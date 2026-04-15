@@ -72,6 +72,7 @@ class ScoringResult:
 
     # ── Identity ───────────────────────────────────────────
     mint: str = ""
+    source: str = "live"  # "live" or "backtest"
     symbol: str = ""
     name: str = ""
     creator: str = ""

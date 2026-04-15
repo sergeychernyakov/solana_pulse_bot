@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS trades (
 );
 
 CREATE TABLE IF NOT EXISTS token_scores (
-    mint TEXT PRIMARY KEY,
+    mint TEXT,
+    source TEXT DEFAULT 'live',  -- 'live' or 'backtest'
     symbol TEXT, name TEXT, creator TEXT,
 
     -- Decisions
@@ -83,7 +84,9 @@ CREATE TABLE IF NOT EXISTS token_scores (
     tokens_last_5min INTEGER DEFAULT 0, concurrent_observations INTEGER DEFAULT 0,
 
     -- Timestamps
-    created_at REAL, scored_at REAL
+    created_at REAL, scored_at REAL,
+
+    PRIMARY KEY (mint, source)
 );
 
 CREATE TABLE IF NOT EXISTS creators (
@@ -157,6 +160,7 @@ CREATE INDEX IF NOT EXISTS idx_opt_trades_run ON optimization_trades(run_id);
 # All columns in token_scores for INSERT (order must match VALUES)
 _SCORE_COLUMNS = [
     "mint",
+    "source",
     "symbol",
     "name",
     "creator",
@@ -240,28 +244,28 @@ class Database:
 
     # ── Sync reads (Streamlit dashboard) ───────────────────
 
-    def get_recent_scores(self, limit: int = 200) -> list[dict]:
+    def get_recent_scores(self, limit: int = 200, source: str = "live") -> list[dict]:
         """Most recent scored tokens, newest first."""
         conn = self._get_sync_conn()
         try:
-            cur = conn.execute("SELECT * FROM token_scores ORDER BY scored_at DESC LIMIT ?", (limit,))
+            cur = conn.execute("SELECT * FROM token_scores WHERE source = ? ORDER BY scored_at DESC LIMIT ?", (source, limit))
             return [dict(row) for row in cur.fetchall()]
         finally:
             conn.close()
 
-    def get_scores_by_date(self, date_str: str) -> list[dict]:
+    def get_scores_by_date(self, date_str: str, source: str = "live") -> list[dict]:
         """All scored tokens for a given date, newest first."""
         conn = self._get_sync_conn()
         try:
             cur = conn.execute(
-                "SELECT * FROM token_scores WHERE date(scored_at, 'unixepoch', 'localtime') = ? ORDER BY scored_at DESC",
-                (date_str,),
+                "SELECT * FROM token_scores WHERE source = ? AND date(scored_at, 'unixepoch', 'localtime') = ? ORDER BY scored_at DESC",
+                (source, date_str),
             )
             return [dict(row) for row in cur.fetchall()]
         finally:
             conn.close()
 
-    def get_stats(self) -> dict:
+    def get_stats(self, source: str = "live") -> dict:
         """Aggregate stats."""
         conn = self._get_sync_conn()
         try:
@@ -271,8 +275,8 @@ class Database:
                     SUM(CASE WHEN decision = 'SKIP' THEN 1 ELSE 0 END) as total_skip,
                     SUM(CASE WHEN decision = 'BORDERLINE' THEN 1 ELSE 0 END) as total_borderline,
                     SUM(CASE WHEN fast_decision = 'FAST_BUY' THEN 1 ELSE 0 END) as total_fast_buy
-                FROM token_scores
-            """)
+                FROM token_scores WHERE source = ?
+            """, (source,))
             row = cur.fetchone()
             return (
                 dict(row)
@@ -288,7 +292,7 @@ class Database:
         finally:
             conn.close()
 
-    def get_stats_by_date(self, date_str: str) -> dict:
+    def get_stats_by_date(self, date_str: str, source: str = "live") -> dict:
         """Aggregate stats for a specific date."""
         conn = self._get_sync_conn()
         try:
@@ -299,9 +303,9 @@ class Database:
                     SUM(CASE WHEN decision = 'SKIP' THEN 1 ELSE 0 END) as total_skip,
                     SUM(CASE WHEN decision = 'BORDERLINE' THEN 1 ELSE 0 END) as total_borderline,
                     SUM(CASE WHEN fast_decision = 'FAST_BUY' THEN 1 ELSE 0 END) as total_fast_buy
-                FROM token_scores WHERE date(scored_at, 'unixepoch', 'localtime') = ?
+                FROM token_scores WHERE source = ? AND date(scored_at, 'unixepoch', 'localtime') = ?
             """,
-                (date_str,),
+                (source, date_str),
             )
             row = cur.fetchone()
             return (

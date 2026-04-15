@@ -58,23 +58,29 @@ class Pipeline:
         )
 
         await self._launchpad.connect()
+        tasks: list[asyncio.Task] = []
 
         try:
             async for token in self._launchpad.stream_new_tokens():
                 if not self._running:
                     break
                 self._tokens_seen += 1
-                asyncio.create_task(self._handle_token_bounded(token))
+                task = asyncio.create_task(self._handle_token_bounded(token))
+                tasks.append(task)
         except asyncio.CancelledError:
             logger.info("Pipeline cancelled")
-        finally:
-            await self._launchpad.disconnect()
-            logger.info(
-                "Pipeline stopped — seen=%d, scored=%d, fast_buys=%d",
-                self._tokens_seen,
-                self._tokens_scored,
-                self._fast_buys,
-            )
+
+        # Wait for all in-flight token handlers to complete
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        await self._launchpad.disconnect()
+        logger.info(
+            "Pipeline stopped — seen=%d, scored=%d, fast_buys=%d",
+            self._tokens_seen,
+            self._tokens_scored,
+            self._fast_buys,
+        )
 
     def stop(self) -> None:
         """Signal the pipeline to stop gracefully."""
@@ -142,6 +148,7 @@ class Pipeline:
             )
 
             # Attach fast phase data
+            result.source = "backtest" if self._launchpad.name == "replay" else "live"
             result.fast_decision = fast_result.decision
             result.fast_score = fast_result.score
             result.fast_reasons = fast_result.reasons

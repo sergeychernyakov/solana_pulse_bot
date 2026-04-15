@@ -126,7 +126,11 @@ class BacktestEngine:
         return sorted(candidates, key=lambda item: item.entry_time)
 
     def _score_token_for_entry(self, token: Token) -> EntryCandidate | None:
-        """Score one token and build a deferred entry candidate."""
+        """Score one token and build a deferred entry candidate.
+
+        Writes scoring result to token_scores with source='backtest'
+        so it can be compared with live decisions.
+        """
         fast_trades = self._source.get_fast_trades(
             token.mint,
             token.created_at,
@@ -138,26 +142,56 @@ class BacktestEngine:
 
         self._tokens_with_trades += 1
 
-        if self._cfg.entry_mode in ("fast", "both"):
-            fast_result = self._fast_filter.evaluate(token, fast_trades)
-            if fast_result.decision == "FAST_BUY":
-                fill = self._execution.simulate_buy(fast_trades)
-                entry_time = token.created_at + self._cfg.fast_observe_seconds
-                return EntryCandidate(token, entry_time, "fast", fill)
+        fast_result = self._fast_filter.evaluate(token, fast_trades)
 
         full_trades = self._source.get_full_trades(
             token.mint,
             token.created_at,
             self._cfg.observe_seconds,
         )
-        if self._cfg.entry_mode in ("full", "both") and full_trades:
-            result = self._scorer.score(token, full_trades)
-            if result.decision == "BUY":
-                fill = self._execution.simulate_buy(full_trades)
-                entry_time = token.created_at + self._cfg.observe_seconds
-                return EntryCandidate(token, entry_time, "full", fill)
+        full_result = self._scorer.score(token, full_trades) if full_trades else None
+
+        # Write to token_scores with source='backtest' (same table as live)
+        if full_result:
+            full_result.source = "backtest"
+            full_result.fast_decision = fast_result.decision
+            full_result.fast_score = fast_result.score
+            full_result.fast_reasons = fast_result.reasons
+            full_result.fast_buy_count = fast_result.buy_count
+            full_result.fast_volume_sol = fast_result.volume_sol
+            full_result.fast_buy_rate = fast_result.buy_rate
+            full_result.fast_unique_buyers = fast_result.unique_buyers
+            full_result.fast_sell_ratio = fast_result.sell_ratio
+            full_result.fast_elapsed = fast_result.elapsed
+            full_result.fast_scored_at = token.created_at + self._cfg.fast_observe_seconds
+            self._save_score_sync(full_result)
+
+        # Entry decision
+        if self._cfg.entry_mode in ("fast", "both") and fast_result.decision == "FAST_BUY":
+            fill = self._execution.simulate_buy(fast_trades)
+            entry_time = token.created_at + self._cfg.fast_observe_seconds
+            return EntryCandidate(token, entry_time, "fast", fill)
+
+        if self._cfg.entry_mode in ("full", "both") and full_result and full_result.decision == "BUY":
+            fill = self._execution.simulate_buy(full_trades)
+            entry_time = token.created_at + self._cfg.observe_seconds
+            return EntryCandidate(token, entry_time, "full", fill)
 
         return None
+
+    def _save_score_sync(self, result: ScoringResult) -> None:
+        """Write scoring result to DB synchronously."""
+        import sqlite3
+        from pulse_bot.db import _SCORE_COLUMNS, Database
+        conn = sqlite3.connect(self._cfg.backtest_db_path)
+        try:
+            placeholders = ", ".join(["?"] * len(_SCORE_COLUMNS))
+            cols = ", ".join(_SCORE_COLUMNS)
+            values = tuple(Database._get_score_value(result, col) for col in _SCORE_COLUMNS)
+            conn.execute(f"INSERT OR REPLACE INTO token_scores ({cols}) VALUES ({placeholders})", values)
+            conn.commit()
+        finally:
+            conn.close()
 
     def _run_timeline(self, candidates: list[EntryCandidate]) -> None:
         """Replay entries and exits in global timestamp order."""

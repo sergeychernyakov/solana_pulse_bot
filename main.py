@@ -111,124 +111,129 @@ def _run_backtest() -> None:
     )
 
     db = Database(config.backtest_db_path)
-    engine = BacktestEngine(config, db)
-    result = engine.run()
-    result.print_report()
+    db.init_schema()
+
+    # Use ReplayLaunchpad — same Pipeline code as live, just different data source
+    from pulse_bot.sources.replay import ReplayLaunchpad
+
+    launchpad = ReplayLaunchpad(config.backtest_db_path, speed=0.0)  # instant replay
+    scorer = Scorer(config, db)
+    fast_filter = FastFilter(config)
+
+    # Override source to 'backtest' for all scores
+    original_score = scorer.score
+
+    def score_as_backtest(*args, **kwargs):
+        result = original_score(*args, **kwargs)
+        result.source = "backtest"
+        return result
+
+    scorer.score = score_as_backtest
+
+    pipeline = Pipeline(config, db, launchpad, scorer, fast_filter)
+
+    # Pipeline writes to token_scores with source='backtest'
+    # Monkeypatch pipeline to set source='backtest'
+    original_handle = pipeline._handle_token
+
+    async def handle_backtest(token):
+        await original_handle(token)
+
+    pipeline._handle_token = handle_backtest
+
+    try:
+        asyncio.run(pipeline.run())
+    except KeyboardInterrupt:
+        pass
+
+    # Print summary from backtest scores
+    bt_stats = db.get_stats(source="backtest")
+    logging.getLogger(__name__).info(
+        "Backtest done: %d tokens scored, BUY=%d, SKIP=%d, FAST_BUY=%d",
+        bt_stats.get("total_seen") or 0, bt_stats.get("total_buy") or 0,
+        bt_stats.get("total_skip") or 0, bt_stats.get("total_fast_buy") or 0,
+    )
 
 
 def _run_verify() -> None:
-    """Compare live pipeline decisions vs backtest decisions on same data."""
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    """Run backtest, then compare live vs backtest from same token_scores table."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(name)s: %(message)s", datefmt="%H:%M:%S")
     log = logging.getLogger(__name__)
 
     config = get_config()
     db = Database(config.db_path)
     db.init_schema()
 
-    live = db.get_live_decisions()
-    if not live:
-        log.info("No live decisions recorded yet. Run 'python main.py monitor' first.")
+    # Step 1: Check live data exists
+    live_rows = db.get_recent_scores(limit=10000, source="live")
+    if not live_rows:
+        log.info("No live data. Run 'python main.py monitor' first, then 'python main.py verify'.")
         sys.exit(1)
+    log.info("Live scores: %d tokens", len(live_rows))
 
-    log.info("Live decisions: %d tokens", len(live))
+    # Step 2: Run backtest (writes to same table with source='backtest')
+    log.info("Running backtest on same data...")
+    engine = BacktestEngine(config, db)
+    engine.run()
 
-    # Replay same tokens through backtest scorer
-    from pulse_bot.clock import SimulatedClock
-    from pulse_bot.sources.backtest import BacktestSource
+    # Step 3: Compare live vs backtest from same table
+    bt_rows = db.get_recent_scores(limit=10000, source="backtest")
+    log.info("Backtest scores: %d tokens", len(bt_rows))
 
-    clock = SimulatedClock()
-    source = BacktestSource(config.db_path, clock)
-    fast_filter = FastFilter(config)
-    scorer = Scorer(config, db)
+    # Index by mint
+    live_by_mint = {r["mint"]: r for r in live_rows}
+    bt_by_mint = {r["mint"]: r for r in bt_rows}
 
-    from pulse_bot.models import Token
+    common = set(live_by_mint.keys()) & set(bt_by_mint.keys())
+    log.info("Common tokens: %d", len(common))
 
     match_fast = 0
-    mismatch_fast = 0
     match_full = 0
-    mismatch_full = 0
     match_score = 0
-
-    import sqlite3
-
-    conn = sqlite3.connect(config.db_path)
-    conn.row_factory = sqlite3.Row
+    total = 0
 
     log.info("")
-    log.info("%-14s %-10s %-10s %-6s %-10s %-10s %-6s %-6s", "Symbol", "Live Fast", "BT Fast", "F.Match", "Live Full", "BT Full", "Match", "Score")
-    log.info("-" * 85)
+    log.info("%-14s %-10s %-10s %-5s %-10s %-10s %-5s %-12s", "Symbol", "Live Fast", "BT Fast", "F.OK", "Live Full", "BT Full", "OK", "Score L/BT")
+    log.info("-" * 90)
 
-    for ld in live:
-        tok_row = conn.execute("SELECT * FROM tokens WHERE mint=?", (ld["mint"],)).fetchone()
-        if not tok_row:
-            continue
+    for mint in sorted(common, key=lambda m: live_by_mint[m].get("created_at", 0)):
+        lv = live_by_mint[mint]
+        bt = bt_by_mint[mint]
+        total += 1
 
-        token = Token(
-            mint=tok_row["mint"], name=tok_row["name"] or "", symbol=tok_row["symbol"] or "",
-            creator=tok_row["creator"] or "", created_at=tok_row["created_at"],
-            uri=tok_row["uri"] or "", launchpad="pumpfun",
-        )
+        lf = lv.get("fast_decision") or ""
+        bf = bt.get("fast_decision") or ""
+        ld = lv.get("decision") or ""
+        bd = bt.get("decision") or ""
+        ls = lv.get("total_score", 0)
+        bs = bt.get("total_score", 0)
 
-        # Backtest fast
-        fast_trades = source.get_fast_trades(token.mint, token.created_at, config.fast_observe_seconds)
-        bt_fast = ""
-        bt_fast_score = 0
-        if fast_trades:
-            fr = fast_filter.evaluate(token, fast_trades)
-            bt_fast = fr.decision
-            bt_fast_score = fr.score
+        fok = "=" if lf == bf else "X"
+        dok = "=" if ld == bd else "X"
+        sok = f"{ls}/{bs}" if ls == bs else f"{ls}!={bs}"
 
-        # Backtest full
-        full_trades = source.get_full_trades(token.mint, token.created_at, config.observe_seconds)
-        bt_full = ""
-        bt_full_score = 0
-        if full_trades:
-            sr = scorer.score(token, full_trades)
-            bt_full = sr.decision
-            bt_full_score = sr.total_score
-
-        # Compare
-        live_fast = ld["fast_decision"] or ""
-        live_full = ld["full_decision"] or ""
-
-        fm = "=" if bt_fast == live_fast else "X"
-        fm_full = "=" if bt_full == live_full else "X"
-        sm = "=" if bt_full_score == ld["full_score"] else f"{ld['full_score']}!={bt_full_score}"
-
-        if bt_fast == live_fast:
+        if lf == bf:
             match_fast += 1
-        else:
-            mismatch_fast += 1
-
-        if bt_full == live_full:
+        if ld == bd:
             match_full += 1
-        else:
-            mismatch_full += 1
-
-        if bt_full_score == ld["full_score"]:
+        if ls == bs:
             match_score += 1
 
-        log.info(
-            "%-14s %-10s %-10s %-6s %-10s %-10s %-6s %-6s",
-            ld["symbol"][:14], live_fast, bt_fast, fm, live_full, bt_full, fm_full, sm,
-        )
+        sym = (lv.get("symbol") or "")[:14]
+        log.info("%-14s %-10s %-10s %-5s %-10s %-10s %-5s %-12s", sym, lf, bf, fok, ld, bd, dok, sok)
 
-    conn.close()
-
-    total = match_fast + mismatch_fast
     log.info("")
-    log.info("=" * 85)
-    log.info("FAST decisions:  %d/%d match (%.0f%%)", match_fast, total, match_fast / max(total, 1) * 100)
-    log.info("FULL decisions:  %d/%d match (%.0f%%)", match_full, total, match_full / max(total, 1) * 100)
-    log.info("FULL scores:     %d/%d exact match (%.0f%%)", match_score, total, match_score / max(total, 1) * 100)
+    log.info("=" * 90)
+    log.info("Compared: %d tokens", total)
+    log.info("FAST decisions:  %d/%d match (%.1f%%)", match_fast, total, match_fast / max(total, 1) * 100)
+    log.info("FULL decisions:  %d/%d match (%.1f%%)", match_full, total, match_full / max(total, 1) * 100)
+    log.info("FULL scores:     %d/%d exact (%.1f%%)", match_score, total, match_score / max(total, 1) * 100)
 
-    if mismatch_fast == 0 and mismatch_full == 0:
-        log.info("RESULT: PERFECT MATCH — backtest = live bot")
-    elif (match_fast + match_full) / max(total * 2, 1) > 0.95:
-        log.info("RESULT: NEAR MATCH (>95%%) — minor differences on edge cases")
+    if match_fast == total and match_full == total and match_score == total:
+        log.info("RESULT: 100%% PERFECT MATCH")
     else:
-        log.info("RESULT: MISMATCH — investigate differences")
-    log.info("=" * 85)
+        log.info("RESULT: %.1f%% match", (match_fast + match_full + match_score) / max(total * 3, 1) * 100)
+    log.info("=" * 90)
 
 
 def _run_qa() -> None:
