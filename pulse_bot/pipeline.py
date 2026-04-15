@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from pulse_bot.filters.fast import FastFilter
     from pulse_bot.filters.scorer import Scorer
     from pulse_bot.launchpads.pumpfun import PumpFunLaunchpad
-    from pulse_bot.models import Token, Trade
+    from pulse_bot.models import CreatorStats, Token, Trade
 
 logger = logging.getLogger(__name__)
 
@@ -96,14 +96,14 @@ class Pipeline:
         self._running = False
 
     async def _handle_token_bounded(
-        self, token: Token, creator_snapshot: object = None
+        self, token: Token, creator_snapshot: CreatorStats | None = None
     ) -> None:
         """Acquire semaphore, then process token."""
         async with self._semaphore:
             await self._handle_token(token, creator_snapshot)
 
     async def _handle_token(
-        self, token: Token, creator_snapshot: object = None
+        self, token: Token, creator_snapshot: CreatorStats | None = None
     ) -> None:
         """Two-phase pipeline for one token."""
         mint_short = token.mint[:12]

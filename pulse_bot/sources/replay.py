@@ -133,8 +133,9 @@ class ReplayLaunchpad(Launchpad):
             if counts and "full_ids" in counts and counts["full_ids"]:
                 # Exact replay: load only the trades that live pipeline saw
                 full_ids = counts["full_ids"]
-                cur = conn.execute(
-                    f"SELECT * FROM trades WHERE id IN ({','.join(str(i) for i in sorted(full_ids))}) ORDER BY id ASC"
+                id_list = ",".join(str(int(i)) for i in sorted(full_ids))
+                cur = conn.execute(  # nosec B608 — IDs are integers from our DB
+                    f"SELECT * FROM trades WHERE id IN ({id_list}) ORDER BY id ASC"
                 )
             else:
                 # No live data: load all trades for this mint
@@ -161,7 +162,7 @@ class ReplayLaunchpad(Launchpad):
                     timestamp=row["timestamp"],
                     is_creator=(row["wallet"] == creator),
                 )
-                trade._db_id = row["id"]  # tag with DB id
+                trade._db_id = row["id"]  # type: ignore[attr-defined]
                 queue = self._trade_queues.get(mint)
                 if queue:
                     await queue.put(trade)
@@ -209,7 +210,7 @@ class ReplayLaunchpad(Launchpad):
         while not queue.empty():
             try:
                 trade = queue.get_nowait()
-                db_id = getattr(trade, "_db_id", None)
+                db_id: int | None = getattr(trade, "_db_id", None)  # type: ignore[assignment]
 
                 if target_ids is not None:
                     if db_id in target_ids:

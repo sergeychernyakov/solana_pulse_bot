@@ -8,7 +8,7 @@ import time
 from typing import TYPE_CHECKING
 
 from pulse_bot.filters.metrics import MetricsCalculator, TokenMetrics
-from pulse_bot.models import ScoringResult, Token, Trade
+from pulse_bot.models import CreatorStats, ScoringResult, Token, Trade
 
 if TYPE_CHECKING:
     from pulse_bot.config import PulseBotConfig
@@ -31,7 +31,7 @@ class Scorer:
         trades: list[Trade],
         tokens_last_5min: int = 0,
         concurrent_observations: int = 0,
-        creator_snapshot: object = None,
+        creator_snapshot: CreatorStats | None = None,
     ) -> ScoringResult:
         """Compute all metrics, run scoring rules, produce decision."""
         self._creator_snapshot = creator_snapshot

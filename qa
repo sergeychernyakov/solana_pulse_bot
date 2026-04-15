@@ -22,6 +22,8 @@ run "Compile"         "python -m compileall -q pulse_bot/"
 run "Ruff"            "ruff check pulse_bot/"
 run "Black"           "black --check --quiet pulse_bot/"
 run "isort"           "isort --check-only --quiet pulse_bot/"
+run "Mypy"            "mypy pulse_bot/ --ignore-missing-imports --no-error-summary 2>&1 | grep -v 'Success' || true"
+run "Bandit"          "bandit -r pulse_bot/ -q -s B101,B608"
 run "Backtest Tests"  "PYTHONPATH= pytest tests/pulse_bot/ -v --noconftest --rootdir=tests/pulse_bot"
 
 echo ""

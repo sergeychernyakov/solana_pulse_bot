@@ -632,7 +632,7 @@ class Database:
                 (trades[0].mint, len(trades)),
             )
             rows = await cur.fetchall()
-            return [r[0] for r in reversed(rows)]
+            return [r[0] for r in list(reversed(list(rows)))]
 
     async def upsert_scoring_result(self, result: ScoringResult) -> None:
         """Insert or update scoring result with all metrics."""
