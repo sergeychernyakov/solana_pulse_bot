@@ -147,6 +147,45 @@ CREATE TABLE IF NOT EXISTS optimization_trades (
     hold_seconds REAL, partial_sells INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS paper_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mint TEXT NOT NULL,
+    symbol TEXT,
+    status TEXT DEFAULT 'open',          -- 'open' | 'closed'
+
+    -- Entry
+    entry_price REAL,
+    entry_time REAL,
+    entry_mcap_sol REAL DEFAULT 0.0,
+    entry_buyer_number INTEGER DEFAULT 0, -- we'd be Nth buyer
+    entry_type TEXT DEFAULT 'full',       -- 'fast' | 'full'
+    entry_score INTEGER DEFAULT 0,
+
+    -- Current (updated while open)
+    current_price REAL DEFAULT 0.0,
+    current_pnl_pct REAL DEFAULT 0.0,
+    current_mcap_sol REAL DEFAULT 0.0,
+    total_buys INTEGER DEFAULT 0,
+    total_sells INTEGER DEFAULT 0,
+    price_updated_at REAL DEFAULT 0.0,
+
+    -- Exit (filled when closed)
+    exit_price REAL DEFAULT 0.0,
+    exit_time REAL DEFAULT 0.0,
+    exit_reason TEXT DEFAULT '',
+    exit_buyer_number INTEGER DEFAULT 0,  -- total buys at exit
+    exit_mcap_sol REAL DEFAULT 0.0,
+    pnl_pct REAL DEFAULT 0.0,
+    pnl_sol REAL DEFAULT 0.0,
+    hold_seconds REAL DEFAULT 0.0,
+
+    -- Config at time of trade
+    buy_amount_sol REAL DEFAULT 0.03
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_status ON paper_trades(status);
+CREATE INDEX IF NOT EXISTS idx_paper_mint ON paper_trades(mint);
+
 CREATE INDEX IF NOT EXISTS idx_trades_mint_ts ON trades(mint, timestamp);
 CREATE INDEX IF NOT EXISTS idx_token_scores_scored ON token_scores(scored_at);
 CREATE INDEX IF NOT EXISTS idx_token_scores_decision ON token_scores(decision);
@@ -679,6 +718,124 @@ class Database:
                 (wallet, int(sold_early), now, now, int(sold_early), now),
             )
             await conn.commit()
+
+    async def open_paper_trade(self, data: dict) -> int:
+        """Open a virtual paper trade position. Returns row ID."""
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
+            cur = await conn.execute(
+                """INSERT INTO paper_trades
+                (mint, symbol, status, entry_price, entry_time, entry_mcap_sol,
+                 entry_buyer_number, entry_type, entry_score, current_price,
+                 current_pnl_pct, buy_amount_sol)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    data["mint"],
+                    data["symbol"],
+                    "open",
+                    data["entry_price"],
+                    data["entry_time"],
+                    data.get("entry_mcap_sol", 0),
+                    data.get("entry_buyer_number", 0),
+                    data.get("entry_type", "full"),
+                    data.get("entry_score", 0),
+                    data["entry_price"],
+                    0.0,
+                    data.get("buy_amount_sol", 0.03),
+                ),
+            )
+            await conn.commit()
+            return cur.lastrowid or 0
+
+    async def update_paper_trade(
+        self,
+        trade_id: int,
+        current_price: float,
+        entry_price: float,
+        total_buys: int,
+        total_sells: int,
+        mcap_sol: float,
+    ) -> None:
+        """Update an open paper trade with current price."""
+        pnl = (
+            ((current_price - entry_price) / entry_price) * 100
+            if entry_price > 0
+            else 0
+        )
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute(
+                """UPDATE paper_trades SET current_price=?, current_pnl_pct=?,
+                   total_buys=?, total_sells=?, current_mcap_sol=?, price_updated_at=?
+                   WHERE id=?""",
+                (
+                    current_price,
+                    pnl,
+                    total_buys,
+                    total_sells,
+                    mcap_sol,
+                    time.time(),
+                    trade_id,
+                ),
+            )
+            await conn.commit()
+
+    async def close_paper_trade(
+        self,
+        trade_id: int,
+        exit_price: float,
+        exit_reason: str,
+        exit_buyer_number: int,
+        exit_mcap_sol: float,
+        entry_price: float,
+        entry_time: float,
+        buy_amount_sol: float,
+    ) -> None:
+        """Close a paper trade with exit details."""
+        now = time.time()
+        pnl_pct = (
+            ((exit_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+        )
+        pnl_sol = buy_amount_sol * (pnl_pct / 100)
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute(
+                """UPDATE paper_trades SET status='closed', exit_price=?, exit_time=?,
+                   exit_reason=?, exit_buyer_number=?, exit_mcap_sol=?,
+                   pnl_pct=?, pnl_sol=?, hold_seconds=?, current_price=?, current_pnl_pct=?
+                   WHERE id=?""",
+                (
+                    exit_price,
+                    now,
+                    exit_reason,
+                    exit_buyer_number,
+                    exit_mcap_sol,
+                    pnl_pct,
+                    pnl_sol,
+                    now - entry_time,
+                    exit_price,
+                    pnl_pct,
+                    trade_id,
+                ),
+            )
+            await conn.commit()
+
+    def get_paper_trades(self, status: str | None = None) -> list[dict]:
+        """Get paper trades, optionally filtered by status."""
+        conn = self._get_sync_conn()
+        try:
+            if status:
+                cur = conn.execute(
+                    "SELECT * FROM paper_trades WHERE status=? ORDER BY entry_time DESC",
+                    (status,),
+                )
+            else:
+                cur = conn.execute(
+                    "SELECT * FROM paper_trades ORDER BY entry_time DESC"
+                )
+            return [dict(row) for row in cur.fetchall()]
+        finally:
+            conn.close()
 
     async def update_live_price(
         self, mint: str, current_price: float, entry_price: float

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -254,7 +255,21 @@ class Pipeline:
                 and (result.decision == "BUY" or fast_result.decision == "FAST_BUY")
                 and result.exit_price > 0
             ):
-                asyncio.create_task(self._monitor_live_price(token, result.exit_price))
+                entry_buyer_num = result.buy_count + 1  # we'd be next buyer
+                entry_type = "fast" if fast_result.decision == "FAST_BUY" else "full"
+                entry_score = (
+                    fast_result.score if entry_type == "fast" else result.total_score
+                )
+                asyncio.create_task(
+                    self._paper_trade(
+                        token,
+                        result.exit_price,
+                        result.market_cap_sol,
+                        entry_buyer_num,
+                        entry_type,
+                        entry_score,
+                    )
+                )
             else:
                 await self._launchpad.unsubscribe_trades(token.mint)
 
@@ -262,22 +277,125 @@ class Pipeline:
             logger.exception("Error processing token %s (%s)", token.symbol, mint_short)
             await self._launchpad.unsubscribe_trades(token.mint)
 
-    async def _monitor_live_price(self, token: Token, entry_price: float) -> None:
-        """Keep tracking price for BUY tokens and update live P&L in DB."""
+    async def _paper_trade(
+        self,
+        token: Token,
+        entry_price: float,
+        entry_mcap: float,
+        entry_buyer_num: int,
+        entry_type: str,
+        entry_score: int,
+    ) -> None:
+        """Virtual paper trade: open position, monitor with PulseMonitor, close on exit signal."""
+        from pulse_bot.pulse.exit_manager import ExitManager
+        from pulse_bot.pulse.monitor import PulseMonitor
+
+        trade_id = await self._db.open_paper_trade(
+            {
+                "mint": token.mint,
+                "symbol": token.symbol,
+                "entry_price": entry_price,
+                "entry_time": time.time(),
+                "entry_mcap_sol": entry_mcap,
+                "entry_buyer_number": entry_buyer_num,
+                "entry_type": entry_type,
+                "entry_score": entry_score,
+                "buy_amount_sol": self._config.buy_amount_sol,
+            }
+        )
+        logger.info(
+            "PAPER BUY %s: price=%e buyer#%d mcap=%.1f type=%s score=%d",
+            token.symbol,
+            entry_price,
+            entry_buyer_num,
+            entry_mcap,
+            entry_type,
+            entry_score,
+        )
+
+        pulse = PulseMonitor(self._config)
+        exit_mgr = ExitManager(self._config)
+        total_buys = 0
+        total_sells = 0
+
         try:
-            deadline = 600  # monitor for 10 min max
+            deadline = self._config.exit_max_hold_seconds
             async for trade in self._launchpad.stream_trades(token.mint, deadline):
-                if (
-                    trade.tx_type == "buy"
-                    and trade.token_amount > 0
-                    and trade.sol_amount > 0
-                ):
+                if trade.tx_type == "buy":
+                    total_buys += 1
+                else:
+                    total_sells += 1
+
+                # Update price
+                current_price = entry_price
+                if trade.token_amount > 0 and trade.sol_amount > 0:
                     current_price = trade.sol_amount / trade.token_amount
-                    await self._db.update_live_price(
-                        token.mint, current_price, entry_price
+
+                # Update paper trade in DB
+                await self._db.update_paper_trade(
+                    trade_id,
+                    current_price,
+                    entry_price,
+                    total_buys,
+                    total_sells,
+                    trade.market_cap_sol,
+                )
+
+                # Also update token_scores live P&L
+                await self._db.update_live_price(token.mint, current_price, entry_price)
+
+                # Check pulse
+                snapshot = pulse.update(trade)
+                if not snapshot:
+                    continue
+
+                pnl_pct = (
+                    ((current_price - entry_price) / entry_price) * 100
+                    if entry_price > 0
+                    else 0
+                )
+                elapsed = time.time() - (trade_id and 0)  # approximate
+                elapsed = trade.timestamp - token.created_at
+
+                signal = exit_mgr.decide(snapshot, pnl_pct, elapsed)
+
+                if signal.action in ("sell_all", "sell_partial"):
+                    await self._db.close_paper_trade(
+                        trade_id,
+                        current_price,
+                        signal.reason,
+                        total_buys + total_sells,
+                        trade.market_cap_sol,
+                        entry_price,
+                        token.created_at,
+                        self._config.buy_amount_sol,
                     )
+                    logger.info(
+                        "PAPER SELL %s: pnl=%+.1f%% reason=%s hold=%.0fs buyer#%d→%d",
+                        token.symbol,
+                        pnl_pct,
+                        signal.reason,
+                        trade.timestamp - token.created_at,
+                        entry_buyer_num,
+                        total_buys + total_sells,
+                    )
+                    return
+
+            # Timeout — close at last price
+            await self._db.close_paper_trade(
+                trade_id,
+                current_price,
+                "timeout",
+                total_buys + total_sells,
+                0,
+                entry_price,
+                token.created_at,
+                self._config.buy_amount_sol,
+            )
+            logger.info("PAPER TIMEOUT %s", token.symbol)
+
         except Exception:
-            logger.debug("Price monitor ended for %s", token.symbol)
+            logger.debug("Paper trade ended for %s", token.symbol)
         finally:
             await self._launchpad.unsubscribe_trades(token.mint)
 

@@ -82,6 +82,10 @@ def main() -> None:
     if rows:
         render_charts(rows)
 
+    # ── Paper trades ───────────────────────────────────────
+    if mode == "Live":
+        render_paper_trades(db)
+
     # ── Token table ────────────────────────────────────────
     if not rows:
         st.info("Waiting for data...")
@@ -203,6 +207,69 @@ def render_charts(rows: list[dict]) -> None:
             st.line_chart(cum_df, x="token#", y="Cum P&L%", height=180, color="#facc15")
         else:
             st.caption("Cumulative P&L (no BUY data)")
+
+
+def render_paper_trades(db: Database) -> None:
+    """Show open and recently closed paper trades."""
+    open_trades = db.get_paper_trades(status="open")
+    closed_trades = db.get_paper_trades(status="closed")
+
+    if not open_trades and not closed_trades:
+        return
+
+    # Open positions
+    if open_trades:
+        parts = []
+        total_pnl = sum(t.get("current_pnl_pct", 0) or 0 for t in open_trades)
+        pnl_cls = "pos" if total_pnl >= 0 else "neg"
+        parts.append(f'<div class="stat">Open <b>{len(open_trades)}</b></div>')
+        parts.append(f'<div class="stat {pnl_cls}">P&L <b>{total_pnl:+.0f}%</b></div>')
+        for t in open_trades[:5]:
+            pnl = t.get("current_pnl_pct", 0) or 0
+            cls = "pos" if pnl >= 0 else "neg"
+            hold = time.time() - (t.get("entry_time", 0) or 0)
+            st_entry = f"#{t.get('entry_buyer_number', '?')}"
+            st_buys = f"B:{t.get('total_buys', 0)} S:{t.get('total_sells', 0)}"
+            parts.append(
+                f'<div class="stat {cls}">'
+                f'{t.get("symbol", "?")} {st_entry} '
+                f"<b>{pnl:+.0f}%</b> {fmt_age(hold)} {st_buys}"
+                f"</div>"
+            )
+        st.markdown(
+            f'<div class="stats-bar">{"".join(parts)}</div>', unsafe_allow_html=True
+        )
+
+    # Closed trades
+    if closed_trades:
+        recent = closed_trades[:10]
+        parts = []
+        wins = sum(1 for t in closed_trades if (t.get("pnl_pct", 0) or 0) > 0)
+        total_pnl = sum(t.get("pnl_pct", 0) or 0 for t in closed_trades)
+        total_sol = sum(t.get("pnl_sol", 0) or 0 for t in closed_trades)
+        pnl_cls = "pos" if total_pnl >= 0 else "neg"
+        parts.append(
+            f'<div class="stat">Closed <b>{len(closed_trades)}</b> WR <b>{wins}/{len(closed_trades)}</b></div>'
+        )
+        parts.append(
+            f'<div class="stat {pnl_cls}">Net <b>{total_pnl:+.0f}%</b> <b>{total_sol:+.4f} SOL</b></div>'
+        )
+        for t in recent:
+            pnl = t.get("pnl_pct", 0) or 0
+            cls = "pos" if pnl >= 0 else "neg"
+            hold = t.get("hold_seconds", 0) or 0
+            reason = t.get("exit_reason", "?")
+            entry_n = t.get("entry_buyer_number", "?")
+            exit_n = t.get("exit_buyer_number", "?")
+            parts.append(
+                f'<div class="stat {cls}">'
+                f'{t.get("symbol", "?")} #{entry_n}→{exit_n} '
+                f"<b>{pnl:+.0f}%</b> {fmt_age(hold)} {reason}"
+                f"</div>"
+            )
+        st.markdown(
+            f'<div class="stats-bar">{"".join(parts)}</div>', unsafe_allow_html=True
+        )
 
 
 def render_token_table(rows: list[dict]) -> None:
