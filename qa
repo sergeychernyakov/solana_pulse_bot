@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# qa — run all tests and quality checks for this project
+# qa — run all tests and quality checks for pulse_bot
 cd "$(dirname "$0")"
 source .venv/bin/activate
 
 PASS=0
 FAIL=0
+WARN=0
 
 run() {
     echo ""
@@ -18,16 +19,29 @@ run() {
     fi
 }
 
+warn() {
+    echo ""
+    echo "── $1 (advisory) ──"
+    eval "$2"
+    ((WARN++))
+}
+
+# Hard checks — must pass
 run "Compile"         "python -m compileall -q pulse_bot/"
 run "Ruff"            "ruff check pulse_bot/"
 run "Black"           "black --check --quiet pulse_bot/"
 run "isort"           "isort --check-only --quiet pulse_bot/"
-run "Mypy"            "mypy pulse_bot/ --ignore-missing-imports --no-error-summary 2>&1 | grep -v 'Success' || true"
-run "Bandit"          "bandit -r pulse_bot/ -q -s B101,B608"
-run "Backtest Tests"  "PYTHONPATH= pytest tests/pulse_bot/ -v --noconftest --rootdir=tests/pulse_bot"
+run "Mypy"            "mypy pulse_bot/ --ignore-missing-imports --no-error-summary"
+run "Bandit"          "bandit -r pulse_bot/ -q --skip B101,B608"
+run "Tests"           "PYTHONPATH= pytest tests/pulse_bot/ -v --noconftest --rootdir=tests/pulse_bot"
+
+# Soft checks — advisory, don't block commit
+warn "Docstrings"     "pydocstyle pulse_bot/ --count --select=D100,D101,D102,D103 2>&1 | tail -1"
+warn "TODOs"          "grep -rn 'TODO\|FIXME\|HACK\|XXX' pulse_bot/ || echo '  None found'"
+warn "Print stmts"    "ruff check pulse_bot/ --select=T201 --statistics 2>&1 | grep T201 || echo '  None found'"
 
 echo ""
-echo "════════════════════════════"
-echo "  $PASS passed, $FAIL failed"
-echo "════════════════════════════"
+echo "════════════════════════════════════"
+echo "  $PASS passed, $FAIL failed, $WARN advisory"
+echo "════════════════════════════════════"
 exit $FAIL
