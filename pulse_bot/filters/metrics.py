@@ -217,7 +217,9 @@ class MetricsCalculator:
         # ── Timing ─────────────────────────────────────────
         import datetime
 
-        m.hour_utc = datetime.datetime.utcfromtimestamp(token.created_at).hour
+        m.hour_utc = datetime.datetime.fromtimestamp(
+            token.created_at, tz=datetime.timezone.utc
+        ).hour
         m.creator_tokens_today = creator_tokens_today
         if trades:
             m.gap_create_to_first_trade = max(

@@ -22,7 +22,7 @@ run "Compile"         "python -m compileall -q pulse_bot/"
 run "Ruff"            "ruff check pulse_bot/"
 run "Black"           "black --check --quiet pulse_bot/"
 run "isort"           "isort --check-only --quiet pulse_bot/"
-run "Backtest Tests"  "pytest tests/pulse_bot/ -v --noconftest --rootdir=tests/pulse_bot"
+run "Backtest Tests"  "PYTHONPATH= pytest tests/pulse_bot/ -v --noconftest --rootdir=tests/pulse_bot"
 
 echo ""
 echo "════════════════════════════"
