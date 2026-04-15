@@ -135,6 +135,20 @@ CREATE INDEX IF NOT EXISTS idx_trades_mint_ts ON trades(mint, timestamp);
 CREATE INDEX IF NOT EXISTS idx_token_scores_scored ON token_scores(scored_at);
 CREATE INDEX IF NOT EXISTS idx_token_scores_decision ON token_scores(decision);
 CREATE INDEX IF NOT EXISTS idx_token_scores_fast ON token_scores(fast_decision);
+CREATE TABLE IF NOT EXISTS live_decisions (
+    mint TEXT PRIMARY KEY,
+    symbol TEXT,
+    fast_decision TEXT,
+    fast_score INTEGER,
+    full_decision TEXT,
+    full_score INTEGER,
+    buy_count INTEGER,
+    unique_buyers INTEGER,
+    buy_volume_sol REAL,
+    created_at REAL,
+    decided_at REAL
+);
+
 CREATE INDEX IF NOT EXISTS idx_opt_runs_session ON optimization_runs(optimizer_session);
 CREATE INDEX IF NOT EXISTS idx_opt_runs_pf ON optimization_runs(profit_factor);
 CREATE INDEX IF NOT EXISTS idx_opt_trades_run ON optimization_trades(run_id);
@@ -468,6 +482,15 @@ class Database:
         finally:
             conn.close()
 
+    def get_live_decisions(self) -> list[dict]:
+        """Get all live decisions for comparison with backtest."""
+        conn = self._get_sync_conn()
+        try:
+            cur = conn.execute("SELECT * FROM live_decisions ORDER BY created_at ASC")
+            return [dict(row) for row in cur.fetchall()]
+        finally:
+            conn.close()
+
     # ── Async writes (pipeline) ────────────────────────────
 
     async def insert_token(self, token: Token) -> None:
@@ -547,6 +570,22 @@ class Database:
             await conn.execute(
                 "INSERT INTO event_log (event_type, data, timestamp) VALUES (?, ?, ?)",
                 (event_type, json.dumps(data, default=str), time.time()),
+            )
+            await conn.commit()
+
+    async def save_live_decision(self, data: dict) -> None:
+        """Save a live pipeline decision for later comparison with backtest."""
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute(
+                """INSERT OR REPLACE INTO live_decisions
+                (mint, symbol, fast_decision, fast_score, full_decision, full_score,
+                 buy_count, unique_buyers, buy_volume_sol, created_at, decided_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (data["mint"], data["symbol"], data["fast_decision"], data["fast_score"],
+                 data["full_decision"], data["full_score"],
+                 data["buy_count"], data["unique_buyers"], data["buy_volume_sol"],
+                 data["created_at"], data["decided_at"]),
             )
             await conn.commit()
 

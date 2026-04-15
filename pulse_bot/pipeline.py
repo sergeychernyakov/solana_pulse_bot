@@ -177,6 +177,21 @@ class Pipeline:
                 result.pnl_at_fast_entry_pct,
             )
 
+            # Save live decision for backtest comparison
+            await self._db.save_live_decision({
+                "mint": token.mint,
+                "symbol": token.symbol,
+                "fast_decision": fast_result.decision,
+                "fast_score": fast_result.score,
+                "full_decision": result.decision,
+                "full_score": result.total_score,
+                "buy_count": result.buy_count,
+                "unique_buyers": result.unique_buyers,
+                "buy_volume_sol": result.buy_volume_sol,
+                "created_at": token.created_at,
+                "decided_at": result.scored_at,
+            })
+
             await self._db.log_event(
                 "score",
                 {
