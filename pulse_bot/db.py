@@ -83,6 +83,11 @@ CREATE TABLE IF NOT EXISTS token_scores (
     -- Market context
     tokens_last_5min INTEGER DEFAULT 0, concurrent_observations INTEGER DEFAULT 0,
 
+    -- Live P&L tracking
+    current_price REAL DEFAULT 0.0,
+    live_pnl_pct REAL DEFAULT 0.0,
+    price_updated_at REAL DEFAULT 0.0,
+
     -- Trade data for exact replay
     fast_trade_count INTEGER DEFAULT 0,
     full_trade_count INTEGER DEFAULT 0,
@@ -661,6 +666,23 @@ class Database:
             )
             await conn.commit()
 
+    async def update_live_price(
+        self, mint: str, current_price: float, entry_price: float
+    ) -> None:
+        """Update current price and live P&L for a token."""
+        pnl = (
+            ((current_price - entry_price) / entry_price) * 100
+            if entry_price > 0
+            else 0
+        )
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute(
+                "UPDATE token_scores SET current_price=?, live_pnl_pct=?, price_updated_at=? WHERE mint=? AND source='live'",
+                (current_price, pnl, time.time(), mint),
+            )
+            await conn.commit()
+
     async def log_event(self, event_type: str, data: dict) -> None:
         """Append to event_log."""
         async with aiosqlite.connect(self.db_path) as conn:
@@ -715,6 +737,9 @@ class Database:
         columns = {
             "pnl_50th_pct": "REAL DEFAULT 0.0",
             "pnl_100th_pct": "REAL DEFAULT 0.0",
+            "current_price": "REAL DEFAULT 0.0",
+            "live_pnl_pct": "REAL DEFAULT 0.0",
+            "price_updated_at": "REAL DEFAULT 0.0",
         }
         for name, definition in columns.items():
             if name not in existing:

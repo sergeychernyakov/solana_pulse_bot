@@ -248,8 +248,36 @@ class Pipeline:
                 },
             )
 
+            # For BUY/FAST_BUY tokens in live mode: keep monitoring price
+            if (
+                self._launchpad.name != "replay"
+                and (result.decision == "BUY" or fast_result.decision == "FAST_BUY")
+                and result.exit_price > 0
+            ):
+                asyncio.create_task(self._monitor_live_price(token, result.exit_price))
+            else:
+                await self._launchpad.unsubscribe_trades(token.mint)
+
         except Exception:
             logger.exception("Error processing token %s (%s)", token.symbol, mint_short)
+            await self._launchpad.unsubscribe_trades(token.mint)
+
+    async def _monitor_live_price(self, token: Token, entry_price: float) -> None:
+        """Keep tracking price for BUY tokens and update live P&L in DB."""
+        try:
+            deadline = 600  # monitor for 10 min max
+            async for trade in self._launchpad.stream_trades(token.mint, deadline):
+                if (
+                    trade.tx_type == "buy"
+                    and trade.token_amount > 0
+                    and trade.sol_amount > 0
+                ):
+                    current_price = trade.sol_amount / trade.token_amount
+                    await self._db.update_live_price(
+                        token.mint, current_price, entry_price
+                    )
+        except Exception:
+            logger.debug("Price monitor ended for %s", token.symbol)
         finally:
             await self._launchpad.unsubscribe_trades(token.mint)
 
