@@ -26,6 +26,15 @@ class FastFilter:
 
     def evaluate(self, token: Token, trades: list[Trade]) -> FastResult:
         """Run fast evaluation on collected trades."""
+        # No trades = no signal
+        if not trades:
+            return FastResult(
+                decision="WAIT", score=0, reasons="no_trades",
+                buy_count=0, sell_count=0, unique_buyers=0,
+                volume_sol=0.0, buy_rate=0.0, sell_ratio=0.0,
+                curve_pct=0.0, elapsed=0.0,
+            )
+
         buys = [t for t in trades if t.tx_type == "buy"]
         sells = [t for t in trades if t.tx_type == "sell"]
 

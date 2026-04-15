@@ -130,18 +130,26 @@ class Pipeline:
             full_trades_extra = await self._collect_trades(token, max(remaining, 0))
             all_trades = fast_trades + full_trades_extra
 
-            # Update creator cache
-            creator_sold = any(t.wallet == token.creator and t.tx_type == "sell" for t in all_trades)
-            await self._db.upsert_creator(token.creator, creator_sold)
+            # Update creator cache (skip in replay to match live state)
+            if self._launchpad.name != "replay":
+                creator_sold = any(t.wallet == token.creator and t.tx_type == "sell" for t in all_trades)
+                await self._db.upsert_creator(token.creator, creator_sold)
 
-            # Store all trades and get DB IDs
-            trade_ids = await self._db.insert_trades_batch(all_trades)
+            # Store all trades and get DB IDs (skip in replay — trades already in DB)
+            if self._launchpad.name != "replay":
+                trade_ids = await self._db.insert_trades_batch(all_trades)
+            else:
+                trade_ids = [getattr(t, "_db_id", 0) for t in all_trades]
             fast_ids = trade_ids[:len(fast_trades)] if trade_ids else []
             full_ids = trade_ids if trade_ids else []
 
-            # Full scoring with market context
-            tokens_5min = self._db.get_tokens_last_5min_sync()
-            concurrent = self._config.max_concurrent_observations - self._semaphore._value  # noqa: SLF001
+            # Full scoring with market context (skip context for replay — it's noise anyway)
+            if self._launchpad.name != "replay":
+                tokens_5min = self._db.get_tokens_last_5min_sync()
+                concurrent = self._config.max_concurrent_observations - self._semaphore._value  # noqa: SLF001
+            else:
+                tokens_5min = 0
+                concurrent = 0
             result = self._scorer.score(
                 token,
                 all_trades,

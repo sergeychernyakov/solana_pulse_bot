@@ -40,7 +40,7 @@ class ReplayLaunchpad(Launchpad):
         self._trade_queues: dict[str, asyncio.Queue[Trade]] = {}
         self._token_creators: dict[str, str] = {}
         self._live_counts: dict[str, dict] = {}  # mint → {fast_trade_count, full_trade_count}
-        self._trades_yielded: dict[str, int] = {}  # mint → count of trades yielded so far
+        self._stream_phase: dict[str, int] = {}  # mint → 0=fast, 1=full
         self._running = False
         self._feeder_task: asyncio.Task | None = None
 
@@ -107,12 +107,14 @@ class ReplayLaunchpad(Launchpad):
                 "SELECT fast_trade_count, full_trade_count, fast_trade_ids, full_trade_ids FROM token_scores WHERE mint = ? AND source = 'live'",
                 (mint,),
             ).fetchone()
-            if row and row["fast_trade_ids"]:
+            if row is not None:
+                fast_ids_str = row["fast_trade_ids"] or ""
+                full_ids_str = row["full_trade_ids"] or ""
                 self._live_counts[mint] = {
-                    "fast": row["fast_trade_count"],
-                    "full": row["full_trade_count"],
-                    "fast_ids": set(int(x) for x in row["fast_trade_ids"].split(",") if x),
-                    "full_ids": set(int(x) for x in row["full_trade_ids"].split(",") if x),
+                    "fast": row["fast_trade_count"] or 0,
+                    "full": row["full_trade_count"] or 0,
+                    "fast_ids": set(int(x) for x in fast_ids_str.split(",") if x),
+                    "full_ids": set(int(x) for x in full_ids_str.split(",") if x),
                 }
         finally:
             conn.close()
@@ -164,28 +166,31 @@ class ReplayLaunchpad(Launchpad):
         First call = fast trades, second call = remaining full trades.
         """
         queue = self._trade_queues.get(mint)
-        if not queue or queue.empty():
+        if not queue:
             return
 
         counts = self._live_counts.get(mint)
-        already_yielded = self._trades_yielded.get(mint, 0)
+        phase = self._stream_phase.get(mint, 0)
 
-        if counts and "fast_ids" in counts:
-            fast_ids = counts["fast_ids"]
+        if counts and "full_ids" in counts:
+            fast_ids = counts.get("fast_ids", set())
             full_ids = counts["full_ids"]
 
-            if already_yielded == 0:
-                # First call = fast phase: yield trades whose ID is in fast_ids
+            if phase == 0:
+                # Fast phase
+                self._stream_phase[mint] = 1  # next call = full phase
+                if not fast_ids:
+                    return  # live saw 0 trades in fast → replay sees 0
                 target_ids = fast_ids
             else:
-                # Second call = remaining: yield trades in full_ids but not in fast_ids
+                # Full phase: yield trades in full_ids but not in fast_ids
                 target_ids = full_ids - fast_ids
         else:
+            # No live data — yield all
             target_ids = None
+            self._stream_phase[mint] = 1
 
-        yielded = 0
         temp_buffer = []
-
         while not queue.empty():
             try:
                 trade = queue.get_nowait()
@@ -193,19 +198,14 @@ class ReplayLaunchpad(Launchpad):
 
                 if target_ids is not None:
                     if db_id in target_ids:
-                        yielded += 1
-                        self._trades_yielded[mint] = already_yielded + yielded
                         yield trade
                     else:
                         temp_buffer.append(trade)
                 else:
-                    yielded += 1
-                    self._trades_yielded[mint] = already_yielded + yielded
                     yield trade
             except asyncio.QueueEmpty:
                 break
 
-        # Put back buffered trades for next phase
         for t in temp_buffer:
             await queue.put(t)
 
