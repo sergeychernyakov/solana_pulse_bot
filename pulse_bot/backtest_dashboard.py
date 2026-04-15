@@ -13,9 +13,12 @@ import streamlit as st
 from pulse_bot.config import get_config
 from pulse_bot.db import Database
 
-st.set_page_config(page_title="Backtest Results", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(
+    page_title="Backtest Results", layout="wide", initial_sidebar_state="collapsed"
+)
 
-st.markdown("""
+st.markdown(
+    """
 <style>
     .block-container { padding-top: 0.5rem; padding-left: 0.5rem; padding-right: 0.5rem; }
     .stats-bar { display: flex; gap: 8px; flex-wrap: wrap; margin: 4px 0 8px 0; font-size: 13px; }
@@ -24,7 +27,9 @@ st.markdown("""
     .pos b { color: #4ade80 !important; }
     .neg b { color: #f87171 !important; }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 
 def main() -> None:
@@ -48,7 +53,9 @@ def main() -> None:
         f"{s['optimizer_session']} ({s['run_count']} runs, best PF={s['best_pf']:.2f})"
         for s in sessions
     ]
-    selected_idx = st.selectbox("Session", range(len(session_options)), format_func=lambda i: session_options[i])
+    selected_idx = st.selectbox(
+        "Session", range(len(session_options)), format_func=lambda i: session_options[i]
+    )
     selected_session = sessions[selected_idx]["optimizer_session"]
 
     # ── Load runs ──────────────────────────────────────────
@@ -71,7 +78,9 @@ def main() -> None:
         f"#{i+1} PF={r['profit_factor']:.2f} WR={r['win_rate']:.0f}% ROI={r['roi_pct']:+.1f}% | {json.loads(r['params'])}"
         for i, r in enumerate(runs)
     ]
-    selected_run_idx = st.selectbox("Select run", range(len(run_options)), format_func=lambda i: run_options[i])
+    selected_run_idx = st.selectbox(
+        "Select run", range(len(run_options)), format_func=lambda i: run_options[i]
+    )
     selected_run = runs[selected_run_idx]
 
     render_run_detail(selected_run, db)
@@ -94,14 +103,17 @@ def render_session_summary(runs: list[dict]) -> None:
     pnl_cls = "pos" if avg_pnl > 0 else "neg"
     roi_cls = "pos" if best_roi > 0 else "neg"
 
-    st.markdown(f"""<div class="stats-bar">
+    st.markdown(
+        f"""<div class="stats-bar">
         <div class="stat">Runs <b>{total}</b></div>
         <div class="stat pos">Profitable <b>{profitable}/{total}</b></div>
         <div class="stat pos">Best PF <b>{best_pf:.2f}</b></div>
         <div class="stat {roi_cls}">Best ROI <b>{best_roi:+.1f}%</b></div>
         <div class="stat pos">Best WR <b>{best_wr:.0f}%</b></div>
         <div class="stat {pnl_cls}">Avg PnL <b>{avg_pnl:+.4f} SOL</b></div>
-    </div>""", unsafe_allow_html=True)
+    </div>""",
+        unsafe_allow_html=True,
+    )
 
 
 def render_runs_table(runs: list[dict]) -> None:
@@ -109,22 +121,24 @@ def render_runs_table(runs: list[dict]) -> None:
     rows = []
     for i, r in enumerate(runs):
         params = json.loads(r["params"])
-        rows.append({
-            "#": i + 1,
-            "Entry": r["entry_mode"],
-            "Trades": r["total_trades"],
-            "Wins": r["wins"],
-            "Losses": r["losses"],
-            "WR%": f"{r['win_rate']:.0f}",
-            "PnL SOL": f"{r['total_pnl_sol']:+.4f}",
-            "PF": f"{r['profit_factor']:.2f}",
-            "ROI%": f"{r['roi_pct']:+.1f}",
-            "DD%": f"{r['max_drawdown_pct']:.0f}",
-            "Avg Win": f"+{r['avg_win_pct']:.0f}%",
-            "Avg Loss": f"-{r['avg_loss_pct']:.0f}%",
-            "Hold": f"{r['avg_hold_seconds']:.0f}s",
-            **{k: str(v) for k, v in params.items()},
-        })
+        rows.append(
+            {
+                "#": i + 1,
+                "Entry": r["entry_mode"],
+                "Trades": r["total_trades"],
+                "Wins": r["wins"],
+                "Losses": r["losses"],
+                "WR%": f"{r['win_rate']:.0f}",
+                "PnL SOL": f"{r['total_pnl_sol']:+.4f}",
+                "PF": f"{r['profit_factor']:.2f}",
+                "ROI%": f"{r['roi_pct']:+.1f}",
+                "DD%": f"{r['max_drawdown_pct']:.0f}",
+                "Avg Win": f"+{r['avg_win_pct']:.0f}%",
+                "Avg Loss": f"-{r['avg_loss_pct']:.0f}%",
+                "Hold": f"{r['avg_hold_seconds']:.0f}s",
+                **{k: str(v) for k, v in params.items()},
+            }
+        )
 
     df = pd.DataFrame(rows)
 
@@ -137,7 +151,12 @@ def render_runs_table(runs: list[dict]) -> None:
         return [""] * len(row)
 
     styled = df.style.apply(color_row, axis=1)
-    st.dataframe(styled, use_container_width=True, hide_index=True, height=min(len(df) * 35 + 38, 500))
+    st.dataframe(
+        styled,
+        use_container_width=True,
+        hide_index=True,
+        height=min(len(df) * 35 + 38, 500),
+    )
 
 
 def render_run_detail(run: dict, db: Database) -> None:
@@ -173,7 +192,11 @@ def render_run_detail(run: dict, db: Database) -> None:
     df = pd.DataFrame(trades)
 
     if "entry_time" in df.columns:
-        df["entry"] = df["entry_time"].apply(lambda t: datetime.datetime.fromtimestamp(t).strftime("%H:%M:%S") if t else "")
+        df["entry"] = df["entry_time"].apply(
+            lambda t: (
+                datetime.datetime.fromtimestamp(t).strftime("%H:%M:%S") if t else ""
+            )
+        )
     if "pnl_pct" in df.columns:
         df["pnl"] = df["pnl_pct"].apply(lambda p: f"{p:+.1f}%")
     if "pnl_sol" in df.columns:
@@ -183,10 +206,15 @@ def render_run_detail(run: dict, db: Database) -> None:
 
     display_cols = []
     col_map = {
-        "entry": "Time", "symbol": "Sym", "entry_type": "Entry",
-        "pnl": "P&L%", "pnl_s": "P&L SOL",
-        "hold": "Hold", "exit_reason": "Exit",
-        "sol_invested": "Invested", "sol_received": "Received",
+        "entry": "Time",
+        "symbol": "Sym",
+        "entry_type": "Entry",
+        "pnl": "P&L%",
+        "pnl_s": "P&L SOL",
+        "hold": "Hold",
+        "exit_reason": "Exit",
+        "sol_invested": "Invested",
+        "sol_received": "Received",
     }
     for col, name in col_map.items():
         if col in df.columns:
@@ -209,7 +237,12 @@ def render_run_detail(run: dict, db: Database) -> None:
             return [""] * len(row)
 
         styled = show_df.style.apply(color_trade, axis=1)
-        st.dataframe(styled, use_container_width=True, hide_index=True, height=min(len(show_df) * 35 + 38, 400))
+        st.dataframe(
+            styled,
+            use_container_width=True,
+            hide_index=True,
+            height=min(len(show_df) * 35 + 38, 400),
+        )
 
 
 if __name__ == "__main__":

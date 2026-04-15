@@ -33,7 +33,9 @@ class ExitManager:
     def remaining_pct(self) -> float:
         return self._remaining_pct
 
-    def decide(self, pulse: PulseSnapshot, pnl_pct: float, elapsed_sec: float) -> ExitSignal:
+    def decide(
+        self, pulse: PulseSnapshot, pnl_pct: float, elapsed_sec: float
+    ) -> ExitSignal:
         """Evaluate pulse and return exit decision."""
 
         # ── Hard exits — sell 100% ─────────────────────────
@@ -41,7 +43,10 @@ class ExitManager:
         if pulse.creator_selling and self._cfg.exit_on_creator_dump:
             return self._sell_all("creator_dump")
 
-        if pulse.buy_rate < self._cfg.pulse_dead_buy_rate and pulse.window_events >= self._cfg.pulse_min_events:
+        if (
+            pulse.buy_rate < self._cfg.pulse_dead_buy_rate
+            and pulse.window_events >= self._cfg.pulse_min_events
+        ):
             return self._sell_all("pulse_dead")
 
         if pulse.trend_declining_count >= self._cfg.exit_trend_dying_count:
@@ -50,7 +55,10 @@ class ExitManager:
         if pulse.sell_rate > pulse.buy_rate * self._cfg.exit_sell_pressure_ratio:
             return self._sell_all("sell_pressure")
 
-        if pulse.new_wallet_rate == 0 and pulse.window_events >= self._cfg.exit_no_new_wallets_events:
+        if (
+            pulse.new_wallet_rate == 0
+            and pulse.window_events >= self._cfg.exit_no_new_wallets_events
+        ):
             return self._sell_all("no_new_blood")
 
         if pulse.whale_exit and self._cfg.exit_on_whale:
@@ -78,7 +86,10 @@ class ExitManager:
             return self._sell_partial(sell_pct, "strong_profit")
 
         # Weak pulse + profit → partial sell
-        if pulse.buy_rate < self._cfg.pulse_weak_buy_rate and pnl_pct > self._cfg.exit_weak_pulse_min_profit_pct:
+        if (
+            pulse.buy_rate < self._cfg.pulse_weak_buy_rate
+            and pnl_pct > self._cfg.exit_weak_pulse_min_profit_pct
+        ):
             sell_pct = min(self._cfg.exit_partial_on_weak_pulse_pct, available)
             return self._sell_partial(sell_pct, "weak_pulse_profit")
 

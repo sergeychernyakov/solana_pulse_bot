@@ -9,7 +9,7 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import asdict, fields
+from dataclasses import fields
 from typing import TYPE_CHECKING
 
 from pulse_bot.backtest import BacktestEngine
@@ -81,7 +81,9 @@ class Optimizer:
 
         logger.info(
             "Optimizer starting: session=%s, %d params, %d combinations",
-            self._session_id, len(param_names), total,
+            self._session_id,
+            len(param_names),
+            total,
         )
         logger.info("Grid: %s", {k: v for k, v in self._grid.items()})
 
@@ -97,7 +99,8 @@ class Optimizer:
 
             logger.info(
                 "[%d/%d] Running: %s",
-                i + 1, total,
+                i + 1,
+                total,
                 " ".join(f"{k}={v}" for k, v in params.items()),
             )
 
@@ -114,9 +117,12 @@ class Optimizer:
 
                 logger.info(
                     "[%d/%d] Done: trades=%d win_rate=%.0f%% pnl=%+.4f pf=%.2f roi=%+.1f%%",
-                    i + 1, total,
-                    run_data["total_trades"], run_data["win_rate"],
-                    run_data["total_pnl_sol"], run_data["profit_factor"],
+                    i + 1,
+                    total,
+                    run_data["total_trades"],
+                    run_data["win_rate"],
+                    run_data["total_pnl_sol"],
+                    run_data["profit_factor"],
                     run_data["roi_pct"],
                 )
             except Exception:
@@ -127,7 +133,9 @@ class Optimizer:
 
         logger.info(
             "Optimizer done: %d runs in %.1fs, session=%s",
-            len(results), elapsed, self._session_id,
+            len(results),
+            elapsed,
+            self._session_id,
         )
 
         self._print_top_results(results)
@@ -140,19 +148,30 @@ class Optimizer:
             setattr(cfg, key, value)
         return cfg
 
-    def _result_to_dict(self, run_id: str, params: dict, cfg: PulseBotConfig, bt_result: object) -> dict:
+    def _result_to_dict(
+        self, run_id: str, params: dict, cfg: PulseBotConfig, bt_result: object
+    ) -> dict:
         """Convert BacktestResult to a storable dict."""
         trades_list = []
         for t in getattr(bt_result, "closed_trades", []):
-            trades_list.append({
-                "mint": t.mint, "symbol": t.symbol,
-                "entry_type": t.entry_type, "exit_reason": t.exit_reason,
-                "entry_price": t.entry_price, "exit_price": t.exit_price,
-                "entry_time": t.entry_time, "exit_time": t.exit_time,
-                "sol_invested": t.sol_invested, "sol_received": t.sol_received,
-                "pnl_sol": t.pnl_sol, "pnl_pct": t.pnl_pct,
-                "hold_seconds": t.hold_seconds, "partial_sells": t.partial_sells,
-            })
+            trades_list.append(
+                {
+                    "mint": t.mint,
+                    "symbol": t.symbol,
+                    "entry_type": t.entry_type,
+                    "exit_reason": t.exit_reason,
+                    "entry_price": t.entry_price,
+                    "exit_price": t.exit_price,
+                    "entry_time": t.entry_time,
+                    "exit_time": t.exit_time,
+                    "sol_invested": t.sol_invested,
+                    "sol_received": t.sol_received,
+                    "pnl_sol": t.pnl_sol,
+                    "pnl_pct": t.pnl_pct,
+                    "hold_seconds": t.hold_seconds,
+                    "partial_sells": t.partial_sells,
+                }
+            )
 
         exit_reasons = getattr(bt_result, "exit_reasons", {})
 
@@ -192,7 +211,9 @@ class Optimizer:
         print("\n" + "=" * 80)
         print("  OPTIMIZER TOP 10 RESULTS")
         print("=" * 80)
-        print(f"  {'#':>3s}  {'Trades':>6s}  {'WR%':>5s}  {'PnL SOL':>9s}  {'PF':>5s}  {'ROI%':>7s}  {'DD%':>5s}  Params")
+        print(
+            f"  {'#':>3s}  {'Trades':>6s}  {'WR%':>5s}  {'PnL SOL':>9s}  {'PF':>5s}  {'ROI%':>7s}  {'DD%':>5s}  Params"
+        )
         print("-" * 80)
 
         for i, r in enumerate(results[:10]):

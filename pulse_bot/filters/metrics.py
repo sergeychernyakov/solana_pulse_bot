@@ -114,7 +114,9 @@ class MetricsCalculator:
         if buy_amounts:
             m.avg_buy_sol = statistics.mean(buy_amounts)
             m.median_buy_sol = statistics.median(buy_amounts)
-            m.std_buy_sol = statistics.stdev(buy_amounts) if len(buy_amounts) > 1 else 0.0
+            m.std_buy_sol = (
+                statistics.stdev(buy_amounts) if len(buy_amounts) > 1 else 0.0
+            )
             m.first_buy_sol = buy_amounts[0]
 
         # ── Top 3 concentration ────────────────────────────
@@ -141,8 +143,16 @@ class MetricsCalculator:
             mid = len(buys) // 2
             first_half = buys[:mid]
             second_half = buys[mid:]
-            t1 = first_half[-1].timestamp - first_half[0].timestamp if len(first_half) > 1 else 1.0
-            t2 = second_half[-1].timestamp - second_half[0].timestamp if len(second_half) > 1 else 1.0
+            t1 = (
+                first_half[-1].timestamp - first_half[0].timestamp
+                if len(first_half) > 1
+                else 1.0
+            )
+            t2 = (
+                second_half[-1].timestamp - second_half[0].timestamp
+                if len(second_half) > 1
+                else 1.0
+            )
             rate1 = len(first_half) / max(t1, 0.1)
             rate2 = len(second_half) / max(t2, 0.1)
             m.buy_velocity_trend = rate2 / max(rate1, 0.01)
@@ -162,7 +172,9 @@ class MetricsCalculator:
         if trades:
             last = trades[-1]
             v_sol = last.v_sol_in_bonding_curve
-            m.curve_progress_pct = min((v_sol / self._graduation_sol) * 100.0, 100.0) if v_sol > 0 else 0.0
+            m.curve_progress_pct = (
+                min((v_sol / self._graduation_sol) * 100.0, 100.0) if v_sol > 0 else 0.0
+            )
             m.sol_to_graduation = max(self._graduation_sol - v_sol, 0.0)
             m.market_cap_sol = last.market_cap_sol
 
@@ -180,8 +192,12 @@ class MetricsCalculator:
                 elapsed_1 = t_mid.timestamp - trades[0].timestamp
                 elapsed_2 = trades[-1].timestamp - t_mid.timestamp
                 if elapsed_1 > 0 and elapsed_2 > 0:
-                    vel_1 = (t_mid.v_sol_in_bonding_curve - trades[0].v_sol_in_bonding_curve) / elapsed_1
-                    vel_2 = (last.v_sol_in_bonding_curve - t_mid.v_sol_in_bonding_curve) / elapsed_2
+                    vel_1 = (
+                        t_mid.v_sol_in_bonding_curve - trades[0].v_sol_in_bonding_curve
+                    ) / elapsed_1
+                    vel_2 = (
+                        last.v_sol_in_bonding_curve - t_mid.v_sol_in_bonding_curve
+                    ) / elapsed_2
                     m.curve_acceleration = vel_2 - vel_1
 
         # ── Price ──────────────────────────────────────────
@@ -204,7 +220,9 @@ class MetricsCalculator:
         m.hour_utc = datetime.datetime.utcfromtimestamp(token.created_at).hour
         m.creator_tokens_today = creator_tokens_today
         if trades:
-            m.gap_create_to_first_trade = max(trades[0].timestamp - token.created_at, 0.0)
+            m.gap_create_to_first_trade = max(
+                trades[0].timestamp - token.created_at, 0.0
+            )
 
         # ── Market context ─────────────────────────────────
         m.tokens_last_5min = tokens_last_5min

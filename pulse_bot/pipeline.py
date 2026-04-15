@@ -72,7 +72,9 @@ class Pipeline:
                 creator_snapshot = self._db.get_creator_stats_sync(token.creator)
 
                 # Both live and replay: parallel processing, deterministic snapshot
-                task = asyncio.create_task(self._handle_token_bounded(token, creator_snapshot))
+                task = asyncio.create_task(
+                    self._handle_token_bounded(token, creator_snapshot)
+                )
                 tasks.append(task)
         except asyncio.CancelledError:
             logger.info("Pipeline cancelled")
@@ -93,27 +95,37 @@ class Pipeline:
         """Signal the pipeline to stop gracefully."""
         self._running = False
 
-    async def _handle_token_bounded(self, token: Token, creator_snapshot: object = None) -> None:
+    async def _handle_token_bounded(
+        self, token: Token, creator_snapshot: object = None
+    ) -> None:
         """Acquire semaphore, then process token."""
         async with self._semaphore:
             await self._handle_token(token, creator_snapshot)
 
-    async def _handle_token(self, token: Token, creator_snapshot: object = None) -> None:
+    async def _handle_token(
+        self, token: Token, creator_snapshot: object = None
+    ) -> None:
         """Two-phase pipeline for one token."""
         mint_short = token.mint[:12]
 
         try:
-            logger.info("New token: %s (%s) by %s", token.symbol, mint_short, token.creator[:12])
+            logger.info(
+                "New token: %s (%s) by %s", token.symbol, mint_short, token.creator[:12]
+            )
 
             await self._launchpad.subscribe_trades(token.mint)
 
             # ── Phase 1: Fast (5 seconds) ──────────────────
-            fast_trades = await self._collect_trades(token, self._config.fast_observe_seconds)
+            fast_trades = await self._collect_trades(
+                token, self._config.fast_observe_seconds
+            )
             fast_result = self._fast_filter.evaluate(token, fast_trades)
 
             fast_entry_price = 0.0
             if fast_trades:
-                fast_buys = [t for t in fast_trades if t.tx_type == "buy" and t.token_amount > 0]
+                fast_buys = [
+                    t for t in fast_trades if t.tx_type == "buy" and t.token_amount > 0
+                ]
                 if fast_buys:
                     last = fast_buys[-1]
                     fast_entry_price = last.sol_amount / last.token_amount
@@ -141,13 +153,15 @@ class Pipeline:
                 trade_ids = await self._db.insert_trades_batch(all_trades)
             else:
                 trade_ids = [getattr(t, "_db_id", 0) for t in all_trades]
-            fast_ids = trade_ids[:len(fast_trades)] if trade_ids else []
+            fast_ids = trade_ids[: len(fast_trades)] if trade_ids else []
             full_ids = trade_ids if trade_ids else []
 
             # Full scoring with market context (skip context for replay — it's noise anyway)
             if self._launchpad.name != "replay":
                 tokens_5min = self._db.get_tokens_last_5min_sync()
-                concurrent = self._config.max_concurrent_observations - self._semaphore._value  # noqa: SLF001
+                concurrent = (
+                    self._config.max_concurrent_observations - self._semaphore._value
+                )  # noqa: SLF001
             else:
                 tokens_5min = 0
                 concurrent = 0
@@ -179,13 +193,19 @@ class Pipeline:
 
             # P&L at fast entry point vs end of full observation
             if fast_entry_price > 0 and result.exit_price > 0:
-                result.pnl_at_fast_entry_pct = ((result.exit_price - fast_entry_price) / fast_entry_price) * 100.0
+                result.pnl_at_fast_entry_pct = (
+                    (result.exit_price - fast_entry_price) / fast_entry_price
+                ) * 100.0
 
             await self._db.upsert_scoring_result(result)
             self._tokens_scored += 1
 
             # Log
-            log_fn = logger.info if result.decision == "BUY" or fast_result.decision == "FAST_BUY" else logger.debug
+            log_fn = (
+                logger.info
+                if result.decision == "BUY" or fast_result.decision == "FAST_BUY"
+                else logger.debug
+            )
             log_fn(
                 "Scored %s (%s): fast=%s(%d) full=%s(%d) buyers=%d vol=%.1f pnl_fast=%+.0f%%",
                 token.symbol,
@@ -200,19 +220,21 @@ class Pipeline:
             )
 
             # Save live decision for backtest comparison
-            await self._db.save_live_decision({
-                "mint": token.mint,
-                "symbol": token.symbol,
-                "fast_decision": fast_result.decision,
-                "fast_score": fast_result.score,
-                "full_decision": result.decision,
-                "full_score": result.total_score,
-                "buy_count": result.buy_count,
-                "unique_buyers": result.unique_buyers,
-                "buy_volume_sol": result.buy_volume_sol,
-                "created_at": token.created_at,
-                "decided_at": result.scored_at,
-            })
+            await self._db.save_live_decision(
+                {
+                    "mint": token.mint,
+                    "symbol": token.symbol,
+                    "fast_decision": fast_result.decision,
+                    "fast_score": fast_result.score,
+                    "full_decision": result.decision,
+                    "full_score": result.total_score,
+                    "buy_count": result.buy_count,
+                    "unique_buyers": result.unique_buyers,
+                    "buy_volume_sol": result.buy_volume_sol,
+                    "created_at": token.created_at,
+                    "decided_at": result.scored_at,
+                }
+            )
 
             await self._db.log_event(
                 "score",

@@ -1,117 +1,151 @@
-# Solana Pulse Bot v3
+# Solana Pulse Bot
 
-Бот-наблюдатель для мемкоин-лончпадов на Solana. Не снайпер — не гонится за первым блоком. Наблюдает 30–90 секунд за новым токеном, оценивает органичность интереса, входит 3–5м покупателем. Выходит не по фиксированному TP/SL, а по пульсу активности — когда покупатели иссякают.
+Бот-наблюдатель для мемкоин-лончпадов на Solana. Наблюдает за новыми токенами, оценивает органичность интереса, принимает решение о покупке. Двухфазный скоринг: быстрый вход (5 сек) + полный анализ (45 сек). 62 метрики на токен, 80+ конфигурируемых параметров.
 
-Асимметричная ставка: теряешь мало (bonding curve почти не сдвинулась), выигрываешь кратно (если токен полетел).
-
-Один код — два режима: бэктест на исторических данных и боевая торговля.
+Бэктест использует тот же код что и live бот — **100% совпадение решений** (верифицировано на 178 токенах).
 
 ## Архитектура
 
-Event-driven: Commands (намерения) отделены от Events (факты). Время абстрагировано через Clock — бэктест и live используют один код. Состояние персистентно — бот восстанавливается после падения.
+```
+Pipeline (один код для live и backtest):
 
+  Token CREATE (WS или replay)
+    │
+  Main loop (sequential, deterministic):
+    ├─ insert_token
+    ├─ upsert_creator
+    ├─ snapshot creator stats
+    │
+  Parallel task (per token):
+    ├─ Phase 1: Fast (5s) → FAST_BUY / WAIT
+    ├─ Phase 2: Full (45s) → BUY / SKIP / BORDERLINE
+    ├─ Score with 62 metrics + creator snapshot
+    └─ Store to token_scores (source='live' or 'backtest')
 ```
-SOURCE (BacktestSource | LiveSource)
-  │ TokenEvent
-PRECHECK FILTERS (authority, creator, blacklist)
-  │ (passed)
-OBSERVATION FILTERS (30-90 сек: buyers, volume, diversity, bundled buy)
-  │ SignalEvent (score > threshold)
-PORTFOLIO (can_open? reserve() balance)
-  │ PlaceBuyCommand
-EXECUTION WORKER (SimulatedExecution | LiveExecution, bounded concurrency)
-  │ FillEvent
-PORTFOLIO (commit() position, persist to SQLite)
-  │
-PULSE MONITOR (stream-based, per-mint task)
-  │ PlaceSellCommand → Execution Worker → FillEvent → Portfolio
-```
+
+Ключевой принцип: **все обновления состояния в main loop (последовательно), скоринг в parallel tasks (с замороженным snapshot)**. Это даёт 100% детерминизм при сохранении параллелизма.
 
 ## Структура проекта
 
 ```
 pulse_bot/
 ├── __init__.py
-├── models.py              # Dataclasses: Token, Trade, Position, PulseSnapshot, TradeResult
-├── events.py              # Event ABC + TokenEvent, SignalEvent, FillEvent, PulseEvent
-├── commands.py            # Command ABC + PlaceBuyCommand, PlaceSellCommand
+├── models.py              # Token, Trade, ScoringResult (62 fields), CreatorStats
+├── config.py              # PulseBotConfig — 80+ параметров для backtesting
+├── db.py                  # SQLite с WAL mode, token_scores (source: live/backtest)
+├── pipeline.py            # Pipeline — единый код для live и replay
 ├── clock.py               # Clock ABC + RealClock + SimulatedClock
-├── config.py              # Config dataclass + LaunchpadConfig + пресеты
-├── db.py                  # SQLite: схема, CRUD, event_log, state persistence
-├── portfolio.py           # Portfolio: reserve/commit/release, persist, restore
-├── execution.py           # ExecutionHandler ABC + SimulatedExecution + LiveExecution + Worker
-├── engine.py              # PulseBot: event loop + execution worker + bounded concurrency
-├── collector.py           # Bitquery → SQLite (сбор данных для бэктеста)
-├── report.py              # P&L отчёт, метрики, топы/лузеры
-├── main.py                # CLI: collect / backtest / paper / live
+├── portfolio.py           # Balance, positions, P&L tracking
+├── execution.py           # SimulatedExecution — slippage model on bonding curve
+├── backtest.py            # BacktestEngine — full cycle replay
+├── optimizer.py           # Grid search over parameter combinations
+├── dashboard.py           # Streamlit: live token monitoring
+├── backtest_dashboard.py  # Streamlit: optimization results
 │
-├── sources/               # Источники данных
-│   ├── base.py            # DataSource ABC (stream_new_tokens, stream_trades)
-│   ├── backtest.py        # BacktestSource — SQLite + SimulatedClock
-│   └── live.py            # LiveSource — WebSocket + RPC + RealClock
+├── sources/
+│   ├── backtest.py        # BacktestSource — SQLite replay
+│   └── replay.py          # ReplayLaunchpad — same Launchpad interface as live WS
 │
-├── launchpads/            # Адаптеры лончпадов
-│   ├── base.py            # Launchpad ABC (ws, parse, tx, curve, graduation, antiscam)
-│   └── pumpfun.py         # PumpFun — bonding curve, tx, ws, ws_subscribe_trades
+├── launchpads/
+│   ├── base.py            # Launchpad ABC
+│   └── pumpfun.py         # PumpFun WS: create events, trade streaming
 │
-├── filters/               # Двухфазная фильтрация + скоринг
-│   ├── base.py            # Filter ABC + FilterResult
-│   ├── authority.py       # AuthorityFilter [precheck]
-│   ├── creator.py         # CreatorFilter [precheck]
-│   ├── bundled_buy.py     # BundledBuyFilter [observation]
-│   ├── observation.py     # ObservationFilter [observation]
-│   └── scorer.py          # Scorer — precheck_filters + observation_filters
+├── filters/
+│   ├── base.py            # Filter ABC
+│   ├── fast.py            # FastFilter — 5 sec entry decision
+│   ├── observation.py     # ObservationFilter — full 45 sec analysis
+│   ├── metrics.py         # MetricsCalculator — computes all 62 metrics
+│   ├── creator.py         # CreatorFilter — creator history
+│   └── scorer.py          # Scorer — aggregates filters, produces decision
 │
-└── pulse/                 # Пульсовый мониторинг
-    ├── monitor.py         # PulseMonitor — stream-based, last_seen курсор
-    └── exit_manager.py    # ExitManager — частичные выходы, moonbag, стопы
+└── pulse/
+    ├── monitor.py         # PulseMonitor — sliding window, trend detection
+    └── exit_manager.py    # ExitManager — 10 configurable exit rules
 ```
 
-## Модули
+## Команды
 
-| Модуль | Назначение |
-|--------|-----------|
-| **Clock** | Абстракция времени. `RealClock` для live, `SimulatedClock` для мгновенного бэктеста |
-| **Sources** | `BacktestSource` (SQLite + SimulatedClock), `LiveSource` (WebSocket + RPC). stream_trades — без polling |
-| **Launchpads** | Адаптеры лончпадов с ws, curve, graduation, antiscam. PumpFun сейчас, остальные потом |
-| **Filters + Scorer** | Двухфазная фильтрация: precheck (мгновенная) + observation (после наблюдения) |
-| **Portfolio** | Reserve/commit/release баланса. Персистентность в SQLite. Восстановление при рестарте |
-| **Execution** | `ExecutionWorker` (bounded concurrency), `SimulatedExecution` / `LiveExecution`. Команды buy/sell с явными количествами |
-| **Pulse Monitor** | Stream-based мониторинг, каждый трейд ровно раз. Тренд (rising/stable/declining) |
-| **Exit Manager** | Жёсткие (creator dump, pulse dead, whale exit) и частичные (profit, weak pulse) выходы, moon bag 10% |
-| **Engine** | `PulseBot` — event loop + execution worker + bounded concurrency через Semaphore |
+```bash
+# Live мониторинг — подключается к Pump.fun WS, скорит токены
+python main.py monitor
 
-### Лончпады
+# Бэктест — replay собранных данных через тот же Pipeline код
+python main.py backtest
 
-| Платформа | Bonding Curve | Graduation |
-|-----------|---------------|------------|
-| Pump.fun | Экспоненциальная | 85 SOL → PumpSwap |
-| LetsBonk | Экспоненциальная | → Raydium |
-| Believe | Динамическая (анти-снайпер) | → Jupiter |
-| LaunchLab | Линейная / Экспоненциальная / Логарифмическая | → Raydium |
+# Верификация — доказывает что backtest = live (должно быть 100%)
+python main.py verify
 
-## Стек технологий
+# Grid search — перебор параметров
+python main.py optimize
 
-| Что | Чем |
-|-----|-----|
-| Язык | Python 3.10+ |
-| Async | asyncio + aiohttp + websockets |
-| Solana SDK | solders (keypair, tx) + solana-py (RPC) |
-| БД | SQLite (sqlite3, без ORM) |
-| Конфиг | dataclass с пресетами (Config) |
-| Логирование | structlog (JSON логи) |
-| RPC | Helius free tier |
-| Исторические данные | Bitquery GraphQL |
+# Качество кода
+./qa
+
+# Dashboards
+streamlit run pulse_bot/dashboard.py --server.port 8501           # live
+streamlit run pulse_bot/backtest_dashboard.py --server.port 8502  # backtest results
+```
+
+## Backtest = Live (100% match)
+
+Бэктест использует тот же `Pipeline` код что и live бот. Разница только в источнике данных:
+
+| | Live | Backtest |
+|---|---|---|
+| Launchpad | PumpFunLaunchpad (WebSocket) | ReplayLaunchpad (SQLite) |
+| Pipeline | тот же код | тот же код |
+| Scorer | тот же код | тот же код |
+| token_scores.source | 'live' | 'backtest' |
+
+Верификация:
+```bash
+python main.py monitor    # собрать данные (2+ мин)
+python main.py verify     # replay + сравнить
+```
+
+Гарантии детерминизма:
+- `insert_token` + `upsert_creator` — в main loop (последовательно)
+- Creator snapshot замораживается ДО параллельной задачи
+- Replay загружает ровно те же trade IDs что видел live (fast_trade_ids, full_trade_ids)
+- FastFilter возвращает WAIT при 0 трейдов (не фейковый FAST_BUY)
+
+## Двухфазный скоринг
+
+| Фаза | Время | Решение | Когда покупаем |
+|------|-------|---------|---------------|
+| Fast | 5 сек | FAST_BUY / WAIT | entry_mode = fast или both |
+| Full | 45 сек | BUY / BORDERLINE / SKIP | entry_mode = full или both |
+
+`entry_mode` задаётся в конфиге. Default: `fast`.
+
+## 62 метрики на токен
+
+Все записываются в SQLite для анализа и backtesting:
+
+**Trade patterns:** buy_count, sell_count, unique_buyers, buy_volume_sol, buy_diversity, avg/median/std buy size, top3 concentration, repeat buyers, buy velocity trend, sell pressure, ...
+
+**Bonding curve:** curve_progress_pct, curve_velocity, curve_acceleration, sol_to_graduation, market_cap_sol
+
+**Token metadata:** name_length, symbol_length, has_uri, is_all_caps, has_numbers
+
+**Timing:** hour_utc, creator_tokens_today, gap_create_to_first_trade
+
+**P&L:** pnl_5th/10th/20th/50th/100th_pct — P&L если бы вошли на N-м покупателе
+
+## Конфигурация
+
+80+ параметров в `pulse_bot/config.py`:
+
+- Fast phase: observe_seconds, min_buys, min_volume, max_sell_ratio, scoring weights
+- Full phase: observe_seconds, score thresholds, buyer/volume/curve weights
+- Execution: fee, slippage model, buy amount
+- Pulse monitor: window_size, dead/weak buy rate, trend threshold
+- Exit rules: stop loss, max hold, partial sells, moonbag
+- Portfolio: initial balance, max positions
+
+Все параметры конфигурируемые для grid search optimizer.
 
 ## Быстрый старт
-
-### Требования
-
-- Python 3.10+
-- Helius API ключ (бесплатный tier)
-- Solana кошелёк для бота (отдельный, не основной)
-
-### Установка
 
 ```bash
 git clone <repo-url>
@@ -119,109 +153,19 @@ cd gg
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+
+# Запустить мониторинг
+python main.py monitor
+
+# В другом терминале — dashboard
+streamlit run pulse_bot/dashboard.py --server.port 8501
 ```
-
-### Проверки качества
-
-```bash
-# Установить локальный git hook
-python -m pre_commit install
-
-# Запустить все проверки вручную
-bash scripts/check_quality.sh
-```
-
-Скрипт запускает compileall, Ruff, Black, isort, mypy, Pylint, pytest с покрытием `src >= 90%`, Bandit, pip-audit и все pre-commit hooks. `pip-audit` требует доступ к сети для проверки vulnerability metadata.
-
-### Запуск
-
-```bash
-# 1. Собрать исторические данные
-python main.py collect --days 7
-
-# 2. Бэктест с дефолтными настройками
-python main.py backtest
-
-# 3. Бэктест с агрессивным пресетом
-python main.py backtest --preset aggressive
-
-# 4. Grid search оптимизация
-python main.py optimize
-
-# 5. Paper trading (всё реально кроме транзакций)
-python main.py paper
-
-# 6. Боевой режим
-python main.py live
-```
-
-## Режимы работы
-
-Разница между режимами — две строки: `source` и `execution`.
-
-| Режим | Source | Execution |
-|-------|--------|-----------|
-| `backtest` | BacktestSource (SQLite) | SimulatedExecution |
-| `paper` | LiveSource (WebSocket) | SimulatedExecution |
-| `live` | LiveSource (WebSocket) | LiveExecution |
-
-**Backtest** — прогон стратегии на исторических данных из Bitquery. Grid search параметров.
-
-**Paper trading** — реальные данные с лончпадов, виртуальные сделки. LiveSource пишет ВСЕ данные в SQLite — завтра прогоняешь вчерашний день через BacktestSource с новыми порогами.
-
-**Live** — реальные транзакции на mainnet. Отдельный кошелёк, закидывать ровно столько сколько готов потерять.
-
-## Конфигурация
-
-Config — dataclass с пресетами:
-
-| Пресет | observe_seconds | score_threshold | pulse_dead | hard_stop |
-|--------|----------------|-----------------|------------|-----------|
-| CONSERVATIVE | 60 | 30 | 0.15 | 0.30 |
-| MODERATE | 45 | 20 | 0.10 | 0.50 |
-| AGGRESSIVE | 30 | 10 | 0.05 | 0.70 |
-
-Основные секции: бюджет, наблюдение, фильтры создателя, пульс, выходы, лончпад, инфра.
-
-## Хранение данных
-
-SQLite с таблицами:
-
-- `tokens` — все обнаруженные токены с метаданными
-- `trades` — все сделки по токенам (для бэктеста и наблюдения)
-- `creators` — кеш создателей (досье, graduation rate, блеклист)
-- `positions` — открытые позиции (восстанавливаются при рестарте)
-- `fills` — все исполненные сделки с command_id и correlation_id
-- `reservations` — pending buy orders (защита от race conditions)
-- `balance` — текущий баланс и резервации
-- `execution_attempts` — попытки исполнения (для отладки live)
-- `event_log` — лог ВСЕХ событий с event_id и correlation_id
-
-## Метрики успеха
-
-Бот прибыльный если за неделю:
-
-- **Win rate > 35%** (при асимметричной ставке достаточно)
-- **Average win > 2x average loss**
-- **Profit factor > 1.5**
-- **Max drawdown < 50% депозита**
-- **Токенов отфильтровано > 95%**
-- **Slippage реальный vs модельный < 2%**
-
-## Безопасность
-
-- Отдельный кошелёк только для бота, никогда не основной
-- Приватный ключ — из файла, не хардкод
-- RPC ключ — через конфиг, не в коде
-- Начальный депозит: 0.15 SOL (~$20)
 
 ## Документация
 
-- [Техническая спецификация v3](./docs/SOLANA_PULSE_BOT_SPEC.md) — полное описание архитектуры, модулей, кода и алгоритмов
-- [Python Style Guide](./PYTHON_STYLE_GUIDE.md) — стандарты кода
+- [Техническая спецификация](./docs/SOLANA_PULSE_BOT_SPEC.md)
+- [Python Style Guide](./PYTHON_STYLE_GUIDE.md)
 
 ## Автор
 
-**Sergey Chernyakov**
-
-Telegram: [@AIBotsTech](https://t.me/AIBotsTech)
+**Sergey Chernyakov** — Telegram: [@AIBotsTech](https://t.me/AIBotsTech)

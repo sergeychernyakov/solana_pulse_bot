@@ -47,13 +47,18 @@ def main() -> None:
     db.init_schema()
 
     # ── Mode selector ──────────────────────────────────────
-    mode = st.radio("", ["Live", "History"], horizontal=True, label_visibility="collapsed")
+    mode = st.radio(
+        "", ["Live", "History"], horizontal=True, label_visibility="collapsed"
+    )
 
     date_str = ""
     if mode == "History":
         available_dates = db.get_available_dates()
         if available_dates:
-            date_str = st.selectbox("Date", available_dates, label_visibility="collapsed") or ""
+            date_str = (
+                st.selectbox("Date", available_dates, label_visibility="collapsed")
+                or ""
+            )
         else:
             st.info("No historical data yet.")
             return
@@ -128,7 +133,9 @@ def render_token_table(rows: list[dict]) -> None:
     # Fast phase columns
     df["fast"] = df.get("fast_decision", zs).apply(lambda d: d if d else "—")
     df["f_sc"] = df.get("fast_score", zi).apply(lambda s: f"{int(s):+d}" if s else "—")
-    df["f_buys"] = df.get("fast_buy_count", zi).apply(lambda x: str(int(x)) if x else "—")
+    df["f_buys"] = df.get("fast_buy_count", zi).apply(
+        lambda x: str(int(x)) if x else "—"
+    )
     df["f_rate"] = df.get("fast_buy_rate", z).apply(lambda r: f"{r:.1f}" if r else "—")
     df["pnl_f"] = df.get("pnl_at_fast_entry_pct", z).apply(fmt_pnl)
 
@@ -198,11 +205,17 @@ def render_token_table(rows: list[dict]) -> None:
         full = row.get("Full", "")
         fast = row.get("Fast", "")
         if full == "BUY" and fast == "FAST_BUY":
-            return ["background-color: #0a4a0a; color: #6eff6e"] * len(row)  # both agree = bright green
+            return ["background-color: #0a4a0a; color: #6eff6e"] * len(
+                row
+            )  # both agree = bright green
         if full == "BUY":
-            return ["background-color: #1a3a1a; color: #4ade80"] * len(row)  # full BUY = green
+            return ["background-color: #1a3a1a; color: #4ade80"] * len(
+                row
+            )  # full BUY = green
         if full == "BORDERLINE":
-            return ["background-color: #3a3a1a; color: #facc15"] * len(row)  # borderline = yellow
+            return ["background-color: #3a3a1a; color: #facc15"] * len(
+                row
+            )  # borderline = yellow
         return [""] * len(row)  # SKIP = default (no highlight)
 
     styled = display_df.style.apply(color_row, axis=1)
@@ -212,7 +225,9 @@ def render_token_table(rows: list[dict]) -> None:
         use_container_width=True,
         height=min(len(display_df) * 35 + 38, 700),
         hide_index=True,
-        column_config={c: st.column_config.TextColumn(width="small") for c in display_df.columns},
+        column_config={
+            c: st.column_config.TextColumn(width="small") for c in display_df.columns
+        },
     )
 
 

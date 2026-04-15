@@ -68,11 +68,15 @@ class BacktestSource:
         finally:
             conn.close()
 
-    def get_fast_trades(self, mint: str, created_at: float, fast_seconds: float) -> list[Trade]:
+    def get_fast_trades(
+        self, mint: str, created_at: float, fast_seconds: float
+    ) -> list[Trade]:
         """Get trades for fast phase window."""
         return self.get_trades(mint, created_at, created_at + fast_seconds)
 
-    def get_full_trades(self, mint: str, created_at: float, full_seconds: float) -> list[Trade]:
+    def get_full_trades(
+        self, mint: str, created_at: float, full_seconds: float
+    ) -> list[Trade]:
         """Get all trades for full observation window."""
         return self.get_trades(mint, created_at, created_at + full_seconds)
 

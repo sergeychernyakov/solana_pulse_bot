@@ -40,7 +40,9 @@ class SimulatedExecution:
     def __init__(self, config: PulseBotConfig) -> None:
         self._cfg = config
 
-    def simulate_buy(self, trades: list[Trade], amount_sol: float | None = None) -> FillResult:
+    def simulate_buy(
+        self, trades: list[Trade], amount_sol: float | None = None
+    ) -> FillResult:
         """Simulate buying tokens at current market price.
 
         Args:
@@ -61,7 +63,11 @@ class SimulatedExecution:
             )
 
         # Estimate price from recent buy trades
-        buy_trades = [t for t in trades if t.tx_type == "buy" and t.token_amount > 0 and t.sol_amount > 0]
+        buy_trades = [
+            t
+            for t in trades
+            if t.tx_type == "buy" and t.token_amount > 0 and t.sol_amount > 0
+        ]
         if not buy_trades:
             return FillResult(
                 side="buy",
@@ -129,7 +135,10 @@ class SimulatedExecution:
         last_price = priced[-1].sol_amount / priced[-1].token_amount
 
         # Sell slippage is higher (thinner liquidity on the way down)
-        slippage = self._estimate_slippage(tokens_to_sell * last_price, trades) * self._cfg.execution_sell_slippage_mult
+        slippage = (
+            self._estimate_slippage(tokens_to_sell * last_price, trades)
+            * self._cfg.execution_sell_slippage_mult
+        )
         fill_price = last_price * (1.0 - slippage)
 
         gross_sol = tokens_to_sell * fill_price

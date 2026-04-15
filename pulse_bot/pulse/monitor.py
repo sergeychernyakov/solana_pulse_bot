@@ -71,10 +71,15 @@ class PulseMonitor:
         total_sol = sum(t.sol_amount for t in buys)
 
         # Creator
-        creator_selling = any(t.is_creator and t.tx_type == "sell" for t in self._window)
+        creator_selling = any(
+            t.is_creator and t.tx_type == "sell" for t in self._window
+        )
 
         # Whale exit
-        whale_exit = any(t.sol_amount > self._cfg.pulse_whale_exit_sol and t.tx_type == "sell" for t in sells)
+        whale_exit = any(
+            t.sol_amount > self._cfg.pulse_whale_exit_sol and t.tx_type == "sell"
+            for t in sells
+        )
 
         # Trends
         buy_rate_trend = self._compute_trend(buy_rate, self._prev_buy_rate)
@@ -94,7 +99,8 @@ class PulseMonitor:
             last = self._window[-1]
             if last.v_sol_in_bonding_curve > 0:
                 curve_pct = min(
-                    (last.v_sol_in_bonding_curve / self._cfg.pumpfun_graduation_sol) * 100,
+                    (last.v_sol_in_bonding_curve / self._cfg.pumpfun_graduation_sol)
+                    * 100,
                     100,
                 )
 

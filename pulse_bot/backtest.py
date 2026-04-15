@@ -21,7 +21,7 @@ from pulse_bot.sources.backtest import BacktestSource
 if TYPE_CHECKING:
     from pulse_bot.config import PulseBotConfig
     from pulse_bot.db import Database
-    from pulse_bot.models import Token, Trade
+    from pulse_bot.models import ScoringResult, Token, Trade
     from pulse_bot.portfolio import ClosedTrade
 
 logger = logging.getLogger(__name__)
@@ -67,7 +67,9 @@ class BacktestEngine:
         self._scorer = Scorer(config, db)
         self._execution = SimulatedExecution(config)
         self._portfolio = Portfolio(config)
-        self._metrics_calc = MetricsCalculator(graduation_sol=config.pumpfun_graduation_sol)
+        self._metrics_calc = MetricsCalculator(
+            graduation_sol=config.pumpfun_graduation_sol
+        )
 
         # Stats
         self._tokens_seen = 0
@@ -163,16 +165,25 @@ class BacktestEngine:
             full_result.fast_unique_buyers = fast_result.unique_buyers
             full_result.fast_sell_ratio = fast_result.sell_ratio
             full_result.fast_elapsed = fast_result.elapsed
-            full_result.fast_scored_at = token.created_at + self._cfg.fast_observe_seconds
+            full_result.fast_scored_at = (
+                token.created_at + self._cfg.fast_observe_seconds
+            )
             self._save_score_sync(full_result)
 
         # Entry decision
-        if self._cfg.entry_mode in ("fast", "both") and fast_result.decision == "FAST_BUY":
+        if (
+            self._cfg.entry_mode in ("fast", "both")
+            and fast_result.decision == "FAST_BUY"
+        ):
             fill = self._execution.simulate_buy(fast_trades)
             entry_time = token.created_at + self._cfg.fast_observe_seconds
             return EntryCandidate(token, entry_time, "fast", fill)
 
-        if self._cfg.entry_mode in ("full", "both") and full_result and full_result.decision == "BUY":
+        if (
+            self._cfg.entry_mode in ("full", "both")
+            and full_result
+            and full_result.decision == "BUY"
+        ):
             fill = self._execution.simulate_buy(full_trades)
             entry_time = token.created_at + self._cfg.observe_seconds
             return EntryCandidate(token, entry_time, "full", fill)
@@ -182,13 +193,20 @@ class BacktestEngine:
     def _save_score_sync(self, result: ScoringResult) -> None:
         """Write scoring result to DB synchronously."""
         import sqlite3
+
         from pulse_bot.db import _SCORE_COLUMNS, Database
+
         conn = sqlite3.connect(self._cfg.backtest_db_path)
         try:
             placeholders = ", ".join(["?"] * len(_SCORE_COLUMNS))
             cols = ", ".join(_SCORE_COLUMNS)
-            values = tuple(Database._get_score_value(result, col) for col in _SCORE_COLUMNS)
-            conn.execute(f"INSERT OR REPLACE INTO token_scores ({cols}) VALUES ({placeholders})", values)
+            values = tuple(
+                Database._get_score_value(result, col) for col in _SCORE_COLUMNS
+            )
+            conn.execute(
+                f"INSERT OR REPLACE INTO token_scores ({cols}) VALUES ({placeholders})",
+                values,
+            )
             conn.commit()
         finally:
             conn.close()
@@ -202,7 +220,9 @@ class BacktestEngine:
         for trade in self._source.iter_trades():
             self._clock.advance_to(trade.timestamp)
             self._close_expired_positions(trade.timestamp, monitors)
-            candidate_index = self._open_due_candidates(candidates, candidate_index, trade.timestamp, monitors)
+            candidate_index = self._open_due_candidates(
+                candidates, candidate_index, trade.timestamp, monitors
+            )
             if trade.mint in monitors:
                 self._handle_position_trade(trade, monitors)
 
@@ -210,7 +230,9 @@ class BacktestEngine:
             candidate = candidates[candidate_index]
             self._clock.advance_to(candidate.entry_time)
             self._close_expired_positions(candidate.entry_time, monitors)
-            candidate_index = self._open_due_candidates(candidates, candidate_index, candidate.entry_time, monitors)
+            candidate_index = self._open_due_candidates(
+                candidates, candidate_index, candidate.entry_time, monitors
+            )
 
     def _open_due_candidates(
         self,
@@ -233,7 +255,10 @@ class BacktestEngine:
         monitors: dict[str, PositionMonitor],
     ) -> None:
         """Open a position if portfolio constraints allow it at entry time."""
-        if not self._portfolio.can_buy or candidate.token.mint in self._portfolio.positions:
+        if (
+            not self._portfolio.can_buy
+            or candidate.token.mint in self._portfolio.positions
+        ):
             return
         opened = self._portfolio.open_position(
             candidate.token.mint,
@@ -270,20 +295,32 @@ class BacktestEngine:
         if not snapshot:
             return
 
-        current_price = trade.sol_amount / trade.token_amount if trade.token_amount > 0 else pos.entry_price
-        pnl_pct = ((current_price - pos.entry_price) / pos.entry_price) * 100 if pos.entry_price > 0 else 0
+        current_price = (
+            trade.sol_amount / trade.token_amount
+            if trade.token_amount > 0
+            else pos.entry_price
+        )
+        pnl_pct = (
+            ((current_price - pos.entry_price) / pos.entry_price) * 100
+            if pos.entry_price > 0
+            else 0
+        )
         elapsed = trade.timestamp - pos.entry_time
         signal = monitor.exit_manager.decide(snapshot, pnl_pct, elapsed)
 
         if signal.action == "sell_partial":
             tokens_to_sell = pos.tokens_held * signal.sell_pct
             fill = self._execution.simulate_sell(monitor.recent_trades, tokens_to_sell)
-            self._portfolio.partial_sell(trade.mint, signal.sell_pct, fill, trade.timestamp, signal.reason)
+            self._portfolio.partial_sell(
+                trade.mint, signal.sell_pct, fill, trade.timestamp, signal.reason
+            )
 
         elif signal.action == "sell_all":
             tokens_to_sell = pos.tokens_held * pos.remaining_pct
             fill = self._execution.simulate_sell(monitor.recent_trades, tokens_to_sell)
-            self._portfolio.close_position(trade.mint, fill, trade.timestamp, signal.reason)
+            self._portfolio.close_position(
+                trade.mint, fill, trade.timestamp, signal.reason
+            )
             monitors.pop(trade.mint, None)
 
     def _close_expired_positions(
@@ -299,7 +336,9 @@ class BacktestEngine:
             recent = monitor.recent_trades if monitor else []
             tokens_left = pos.tokens_held * pos.remaining_pct
             fill = self._execution.simulate_sell(recent, tokens_left)
-            self._portfolio.close_position(mint, fill, pos.entry_time + self._cfg.exit_max_hold_seconds, "timeout")
+            self._portfolio.close_position(
+                mint, fill, pos.entry_time + self._cfg.exit_max_hold_seconds, "timeout"
+            )
             monitors.pop(mint, None)
 
     def _close_remaining_positions(self) -> None:
@@ -343,10 +382,16 @@ class BacktestEngine:
             max_drawdown_pct=self._portfolio.max_drawdown_pct,
             final_balance_sol=self._portfolio.balance,
             initial_balance_sol=self._cfg.portfolio_initial_sol,
-            roi_pct=((self._portfolio.balance - self._cfg.portfolio_initial_sol) / self._cfg.portfolio_initial_sol)
+            roi_pct=(
+                (self._portfolio.balance - self._cfg.portfolio_initial_sol)
+                / self._cfg.portfolio_initial_sol
+            )
             * 100,
             avg_hold_seconds=sum(t.hold_seconds for t in trades) / max(len(trades), 1),
-            exit_reasons={r: sum(1 for t in trades if t.exit_reason == r) for r in set(t.exit_reason for t in trades)},
+            exit_reasons={
+                r: sum(1 for t in trades if t.exit_reason == r)
+                for r in set(t.exit_reason for t in trades)
+            },
             entry_types={
                 "fast": sum(1 for t in trades if t.entry_type == "fast"),
                 "full": sum(1 for t in trades if t.entry_type == "full"),
@@ -418,12 +463,23 @@ class BacktestResult:
             "-" * 60,
             "  Entry types:",
         ]
-        lines.extend(f"    {etype}: {count}" for etype, count in self.entry_types.items())
+        lines.extend(
+            f"    {etype}: {count}" for etype, count in self.entry_types.items()
+        )
         lines.append("  Exit reasons:")
         lines.extend(
-            f"    {reason}: {count}" for reason, count in sorted(self.exit_reasons.items(), key=lambda item: -item[1])
+            f"    {reason}: {count}"
+            for reason, count in sorted(
+                self.exit_reasons.items(), key=lambda item: -item[1]
+            )
         )
-        lines.extend(["-" * 60, f"  Wall time:         {self.elapsed_wall_seconds:.1f}s", "=" * 60])
+        lines.extend(
+            [
+                "-" * 60,
+                f"  Wall time:         {self.elapsed_wall_seconds:.1f}s",
+                "=" * 60,
+            ]
+        )
 
         by_pnl = sorted(self.closed_trades, key=lambda t: t.pnl_pct, reverse=True)
         lines.append("")

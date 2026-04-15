@@ -103,7 +103,9 @@ class PumpFunLaunchpad(Launchpad):
         self._trade_queues.pop(mint, None)
         self._token_creators.pop(mint, None)
 
-    async def stream_trades(self, mint: str, duration_seconds: float) -> AsyncIterator[Trade]:
+    async def stream_trades(
+        self, mint: str, duration_seconds: float
+    ) -> AsyncIterator[Trade]:
         """Yield trades for a mint during the observation window."""
         queue = self._trade_queues.get(mint)
         if not queue:
@@ -177,7 +179,9 @@ class PumpFunLaunchpad(Launchpad):
 
     async def _establish_connection(self) -> None:
         """Connect to WS and send initial subscription."""
-        self._ws = await websockets.connect(self.ws_url, ping_interval=30, ping_timeout=10)
+        self._ws = await websockets.connect(
+            self.ws_url, ping_interval=30, ping_timeout=10
+        )
         await self._ws.send(json.dumps({"method": "subscribeNewToken"}))
         logger.info("Subscribed to new tokens on PumpFun")
 
@@ -203,10 +207,14 @@ class PumpFunLaunchpad(Launchpad):
                 try:
                     await self._establish_connection()
                     if self._ws is None:
-                        raise ConnectionError("WebSocket reconnect returned no connection")
+                        raise ConnectionError(
+                            "WebSocket reconnect returned no connection"
+                        )
                     # Re-subscribe to all active trade mints
                     for mint in list(self._trade_queues.keys()):
-                        sub_msg = json.dumps({"method": "subscribeTokenTrade", "keys": [mint]})
+                        sub_msg = json.dumps(
+                            {"method": "subscribeTokenTrade", "keys": [mint]}
+                        )
                         await self._ws.send(sub_msg)
                     reconnect_count = 0
                     logger.info("WS reconnected successfully")

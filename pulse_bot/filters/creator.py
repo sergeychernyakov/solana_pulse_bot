@@ -56,17 +56,26 @@ class CreatorFilter(Filter):
         # Serial creator penalty
         if stats.total_tokens_created > self._config.creator_serial_threshold:
             if stats.tokens_where_creator_sold_early > 0:
-                sell_rate = stats.tokens_where_creator_sold_early / stats.total_tokens_created
+                sell_rate = (
+                    stats.tokens_where_creator_sold_early / stats.total_tokens_created
+                )
                 if sell_rate > 0.5:
                     score -= 20
-                    reasons.append(f"serial_dumper({stats.total_tokens_created}tok,{sell_rate:.0%}sell)")
+                    reasons.append(
+                        f"serial_dumper({stats.total_tokens_created}tok,{sell_rate:.0%}sell)"
+                    )
                 else:
                     score -= 10
                     reasons.append(f"serial_creator({stats.total_tokens_created}tok)")
             else:
                 score -= 5
-                reasons.append(f"serial_creator({stats.total_tokens_created}tok,no_dumps)")
-        elif stats.total_tokens_created > 1 and stats.tokens_where_creator_sold_early == 0:
+                reasons.append(
+                    f"serial_creator({stats.total_tokens_created}tok,no_dumps)"
+                )
+        elif (
+            stats.total_tokens_created > 1
+            and stats.tokens_where_creator_sold_early == 0
+        ):
             score += 10
             reasons.append(f"clean_creator({stats.total_tokens_created}tok)")
 

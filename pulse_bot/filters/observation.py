@@ -68,7 +68,9 @@ class ObservationFilter(Filter):
 
     # ── Observation computation ────────────────────────────────
 
-    def _compute_observation(self, token: Token, trades: list[Trade]) -> ObservationResult:
+    def _compute_observation(
+        self, token: Token, trades: list[Trade]
+    ) -> ObservationResult:
         """Aggregate raw trades into observation metrics."""
         buys = [t for t in trades if t.tx_type == "buy"]
         sells = [t for t in trades if t.tx_type == "sell"]
@@ -89,7 +91,11 @@ class ObservationFilter(Filter):
             last_trade = trades[-1]
             curve_pct = (
                 min(
-                    (last_trade.v_sol_in_bonding_curve / self._config.pumpfun_graduation_sol) * 100.0,
+                    (
+                        last_trade.v_sol_in_bonding_curve
+                        / self._config.pumpfun_graduation_sol
+                    )
+                    * 100.0,
                     100.0,
                 )
                 if last_trade.v_sol_in_bonding_curve > 0

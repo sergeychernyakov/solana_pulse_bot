@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-import time
 from typing import AsyncIterator
 
 from pulse_bot.launchpads.base import Launchpad
@@ -39,7 +38,9 @@ class ReplayLaunchpad(Launchpad):
         self._speed = speed
         self._trade_queues: dict[str, asyncio.Queue[Trade]] = {}
         self._token_creators: dict[str, str] = {}
-        self._live_counts: dict[str, dict] = {}  # mint → {fast_trade_count, full_trade_count}
+        self._live_counts: dict[str, dict] = (
+            {}
+        )  # mint → {fast_trade_count, full_trade_count}
         self._stream_phase: dict[str, int] = {}  # mint → 0=fast, 1=full
         self._running = False
         self._feeder_task: asyncio.Task | None = None
@@ -71,9 +72,13 @@ class ReplayLaunchpad(Launchpad):
                 if not self._running:
                     break
                 token = Token(
-                    mint=row["mint"], name=row["name"] or "", symbol=row["symbol"] or "",
-                    creator=row["creator"] or "", created_at=row["created_at"],
-                    uri=row["uri"] or "", launchpad="pumpfun",
+                    mint=row["mint"],
+                    name=row["name"] or "",
+                    symbol=row["symbol"] or "",
+                    creator=row["creator"] or "",
+                    created_at=row["created_at"],
+                    uri=row["uri"] or "",
+                    launchpad="pumpfun",
                 )
                 self._token_creators[token.mint] = token.creator
 
@@ -133,15 +138,23 @@ class ReplayLaunchpad(Launchpad):
                 )
             else:
                 # No live data: load all trades for this mint
-                cur = conn.execute("SELECT * FROM trades WHERE mint = ? ORDER BY timestamp ASC, id ASC", (mint,))
+                cur = conn.execute(
+                    "SELECT * FROM trades WHERE mint = ? ORDER BY timestamp ASC, id ASC",
+                    (mint,),
+                )
 
             creator = self._token_creators.get(mint, "")
             for row in cur:
                 trade = Trade(
-                    mint=mint, wallet=row["wallet"], tx_type=row["tx_type"],
+                    mint=mint,
+                    wallet=row["wallet"],
+                    tx_type=row["tx_type"],
                     sol_amount=row["sol_amount"] or 0.0,
-                    token_amount=row["token_amount"] if "token_amount" in row.keys() else 0.0,
-                    new_token_balance=0.0, bonding_curve_key="",
+                    token_amount=(
+                        row["token_amount"] if "token_amount" in row.keys() else 0.0
+                    ),
+                    new_token_balance=0.0,
+                    bonding_curve_key="",
                     v_sol_in_bonding_curve=row["v_sol_in_bonding_curve"] or 0.0,
                     v_tokens_in_bonding_curve=0.0,
                     market_cap_sol=row["market_cap_sol"] or 0.0,
@@ -159,7 +172,9 @@ class ReplayLaunchpad(Launchpad):
         self._trade_queues.pop(mint, None)
         self._token_creators.pop(mint, None)
 
-    async def stream_trades(self, mint: str, duration_seconds: float) -> AsyncIterator[Trade]:
+    async def stream_trades(
+        self, mint: str, duration_seconds: float
+    ) -> AsyncIterator[Trade]:
         """Yield exactly the same trades that live pipeline collected.
 
         Uses ID-based filtering from live scores for 100% exact match.
@@ -236,10 +251,15 @@ class ReplayLaunchpad(Launchpad):
 
                 creator = self._token_creators.get(mint, "")
                 trade = Trade(
-                    mint=mint, wallet=row["wallet"], tx_type=row["tx_type"],
+                    mint=mint,
+                    wallet=row["wallet"],
+                    tx_type=row["tx_type"],
                     sol_amount=row["sol_amount"] or 0.0,
-                    token_amount=row["token_amount"] if "token_amount" in row.keys() else 0.0,
-                    new_token_balance=0.0, bonding_curve_key="",
+                    token_amount=(
+                        row["token_amount"] if "token_amount" in row.keys() else 0.0
+                    ),
+                    new_token_balance=0.0,
+                    bonding_curve_key="",
                     v_sol_in_bonding_curve=row["v_sol_in_bonding_curve"] or 0.0,
                     v_tokens_in_bonding_curve=0.0,
                     market_cap_sol=row["market_cap_sol"] or 0.0,

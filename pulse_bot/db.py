@@ -262,7 +262,10 @@ class Database:
         """Most recent scored tokens, newest first."""
         conn = self._get_sync_conn()
         try:
-            cur = conn.execute("SELECT * FROM token_scores WHERE source = ? ORDER BY scored_at DESC LIMIT ?", (source, limit))
+            cur = conn.execute(
+                "SELECT * FROM token_scores WHERE source = ? ORDER BY scored_at DESC LIMIT ?",
+                (source, limit),
+            )
             return [dict(row) for row in cur.fetchall()]
         finally:
             conn.close()
@@ -283,14 +286,17 @@ class Database:
         """Aggregate stats."""
         conn = self._get_sync_conn()
         try:
-            cur = conn.execute("""
+            cur = conn.execute(
+                """
                 SELECT COUNT(*) as total_seen,
                     SUM(CASE WHEN decision = 'BUY' THEN 1 ELSE 0 END) as total_buy,
                     SUM(CASE WHEN decision = 'SKIP' THEN 1 ELSE 0 END) as total_skip,
                     SUM(CASE WHEN decision = 'BORDERLINE' THEN 1 ELSE 0 END) as total_borderline,
                     SUM(CASE WHEN fast_decision = 'FAST_BUY' THEN 1 ELSE 0 END) as total_fast_buy
                 FROM token_scores WHERE source = ?
-            """, (source,))
+            """,
+                (source,),
+            )
             row = cur.fetchone()
             return (
                 dict(row)
@@ -397,7 +403,9 @@ class Database:
 
     # ── Optimizer reads (backtest dashboard) ─────────────────
 
-    def get_optimization_runs(self, session: str | None = None, limit: int = 500) -> list[dict]:
+    def get_optimization_runs(
+        self, session: str | None = None, limit: int = 500
+    ) -> list[dict]:
         """Get optimization runs, optionally filtered by session."""
         conn = self._get_sync_conn()
         try:
@@ -408,7 +416,8 @@ class Database:
                 )
             else:
                 cur = conn.execute(
-                    "SELECT * FROM optimization_runs ORDER BY created_at DESC LIMIT ?", (limit,),
+                    "SELECT * FROM optimization_runs ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
                 )
             return [dict(row) for row in cur.fetchall()]
         finally:
@@ -418,7 +427,8 @@ class Database:
         """Get list of optimizer sessions with summary stats."""
         conn = self._get_sync_conn()
         try:
-            cur = conn.execute("""
+            cur = conn.execute(
+                """
                 SELECT optimizer_session,
                     COUNT(*) as run_count,
                     MAX(profit_factor) as best_pf,
@@ -429,7 +439,8 @@ class Database:
                 FROM optimization_runs
                 GROUP BY optimizer_session
                 ORDER BY last_run_at DESC
-            """)
+            """
+            )
             return [dict(row) for row in cur.fetchall()]
         finally:
             conn.close()
@@ -460,20 +471,31 @@ class Database:
                  avg_hold_seconds, fast_buys, full_buys, exit_reasons, trades_json, created_at)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    run_data["run_id"], run_data["session"], run_data["params"],
+                    run_data["run_id"],
+                    run_data["session"],
+                    run_data["params"],
                     run_data["entry_mode"],
-                    run_data["total_trades"], run_data["wins"], run_data["losses"],
-                    run_data["win_rate"], run_data["total_pnl_sol"],
-                    run_data["gross_profit_sol"], run_data["gross_loss_sol"],
+                    run_data["total_trades"],
+                    run_data["wins"],
+                    run_data["losses"],
+                    run_data["win_rate"],
+                    run_data["total_pnl_sol"],
+                    run_data["gross_profit_sol"],
+                    run_data["gross_loss_sol"],
                     run_data["profit_factor"],
-                    run_data["avg_win_pct"], run_data["avg_loss_pct"],
-                    run_data["avg_win_sol"], run_data["avg_loss_sol"],
+                    run_data["avg_win_pct"],
+                    run_data["avg_loss_pct"],
+                    run_data["avg_win_sol"],
+                    run_data["avg_loss_sol"],
                     run_data["max_drawdown_pct"],
-                    run_data["initial_balance_sol"], run_data["final_balance_sol"],
+                    run_data["initial_balance_sol"],
+                    run_data["final_balance_sol"],
                     run_data["roi_pct"],
                     run_data["avg_hold_seconds"],
-                    run_data["fast_buys"], run_data["full_buys"],
-                    run_data["exit_reasons"], run_data["trades_json"],
+                    run_data["fast_buys"],
+                    run_data["full_buys"],
+                    run_data["exit_reasons"],
+                    run_data["trades_json"],
                     run_data["created_at"],
                 ),
             )
@@ -487,13 +509,21 @@ class Database:
                      hold_seconds, partial_sells)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
-                        run_data["run_id"], t["mint"], t["symbol"],
-                        t["entry_type"], t["exit_reason"],
-                        t["entry_price"], t["exit_price"],
-                        t["entry_time"], t["exit_time"],
-                        t["sol_invested"], t["sol_received"],
-                        t["pnl_sol"], t["pnl_pct"],
-                        t["hold_seconds"], t["partial_sells"],
+                        run_data["run_id"],
+                        t["mint"],
+                        t["symbol"],
+                        t["entry_type"],
+                        t["exit_reason"],
+                        t["entry_price"],
+                        t["exit_price"],
+                        t["entry_time"],
+                        t["exit_time"],
+                        t["sol_invested"],
+                        t["sol_received"],
+                        t["pnl_sol"],
+                        t["pnl_pct"],
+                        t["hold_seconds"],
+                        t["partial_sells"],
                     ),
                 )
             conn.commit()
@@ -503,10 +533,12 @@ class Database:
     def get_creator_stats_from_tokens_sync(self, wallet: str) -> CreatorStats | None:
         """Compute creator stats directly from tokens table (deterministic, no cache)."""
         from pulse_bot.models import CreatorStats
+
         conn = self._get_sync_conn()
         try:
             row = conn.execute(
-                "SELECT COUNT(*) as total FROM tokens WHERE creator = ?", (wallet,),
+                "SELECT COUNT(*) as total FROM tokens WHERE creator = ?",
+                (wallet,),
             ).fetchone()
             total = row["total"] if row else 0
             if total == 0:
@@ -648,10 +680,19 @@ class Database:
                 (mint, symbol, fast_decision, fast_score, full_decision, full_score,
                  buy_count, unique_buyers, buy_volume_sol, created_at, decided_at)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (data["mint"], data["symbol"], data["fast_decision"], data["fast_score"],
-                 data["full_decision"], data["full_score"],
-                 data["buy_count"], data["unique_buyers"], data["buy_volume_sol"],
-                 data["created_at"], data["decided_at"]),
+                (
+                    data["mint"],
+                    data["symbol"],
+                    data["fast_decision"],
+                    data["fast_score"],
+                    data["full_decision"],
+                    data["full_score"],
+                    data["buy_count"],
+                    data["unique_buyers"],
+                    data["buy_volume_sol"],
+                    data["created_at"],
+                    data["decided_at"],
+                ),
             )
             await conn.commit()
 
@@ -668,7 +709,9 @@ class Database:
     @staticmethod
     def _ensure_token_score_columns(conn: sqlite3.Connection) -> None:
         """Add new token_scores columns for existing SQLite databases."""
-        existing = {row["name"] for row in conn.execute("PRAGMA table_info(token_scores)")}
+        existing = {
+            row["name"] for row in conn.execute("PRAGMA table_info(token_scores)")
+        }
         columns = {
             "pnl_50th_pct": "REAL DEFAULT 0.0",
             "pnl_100th_pct": "REAL DEFAULT 0.0",

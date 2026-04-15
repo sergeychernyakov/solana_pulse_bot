@@ -69,12 +69,17 @@ class Portfolio:
 
     @property
     def can_buy(self) -> bool:
-        return self.open_count < self._cfg.portfolio_max_positions and self.balance >= self._cfg.buy_amount_sol
+        return (
+            self.open_count < self._cfg.portfolio_max_positions
+            and self.balance >= self._cfg.buy_amount_sol
+        )
 
     @property
     def total_value(self) -> float:
         """Balance + estimated value of open positions (at entry price)."""
-        open_val = sum(p.sol_invested * p.remaining_pct for p in self.positions.values())
+        open_val = sum(
+            p.sol_invested * p.remaining_pct for p in self.positions.values()
+        )
         return self.balance + open_val
 
     @property
@@ -144,7 +149,9 @@ class Portfolio:
             reason,
         )
 
-    def close_position(self, mint: str, fill: FillResult, exit_time: float, reason: str) -> ClosedTrade | None:
+    def close_position(
+        self, mint: str, fill: FillResult, exit_time: float, reason: str
+    ) -> ClosedTrade | None:
         """Close a position completely."""
         pos = self.positions.get(mint)
         if not pos:

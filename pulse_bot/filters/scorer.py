@@ -143,7 +143,11 @@ class Scorer:
         cfg = self._cfg
 
         # ── Creator (use snapshot taken in main loop for deterministic parallel scoring) ──
-        stats = self._creator_snapshot if self._creator_snapshot else self._db.get_creator_stats_sync(token.creator)
+        stats = (
+            self._creator_snapshot
+            if self._creator_snapshot
+            else self._db.get_creator_stats_sync(token.creator)
+        )
         if stats and stats.blacklisted:
             yield 0, "creator_blacklisted", True
             return
@@ -240,9 +244,15 @@ class Scorer:
         yield 0, "authority:N/A", False
         yield 0, "bundled_buy:N/A", False
 
-    def _compute_pnl(self, trades: list[Trade], exit_price: float) -> tuple[float, float, float, float, float]:
+    def _compute_pnl(
+        self, trades: list[Trade], exit_price: float
+    ) -> tuple[float, float, float, float, float]:
         """Compute P&L at 5th, 10th, 20th, 50th, 100th average entry."""
-        buys = [t for t in trades if t.tx_type == "buy" and t.token_amount > 0 and t.sol_amount > 0]
+        buys = [
+            t
+            for t in trades
+            if t.tx_type == "buy" and t.token_amount > 0 and t.sol_amount > 0
+        ]
         results = []
         for nth in [5, 10, 20, 50, 100]:
             if nth <= len(buys) and exit_price > 0:
@@ -250,7 +260,11 @@ class Scorer:
                 total_sol = sum(t.sol_amount for t in first_n)
                 total_tokens = sum(t.token_amount for t in first_n)
                 avg_entry = total_sol / total_tokens if total_tokens > 0 else 0
-                pnl = ((exit_price - avg_entry) / avg_entry) * 100.0 if avg_entry > 0 else 0
+                pnl = (
+                    ((exit_price - avg_entry) / avg_entry) * 100.0
+                    if avg_entry > 0
+                    else 0
+                )
                 results.append(pnl)
             else:
                 results.append(0.0)

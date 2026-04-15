@@ -93,9 +93,13 @@ class PulseBotConfig:
     execution_fee_pct: float = 0.01  # 1% Pump.fun fee
     execution_priority_fee: float = 0.0001  # priority fee SOL
     execution_base_slippage: float = 0.02  # 2% base slippage
-    execution_slippage_per_volume_pct: float = 0.05  # additional slippage per volume ratio
+    execution_slippage_per_volume_pct: float = (
+        0.05  # additional slippage per volume ratio
+    )
     execution_max_slippage: float = 0.25  # 25% max slippage cap
-    execution_sell_slippage_mult: float = 1.5  # sell slippage multiplier (thinner liquidity)
+    execution_sell_slippage_mult: float = (
+        1.5  # sell slippage multiplier (thinner liquidity)
+    )
 
     # ── ENTRY STRATEGY ─────────────────────────────────────
     entry_mode: str = "fast"  # "fast" | "full" | "both"

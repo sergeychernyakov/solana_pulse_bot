@@ -29,10 +29,17 @@ class FastFilter:
         # No trades = no signal
         if not trades:
             return FastResult(
-                decision="WAIT", score=0, reasons="no_trades",
-                buy_count=0, sell_count=0, unique_buyers=0,
-                volume_sol=0.0, buy_rate=0.0, sell_ratio=0.0,
-                curve_pct=0.0, elapsed=0.0,
+                decision="WAIT",
+                score=0,
+                reasons="no_trades",
+                buy_count=0,
+                sell_count=0,
+                unique_buyers=0,
+                volume_sol=0.0,
+                buy_rate=0.0,
+                sell_ratio=0.0,
+                curve_pct=0.0,
+                elapsed=0.0,
             )
 
         buys = [t for t in trades if t.tx_type == "buy"]
@@ -61,12 +68,15 @@ class FastFilter:
         curve_pct = 0.0
         if trades and trades[-1].v_sol_in_bonding_curve > 0:
             curve_pct = min(
-                (trades[-1].v_sol_in_bonding_curve / self._cfg.pumpfun_graduation_sol) * 100.0,
+                (trades[-1].v_sol_in_bonding_curve / self._cfg.pumpfun_graduation_sol)
+                * 100.0,
                 100.0,
             )
 
         # Creator sold?
-        creator_sold = any(t.wallet == token.creator and t.tx_type == "sell" for t in trades)
+        creator_sold = any(
+            t.wallet == token.creator and t.tx_type == "sell" for t in trades
+        )
 
         # ── Hard rejects ───────────────────────────────────
 
@@ -130,7 +140,9 @@ class FastFilter:
             reasons.append(f"curve_high_{curve_pct:.1f}%")
 
         # Decision
-        decision = "FAST_BUY" if total_score >= self._cfg.fast_score_threshold else "WAIT"
+        decision = (
+            "FAST_BUY" if total_score >= self._cfg.fast_score_threshold else "WAIT"
+        )
 
         return FastResult(
             decision=decision,
