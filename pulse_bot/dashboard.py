@@ -133,6 +133,8 @@ def render_token_table(rows: list[dict]) -> None:
     df["pnl5"] = df.get("pnl_5th_pct", z).apply(fmt_pnl)
     df["pnl10"] = df.get("pnl_10th_pct", z).apply(fmt_pnl)
     df["pnl20"] = df.get("pnl_20th_pct", z).apply(fmt_pnl)
+    df["pnl50"] = df.get("pnl_50th_pct", z).apply(fmt_pnl)
+    df["pnl100"] = df.get("pnl_100th_pct", z).apply(fmt_pnl)
     df["score_f"] = df["total_score"].apply(lambda s: f"{s:+d}")
 
     # Select and rename
@@ -140,7 +142,7 @@ def render_token_table(rows: list[dict]) -> None:
         "time", "symbol", "mint_s",
         "fast", "f_sc", "f_buys", "f_rate", "pnl_f",
         "mcap", "unique_buyers", "buys", "sells", "vol",
-        "curve", "pnl5", "pnl10", "pnl20",
+        "curve", "pnl5", "pnl10", "pnl20", "pnl50", "pnl100",
         "score_f", "decision",
     ]].copy()
 
@@ -148,23 +150,21 @@ def render_token_table(rows: list[dict]) -> None:
         "Time", "Sym", "Mint",
         "Fast", "F.Sc", "F.Buys", "Rate/s", "F.P&L",
         "MCap", "Uniq", "Buys", "Sells", "Vol",
-        "Curve", "~5", "~10", "~20",
+        "Curve", "~5", "~10", "~20", "~50", "~100",
         "Score", "Full",
     ]
 
-    # Color rows: FAST_BUY = bright green, BUY = green, BORDERLINE = yellow
+    # Color by FULL decision only. Fast shown in column text.
     def color_row(row: pd.Series) -> list[str]:
-        fast = row.get("Fast", "")
         full = row.get("Full", "")
-        if fast == "FAST_BUY" and full == "BUY":
-            return ["background-color: #0a4a0a; color: #6eff6e"] * len(row)
-        if fast == "FAST_BUY":
-            return ["background-color: #1a4a2a; color: #4ade80"] * len(row)
+        fast = row.get("Fast", "")
+        if full == "BUY" and fast == "FAST_BUY":
+            return ["background-color: #0a4a0a; color: #6eff6e"] * len(row)  # both agree = bright green
         if full == "BUY":
-            return ["background-color: #1a3a1a; color: #4ade80"] * len(row)
+            return ["background-color: #1a3a1a; color: #4ade80"] * len(row)  # full BUY = green
         if full == "BORDERLINE":
-            return ["background-color: #3a3a1a; color: #facc15"] * len(row)
-        return [""] * len(row)
+            return ["background-color: #3a3a1a; color: #facc15"] * len(row)  # borderline = yellow
+        return [""] * len(row)  # SKIP = default (no highlight)
 
     styled = display_df.style.apply(color_row, axis=1)
 

@@ -56,7 +56,7 @@ class Scorer:
                 break
 
         # P&L calculations
-        pnl_5, pnl_10, pnl_20 = self._compute_pnl(trades, m.exit_price)
+        pnl_5, pnl_10, pnl_20, pnl_50, pnl_100 = self._compute_pnl(trades, m.exit_price)
 
         # Decision
         if hard_rejected:
@@ -90,7 +90,7 @@ class Scorer:
             market_cap_sol=m.market_cap_sol,
             # Price
             token_price_sol=m.token_price_sol, exit_price=m.exit_price,
-            pnl_5th_pct=pnl_5, pnl_10th_pct=pnl_10, pnl_20th_pct=pnl_20,
+            pnl_5th_pct=pnl_5, pnl_10th_pct=pnl_10, pnl_20th_pct=pnl_20, pnl_50th_pct=pnl_50, pnl_100th_pct=pnl_100,
             # Metadata
             name_length=m.name_length, symbol_length=m.symbol_length,
             has_uri=m.has_uri, is_all_caps=m.is_all_caps, has_numbers=m.has_numbers,
@@ -213,11 +213,11 @@ class Scorer:
         yield 0, "authority:N/A", False
         yield 0, "bundled_buy:N/A", False
 
-    def _compute_pnl(self, trades: list[Trade], exit_price: float) -> tuple[float, float, float]:
-        """Compute P&L at 5th, 10th, 20th average entry."""
+    def _compute_pnl(self, trades: list[Trade], exit_price: float) -> tuple[float, float, float, float, float]:
+        """Compute P&L at 5th, 10th, 20th, 50th, 100th average entry."""
         buys = [t for t in trades if t.tx_type == "buy" and t.token_amount > 0 and t.sol_amount > 0]
         results = []
-        for nth in [5, 10, 20]:
+        for nth in [5, 10, 20, 50, 100]:
             if nth <= len(buys) and exit_price > 0:
                 first_n = buys[:nth]
                 total_sol = sum(t.sol_amount for t in first_n)
@@ -227,4 +227,4 @@ class Scorer:
                 results.append(pnl)
             else:
                 results.append(0.0)
-        return results[0], results[1], results[2]
+        return results[0], results[1], results[2], results[3], results[4]

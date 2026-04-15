@@ -113,6 +113,8 @@ class ScoringResult:
     pnl_5th_pct: float = 0.0
     pnl_10th_pct: float = 0.0
     pnl_20th_pct: float = 0.0
+    pnl_50th_pct: float = 0.0
+    pnl_100th_pct: float = 0.0
 
     # ── Token metadata ─────────────────────────────────────
     name_length: int = 0

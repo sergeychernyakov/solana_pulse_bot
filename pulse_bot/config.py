@@ -86,6 +86,52 @@ class PulseBotConfig:
     # ── PumpFun bonding curve ──────────────────────────────
     pumpfun_graduation_sol: float = 85.0
 
+    # ── PORTFOLIO / EXECUTION ──────────────────────────────
+    portfolio_initial_sol: float = 0.15
+    portfolio_max_positions: int = 3
+    buy_amount_sol: float = 0.03
+    execution_fee_pct: float = 0.01         # 1% Pump.fun fee
+    execution_priority_fee: float = 0.0001  # priority fee SOL
+    execution_base_slippage: float = 0.02   # 2% base slippage
+    execution_slippage_per_volume_pct: float = 0.05  # additional slippage per volume ratio
+    execution_max_slippage: float = 0.25    # 25% max slippage cap
+    execution_sell_slippage_mult: float = 1.5  # sell slippage multiplier (thinner liquidity)
+
+    # ── ENTRY STRATEGY ─────────────────────────────────────
+    entry_mode: str = "fast"                # "fast" | "full" | "both"
+    # "fast" = enter on FAST_BUY only
+    # "full" = enter on full BUY only
+    # "both" = enter on FAST_BUY, add on BUY if not already in
+
+    # ── PULSE MONITOR ──────────────────────────────────────
+    pulse_window_size: int = 20
+    pulse_min_events: int = 5
+    pulse_dead_buy_rate: float = 0.10
+    pulse_weak_buy_rate: float = 0.30
+    pulse_trend_threshold: float = 0.15     # % change for trend detection
+    pulse_whale_exit_sol: float = 1.0       # sell > this = whale exit
+
+    # ── EXIT RULES ─────────────────────────────────────────
+    exit_on_creator_dump: bool = True
+    exit_on_whale: bool = True
+    exit_sell_pressure_ratio: float = 2.0   # sell_rate > buy_rate × this → exit
+    exit_no_new_wallets_events: int = 5     # no new wallets for N buys → exit
+    exit_near_graduation_pct: float = 70.0
+    exit_hard_stop_loss_pct: float = 50.0   # -50% → hard stop
+    exit_max_hold_seconds: float = 7200     # 2 hours max
+    exit_trend_dying_count: int = 2         # N consecutive declining windows → exit
+
+    # ── PARTIAL EXIT RULES ─────────────────────────────────
+    exit_partial_on_profit_pct: float = 0.30   # sell 30% on strong profit
+    exit_profit_threshold_pct: float = 200.0    # what counts as strong profit (%)
+    exit_partial_on_weak_pulse_pct: float = 0.50  # sell 50% on weak pulse + profit
+    exit_weak_pulse_min_profit_pct: float = 50.0  # min profit for weak pulse sell
+    exit_moonbag_pct: float = 0.10              # always keep 10%
+
+    # ── BACKTEST ───────────────────────────────────────────
+    backtest_db_path: str = "pulse_bot.db"  # source data
+    backtest_results_db: str = "backtest_results.db"  # results storage
+
     # ── Infrastructure ─────────────────────────────────────
     db_path: str = "pulse_bot.db"
     dashboard_refresh_seconds: int = 3

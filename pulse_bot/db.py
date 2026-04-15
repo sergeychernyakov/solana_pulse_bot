@@ -67,7 +67,8 @@ CREATE TABLE IF NOT EXISTS token_scores (
     -- Price & P&L
     token_price_sol REAL DEFAULT 0.0, exit_price REAL DEFAULT 0.0,
     pnl_5th_pct REAL DEFAULT 0.0, pnl_10th_pct REAL DEFAULT 0.0,
-    pnl_20th_pct REAL DEFAULT 0.0,
+    pnl_20th_pct REAL DEFAULT 0.0, pnl_50th_pct REAL DEFAULT 0.0,
+    pnl_100th_pct REAL DEFAULT 0.0,
 
     -- Token metadata
     name_length INTEGER DEFAULT 0, symbol_length INTEGER DEFAULT 0,
@@ -119,7 +120,7 @@ _SCORE_COLUMNS = [
     "time_to_first_buy", "buys_per_unique",
     "curve_progress_pct", "curve_velocity", "curve_acceleration", "sol_to_graduation",
     "market_cap_sol",
-    "token_price_sol", "exit_price", "pnl_5th_pct", "pnl_10th_pct", "pnl_20th_pct",
+    "token_price_sol", "exit_price", "pnl_5th_pct", "pnl_10th_pct", "pnl_20th_pct", "pnl_50th_pct", "pnl_100th_pct",
     "name_length", "symbol_length", "has_uri", "is_all_caps", "has_numbers",
     "hour_utc", "creator_tokens_today", "gap_create_to_first_trade",
     "tokens_last_5min", "concurrent_observations",
