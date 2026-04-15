@@ -164,12 +164,16 @@ def render_charts(rows: list[dict]) -> None:
 
     c1, c2, c3 = st.columns(3)
 
-    # Chart 1: P&L@5 distribution for BUY tokens
+    # Chart 1: P&L@5 distribution — green for wins, red for losses
     with c1:
         if buy_rows:
             pnl_vals = [r["pnl_5th_pct"] for r in buy_rows]
-            chart_df = pd.DataFrame({"P&L%": pnl_vals, "token": range(len(pnl_vals))})
-            st.bar_chart(chart_df, x="token", y="P&L%", height=180, color="#4ade80")
+            wins = [v if v > 0 else 0 for v in pnl_vals]
+            losses = [v if v < 0 else 0 for v in pnl_vals]
+            chart_df = pd.DataFrame(
+                {"win": wins, "loss": losses}, index=range(len(pnl_vals))
+            )
+            st.bar_chart(chart_df, height=180, color=["#4ade80", "#f87171"])
         else:
             st.caption("P&L@5 (no BUY data)")
 
@@ -304,6 +308,11 @@ def render_token_table(rows: list[dict]) -> None:
             return 0.0
 
     def color_row(row: pd.Series) -> list[str]:
+        # Only color BUY tokens
+        full = row.get("Full", "")
+        if full not in ("BUY", "BORDERLINE"):
+            return [""] * len(row)
+
         # Check ~5, ~10, ~20 — use first non-zero
         pnl = 0.0
         for col in ["~5", "~10", "~20"]:
@@ -311,6 +320,9 @@ def render_token_table(rows: list[dict]) -> None:
             if v != 0:
                 pnl = v
                 break
+
+        if full == "BORDERLINE":
+            return ["background-color: #3a3a1a; color: #facc15"] * len(row)
 
         if pnl > 0:
             # Brighter green for bigger gains: +10% = mild, +100% = vivid
