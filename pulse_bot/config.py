@@ -60,8 +60,8 @@ class PulseBotConfig:
     sell_ratio_dump: float = 1.0  # ratio >= this → -30 (dump)
     sell_ratio_heavy: float = 0.7  # ratio >= this → -15
     sell_ratio_moderate: float = 0.4  # ratio >= this → -5
-    sell_dump_penalty: int = -40  # data: 32% WR, -14% avg
-    sell_heavy_penalty: int = -25  # data: 44% WR, -2% avg
+    sell_dump_penalty: int = -50  # data: 32% WR, -14% avg
+    sell_heavy_penalty: int = -40  # data: 41% WR, -550% total P&L above 0.7
     sell_moderate_penalty: int = -5
     sell_dominant_bonus: int = 10  # data: 94% WR when sell_p < 0.5
 
@@ -84,8 +84,10 @@ class PulseBotConfig:
     curve_near_grad_score: int = -10
     curve_mid_score: int = -5
     curve_healthy_score: int = 5
-    curve_low_pct: float = 40.0  # curve below this = weak token
-    curve_low_score: int = -30  # heavy penalty for low curve (data: 38% WR vs 87%)
+    curve_low_pct: float = (
+        36.0  # curve below this = dead token (data: 26% WR, -971% P&L)
+    )
+    curve_low_score: int = -50  # hard penalty — kills almost all losers
 
     # ── PumpFun bonding curve ──────────────────────────────
     pumpfun_graduation_sol: float = 85.0
