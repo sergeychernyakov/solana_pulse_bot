@@ -214,14 +214,19 @@ def render_token_table(rows: list[dict]) -> None:
     zi = pd.Series([0] * len(df))
     zs = pd.Series([""] * len(df))
 
-    df["time"] = df["scored_at"].apply(format_ts)
-    df["mint_s"] = df["mint"].apply(lambda m: m[:6] + "..")
-    df["mcap"] = df.get("market_cap_sol", z).apply(fmt_mcap)
-    df["price"] = df.get("token_price_sol", z).apply(fmt_price)
+    now = time.time()
+    SOL_USD = 130  # approximate SOL price, update as needed
+
+    df["age"] = df["scored_at"].apply(lambda t: fmt_age(now - t) if t else "—")
+    df["link"] = df["mint"].apply(lambda m: f"https://pump.fun/coin/{m}")
+    df["mcap_usd"] = df.get("market_cap_sol", z).apply(
+        lambda v: fmt_mcap_usd(v, SOL_USD)
+    )
     df["vol"] = df["buy_volume_sol"].apply(lambda v: f"{v:.1f}")
     df["curve"] = df["curve_progress_pct"].apply(lambda p: f"{p:.0f}%")
     df["buys"] = df.get("buy_count", zi).apply(lambda x: str(int(x)))
     df["sells"] = df.get("sell_count", zi).apply(lambda x: str(int(x)))
+    df["sp"] = df.get("sell_pressure", z).apply(lambda p: f"{p:.1f}" if p else "—")
 
     # Fast phase columns
     df["fast"] = df.get("fast_decision", zs).apply(lambda d: d if d else "—")
@@ -229,72 +234,80 @@ def render_token_table(rows: list[dict]) -> None:
     df["f_buys"] = df.get("fast_buy_count", zi).apply(
         lambda x: str(int(x)) if x else "—"
     )
+    df["f_sells"] = df.apply(
+        lambda r: (
+            str(
+                int(
+                    (r.get("fast_sell_ratio", 0) or 0)
+                    * max(r.get("fast_buy_count", 0) or 0, 1)
+                )
+            )
+            if r.get("fast_buy_count", 0)
+            else "—"
+        ),
+        axis=1,
+    )
     df["f_rate"] = df.get("fast_buy_rate", z).apply(lambda r: f"{r:.1f}" if r else "—")
-    df["pnl_f"] = df.get("pnl_at_fast_entry_pct", z).apply(fmt_pnl)
 
     # Live P&L
     df["live_pnl"] = df.get("live_pnl_pct", z).apply(fmt_pnl)
 
-    # Full phase P&L
+    # P&L at entry points
     df["pnl5"] = df.get("pnl_5th_pct", z).apply(fmt_pnl)
     df["pnl10"] = df.get("pnl_10th_pct", z).apply(fmt_pnl)
     df["pnl20"] = df.get("pnl_20th_pct", z).apply(fmt_pnl)
-    df["pnl50"] = df.get("pnl_50th_pct", z).apply(fmt_pnl)
-    df["pnl100"] = df.get("pnl_100th_pct", z).apply(fmt_pnl)
     df["score_f"] = df["total_score"].apply(lambda s: f"{s:+d}")
 
     # Select and rename
     display_df = df[
         [
-            "time",
+            "age",
             "symbol",
-            "mint_s",
+            "link",
             "fast",
             "f_sc",
             "f_buys",
+            "f_sells",
             "f_rate",
-            "pnl_f",
+            "decision",
+            "score_f",
             "live_pnl",
-            "mcap",
+            "mcap_usd",
             "unique_buyers",
             "buys",
             "sells",
+            "sp",
             "vol",
             "curve",
             "pnl5",
             "pnl10",
             "pnl20",
-            "pnl50",
-            "pnl100",
-            "score_f",
-            "decision",
         ]
     ].copy()
 
     display_df.columns = pd.Index(
         [
-            "Time",
+            "Age",
             "Sym",
-            "Mint",
+            "Link",
             "Fast",
             "F.Sc",
             "F.Buys",
+            "F.Sells",
             "Rate/s",
-            "F.P&L",
+            "Full",
+            "Score",
             "Live",
-            "MCap",
+            "MCap$",
             "Uniq",
             "Buys",
             "Sells",
+            "SP",
             "Vol",
             "Curve",
             "~5",
             "~10",
             "~20",
-            "~50",
-            "~100",
-            "Score",
-            "Full",
         ]
     )
 
@@ -350,7 +363,11 @@ def render_token_table(rows: list[dict]) -> None:
         height=min(len(display_df) * 35 + 38, 700),
         hide_index=True,
         column_config={
-            c: st.column_config.TextColumn(width="small") for c in display_df.columns
+            **{
+                c: st.column_config.TextColumn(width="small")
+                for c in display_df.columns
+            },
+            "Link": st.column_config.LinkColumn(width="small", display_text="pump.fun"),
         },
     )
 
@@ -363,6 +380,29 @@ def format_ts(ts: float) -> str:
     if not ts:
         return "—"
     return datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+
+
+def fmt_age(seconds: float) -> str:
+    """Seconds ago → compact string."""
+    if seconds < 0:
+        return "—"
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
+def fmt_mcap_usd(mcap_sol: float, sol_usd: float) -> str:
+    """Market cap in USD."""
+    if not mcap_sol or mcap_sol <= 0:
+        return "—"
+    usd = mcap_sol * sol_usd
+    if usd >= 1_000_000:
+        return f"${usd / 1_000_000:.1f}M"
+    if usd >= 1_000:
+        return f"${usd / 1_000:.1f}K"
+    return f"${usd:.0f}"
 
 
 def fmt_mcap(val: float) -> str:
