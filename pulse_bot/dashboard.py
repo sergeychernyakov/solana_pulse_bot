@@ -74,6 +74,10 @@ def main() -> None:
     # ── Stats as compact HTML bar ──────────────────────────
     render_stats_bar(stats)
 
+    # ── P&L summary for BUY tokens ────────────────────────
+    if rows:
+        render_pnl_summary(rows)
+
     # ── Token table ────────────────────────────────────────
     if not rows:
         st.info("Waiting for data...")
@@ -109,6 +113,44 @@ def render_stats_bar(stats: dict) -> None:
         <div class="stat">Filter <b>{filt}</b></div>
         </div>""",
         unsafe_allow_html=True,
+    )
+
+
+def render_pnl_summary(rows: list[dict]) -> None:
+    """Show P&L summary for BUY tokens: sum positive, sum negative, net."""
+    buy_rows = [r for r in rows if r.get("decision") == "BUY"]
+    if not buy_rows:
+        return
+
+    labels = [
+        ("~5", "pnl_5th_pct"),
+        ("~10", "pnl_10th_pct"),
+        ("~20", "pnl_20th_pct"),
+        ("~50", "pnl_50th_pct"),
+        ("~100", "pnl_100th_pct"),
+    ]
+
+    parts = []
+    for label, col in labels:
+        vals = [r.get(col, 0) or 0 for r in buy_rows if r.get(col, 0)]
+        if not vals:
+            parts.append(f'<div class="stat">{label} <b>—</b></div>')
+            continue
+        pos = sum(v for v in vals if v > 0)
+        neg = sum(v for v in vals if v < 0)
+        net = pos + neg
+        n_win = sum(1 for v in vals if v > 0)
+        n_lose = sum(1 for v in vals if v < 0)
+        net_cls = "pos" if net >= 0 else "neg"
+        parts.append(
+            f'<div class="stat {net_cls}">{label} '
+            f'<b style="color:#4ade80">+{pos:.0f}%</b>({n_win}) '
+            f'<b style="color:#f87171">{neg:.0f}%</b>({n_lose}) '
+            f"= <b>{net:+.0f}%</b></div>"
+        )
+
+    st.markdown(
+        f'<div class="stats-bar">{"".join(parts)}</div>', unsafe_allow_html=True
     )
 
 
