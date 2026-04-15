@@ -65,7 +65,14 @@ class Pipeline:
                 if not self._running:
                     break
                 self._tokens_seen += 1
-                task = asyncio.create_task(self._handle_token_bounded(token))
+
+                # Insert token and update creator count (sequential in main loop)
+                await self._db.insert_token(token)
+                await self._db.upsert_creator(token.creator, sold_early=False)
+                creator_snapshot = self._db.get_creator_stats_sync(token.creator)
+
+                # Both live and replay: parallel processing, deterministic snapshot
+                task = asyncio.create_task(self._handle_token_bounded(token, creator_snapshot))
                 tasks.append(task)
         except asyncio.CancelledError:
             logger.info("Pipeline cancelled")
@@ -86,17 +93,16 @@ class Pipeline:
         """Signal the pipeline to stop gracefully."""
         self._running = False
 
-    async def _handle_token_bounded(self, token: Token) -> None:
+    async def _handle_token_bounded(self, token: Token, creator_snapshot: object = None) -> None:
         """Acquire semaphore, then process token."""
         async with self._semaphore:
-            await self._handle_token(token)
+            await self._handle_token(token, creator_snapshot)
 
-    async def _handle_token(self, token: Token) -> None:
+    async def _handle_token(self, token: Token, creator_snapshot: object = None) -> None:
         """Two-phase pipeline for one token."""
         mint_short = token.mint[:12]
 
         try:
-            await self._db.insert_token(token)
             logger.info("New token: %s (%s) by %s", token.symbol, mint_short, token.creator[:12])
 
             await self._launchpad.subscribe_trades(token.mint)
@@ -130,10 +136,6 @@ class Pipeline:
             full_trades_extra = await self._collect_trades(token, max(remaining, 0))
             all_trades = fast_trades + full_trades_extra
 
-            # Update creator cache (both live and replay — builds same cache from scratch)
-            creator_sold = any(t.wallet == token.creator and t.tx_type == "sell" for t in all_trades)
-            await self._db.upsert_creator(token.creator, creator_sold)
-
             # Store all trades and get DB IDs (skip in replay — trades already in DB)
             if self._launchpad.name != "replay":
                 trade_ids = await self._db.insert_trades_batch(all_trades)
@@ -154,6 +156,7 @@ class Pipeline:
                 all_trades,
                 tokens_last_5min=tokens_5min,
                 concurrent_observations=concurrent,
+                creator_snapshot=creator_snapshot,
             )
 
             # Attach fast phase data
@@ -178,7 +181,6 @@ class Pipeline:
             if fast_entry_price > 0 and result.exit_price > 0:
                 result.pnl_at_fast_entry_pct = ((result.exit_price - fast_entry_price) / fast_entry_price) * 100.0
 
-            # Store
             await self._db.upsert_scoring_result(result)
             self._tokens_scored += 1
 

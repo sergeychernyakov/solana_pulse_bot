@@ -500,6 +500,29 @@ class Database:
         finally:
             conn.close()
 
+    def get_creator_stats_from_tokens_sync(self, wallet: str) -> CreatorStats | None:
+        """Compute creator stats directly from tokens table (deterministic, no cache)."""
+        from pulse_bot.models import CreatorStats
+        conn = self._get_sync_conn()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) as total FROM tokens WHERE creator = ?", (wallet,),
+            ).fetchone()
+            total = row["total"] if row else 0
+            if total == 0:
+                return None
+            return CreatorStats(
+                wallet=wallet,
+                total_tokens_created=total,
+                times_seen=total,
+                tokens_where_creator_sold_early=0,
+                first_seen_at=0,
+                last_seen_at=0,
+                blacklisted=False,
+            )
+        finally:
+            conn.close()
+
     def clear_creators(self) -> None:
         """Reset creator cache. Called before backtest to build from scratch."""
         conn = self._get_sync_conn()

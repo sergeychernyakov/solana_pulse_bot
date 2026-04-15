@@ -31,8 +31,10 @@ class Scorer:
         trades: list[Trade],
         tokens_last_5min: int = 0,
         concurrent_observations: int = 0,
+        creator_snapshot: object = None,
     ) -> ScoringResult:
         """Compute all metrics, run scoring rules, produce decision."""
+        self._creator_snapshot = creator_snapshot
         creator_tokens_today = self._db.get_creator_tokens_today_sync(token.creator)
 
         m = self._metrics.compute(
@@ -140,21 +142,14 @@ class Scorer:
         """Generator of (score, reason, is_hard_reject) tuples. All configurable."""
         cfg = self._cfg
 
-        # ── Creator ────────────────────────────────────────
-        stats = self._db.get_creator_stats_sync(token.creator)
+        # ── Creator (use snapshot taken in main loop for deterministic parallel scoring) ──
+        stats = self._creator_snapshot if self._creator_snapshot else self._db.get_creator_stats_sync(token.creator)
         if stats and stats.blacklisted:
             yield 0, "creator_blacklisted", True
             return
         if stats and stats.total_tokens_created > cfg.creator_serial_threshold:
-            if stats.tokens_where_creator_sold_early > 0:
-                sell_rate = stats.tokens_where_creator_sold_early / stats.total_tokens_created
-                if sell_rate > 0.5:
-                    yield -20, f"serial_dumper({stats.total_tokens_created}tok,{sell_rate:.0%}sell)", False
-                else:
-                    yield -10, f"serial_creator({stats.total_tokens_created}tok)", False
-            else:
-                yield -5, f"serial_creator({stats.total_tokens_created}tok,no_dumps)", False
-        elif stats and stats.total_tokens_created > 1 and stats.tokens_where_creator_sold_early == 0:
+            yield -5, f"serial_creator({stats.total_tokens_created}tok)", False
+        elif stats and stats.total_tokens_created > 1:
             yield 10, f"clean_creator({stats.total_tokens_created}tok)", False
 
         # ── Unique buyers ──────────────────────────────────
