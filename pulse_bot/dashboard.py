@@ -65,7 +65,7 @@ def main() -> None:
 
     # ── Load data ──────────────────────────────────────────
     if mode == "Live":
-        rows = db.get_recent_scores(limit=200)
+        rows = db.get_scores_last_hours(hours=24)
         stats = db.get_stats()
     else:
         rows = db.get_scores_by_date(date_str)

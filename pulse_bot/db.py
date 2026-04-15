@@ -275,6 +275,20 @@ class Database:
         finally:
             conn.close()
 
+    def get_scores_last_hours(
+        self, hours: int = 24, source: str = "live"
+    ) -> list[dict]:
+        """Scored tokens from the last N hours, newest first."""
+        conn = self._get_sync_conn()
+        try:
+            cur = conn.execute(
+                "SELECT * FROM token_scores WHERE source = ? AND scored_at > ? ORDER BY scored_at DESC",
+                (source, time.time() - hours * 3600),
+            )
+            return [dict(row) for row in cur.fetchall()]
+        finally:
+            conn.close()
+
     def get_scores_by_date(self, date_str: str, source: str = "live") -> list[dict]:
         """All scored tokens for a given date, newest first."""
         conn = self._get_sync_conn()
