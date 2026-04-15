@@ -50,7 +50,9 @@ class PulseBotConfig:
     whale_dominance_pct: float = 50.0
 
     # ── Creator filter ─────────────────────────────────────
-    creator_serial_threshold: int = 5
+    creator_serial_threshold: int = (
+        50  # relaxed — data shows serial creators can be profitable
+    )
     creator_sell_penalty: bool = True
     creator_sold_score: int = -15  # soft penalty for creator selling
 
@@ -58,10 +60,10 @@ class PulseBotConfig:
     sell_ratio_dump: float = 1.0  # ratio >= this → -30 (dump)
     sell_ratio_heavy: float = 0.7  # ratio >= this → -15
     sell_ratio_moderate: float = 0.4  # ratio >= this → -5
-    sell_dump_penalty: int = -30
-    sell_heavy_penalty: int = -15
+    sell_dump_penalty: int = -40  # data: 32% WR, -14% avg
+    sell_heavy_penalty: int = -25  # data: 44% WR, -2% avg
     sell_moderate_penalty: int = -5
-    sell_dominant_bonus: int = 5  # ratio < moderate → bonus
+    sell_dominant_bonus: int = 10  # data: 94% WR when sell_p < 0.5
 
     # ── Volume scoring ─────────────────────────────────────
     volume_massive_sol: float = 20.0  # >this → massive bonus
@@ -82,6 +84,8 @@ class PulseBotConfig:
     curve_near_grad_score: int = -10
     curve_mid_score: int = -5
     curve_healthy_score: int = 5
+    curve_low_pct: float = 40.0  # curve below this = weak token
+    curve_low_score: int = -30  # heavy penalty for low curve (data: 38% WR vs 87%)
 
     # ── PumpFun bonding curve ──────────────────────────────
     pumpfun_graduation_sol: float = 85.0

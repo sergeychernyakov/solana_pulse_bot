@@ -189,8 +189,10 @@ class Scorer:
             yield cfg.curve_near_grad_score, f"near_grad_{pct:.0f}%", False
         elif pct > cfg.max_curve_progress_pct:
             yield cfg.curve_mid_score, f"mid_curve_{pct:.0f}%", False
-        elif pct > 10:
+        elif pct > cfg.curve_low_pct:
             yield cfg.curve_healthy_score, f"curve_{pct:.0f}%(ok)", False
+        else:
+            yield cfg.curve_low_score, f"curve_low_{pct:.0f}%", False
 
         # ── Creator sold ───────────────────────────────────
         if m.creator_sold:

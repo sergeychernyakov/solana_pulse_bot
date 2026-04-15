@@ -205,33 +205,40 @@ def render_token_table(rows: list[dict]) -> None:
         ]
     )
 
-    # Color by decision + live P&L
+    # Color by P&L: green if profitable, red if losing
+    def _parse_pnl(val: str) -> float:
+        if not val or val == "—":
+            return 0.0
+        try:
+            return float(val.replace("%", "").replace("+", ""))
+        except (ValueError, AttributeError):
+            return 0.0
+
     def color_row(row: pd.Series) -> list[str]:
-        full = row.get("Full", "")
-        fast = row.get("Fast", "")
-        live = row.get("Live", "—")
+        # Check ~5, ~10, ~20 — use first non-zero
+        pnl = 0.0
+        for col in ["~5", "~10", "~20"]:
+            v = _parse_pnl(row.get(col, "—"))
+            if v != 0:
+                pnl = v
+                break
 
-        # Parse live P&L
-        is_losing = False
-        if live and live != "—":
-            try:
-                pnl_val = float(live.replace("%", "").replace("+", ""))
-                is_losing = pnl_val < 0
-            except (ValueError, AttributeError):
-                pass
-
-        # BUY losing → red
-        if full == "BUY" and is_losing:
-            return ["background-color: #3a1a1a; color: #f87171"] * len(row)
-        # BUY + FAST_BUY winning → bright green
-        if full == "BUY" and fast == "FAST_BUY":
-            return ["background-color: #0a4a0a; color: #6eff6e"] * len(row)
-        # BUY winning → green
-        if full == "BUY":
-            return ["background-color: #1a3a1a; color: #4ade80"] * len(row)
-        # BORDERLINE → yellow
-        if full == "BORDERLINE":
-            return ["background-color: #3a3a1a; color: #facc15"] * len(row)
+        if pnl > 0:
+            # Brighter green for bigger gains: +10% = mild, +100% = vivid
+            intensity = min(pnl / 100, 1.0)
+            bg_g = int(30 + 50 * intensity)
+            fg_g = int(160 + 95 * intensity)
+            return [
+                f"background-color: #{26:02x}{bg_g:02x}{26:02x}; color: #{74:02x}{fg_g:02x}{128:02x}"
+            ] * len(row)
+        if pnl < 0:
+            # Brighter red for bigger losses: -10% = mild, -100% = vivid
+            intensity = min(abs(pnl) / 100, 1.0)
+            bg_r = int(30 + 50 * intensity)
+            fg_r = int(160 + 95 * intensity)
+            return [
+                f"background-color: #{bg_r:02x}{26:02x}{26:02x}; color: #{fg_r:02x}{113:02x}{113:02x}"
+            ] * len(row)
         return [""] * len(row)
 
     styled = display_df.style.apply(color_row, axis=1)
