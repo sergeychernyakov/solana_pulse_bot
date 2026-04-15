@@ -78,6 +78,10 @@ def main() -> None:
     if rows:
         render_pnl_summary(rows)
 
+    # ── Charts ─────────────────────────────────────────────
+    if rows:
+        render_charts(rows)
+
     # ── Token table ────────────────────────────────────────
     if not rows:
         st.info("Waiting for data...")
@@ -152,6 +156,49 @@ def render_pnl_summary(rows: list[dict]) -> None:
     st.markdown(
         f'<div class="stats-bar">{"".join(parts)}</div>', unsafe_allow_html=True
     )
+
+
+def render_charts(rows: list[dict]) -> None:
+    """Compact charts row: P&L distribution, decisions breakdown, cumulative P&L."""
+    buy_rows = [r for r in rows if r.get("decision") == "BUY" and r.get("pnl_5th_pct")]
+
+    c1, c2, c3 = st.columns(3)
+
+    # Chart 1: P&L@5 distribution for BUY tokens
+    with c1:
+        if buy_rows:
+            pnl_vals = [r["pnl_5th_pct"] for r in buy_rows]
+            chart_df = pd.DataFrame({"P&L%": pnl_vals, "token": range(len(pnl_vals))})
+            st.bar_chart(chart_df, x="token", y="P&L%", height=180, color="#4ade80")
+        else:
+            st.caption("P&L@5 (no BUY data)")
+
+    # Chart 2: Decision breakdown
+    with c2:
+        decisions: dict[str, int] = {}
+        for r in rows:
+            d = r.get("decision", "SKIP")
+            decisions[d] = decisions.get(d, 0) + 1
+        dec_df = pd.DataFrame(
+            {"decision": list(decisions.keys()), "count": list(decisions.values())}
+        )
+        st.bar_chart(dec_df, x="decision", y="count", height=180, color="#6366f1")
+
+    # Chart 3: Cumulative P&L over time (BUY tokens only)
+    with c3:
+        if buy_rows:
+            sorted_buys = sorted(buy_rows, key=lambda r: r.get("scored_at", 0))
+            cum_pnl = []
+            total = 0.0
+            for r in sorted_buys:
+                total += r["pnl_5th_pct"]
+                cum_pnl.append(total)
+            cum_df = pd.DataFrame(
+                {"token#": range(1, len(cum_pnl) + 1), "Cum P&L%": cum_pnl}
+            )
+            st.line_chart(cum_df, x="token#", y="Cum P&L%", height=180, color="#facc15")
+        else:
+            st.caption("Cumulative P&L (no BUY data)")
 
 
 def render_token_table(rows: list[dict]) -> None:
