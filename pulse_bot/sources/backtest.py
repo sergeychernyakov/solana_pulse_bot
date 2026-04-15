@@ -30,17 +30,29 @@ class BacktestSource:
         """Yield all tokens ordered by created_at."""
         conn = self._conn()
         try:
-            cur = conn.execute(
-                "SELECT * FROM tokens ORDER BY created_at ASC"
-            )
+            cur = conn.execute("SELECT * FROM tokens ORDER BY created_at ASC")
             for row in cur:
                 token = Token(
-                    mint=row["mint"], name=row["name"] or "", symbol=row["symbol"] or "",
-                    creator=row["creator"] or "", created_at=row["created_at"],
-                    uri=row["uri"] or "", launchpad=row["launchpad"] or "pumpfun",
+                    mint=row["mint"],
+                    name=row["name"] or "",
+                    symbol=row["symbol"] or "",
+                    creator=row["creator"] or "",
+                    created_at=row["created_at"],
+                    uri=row["uri"] or "",
+                    launchpad=row["launchpad"] or "pumpfun",
                 )
                 self.clock.advance_to(token.created_at)
                 yield token
+        finally:
+            conn.close()
+
+    def iter_trades(self) -> Iterator[Trade]:
+        """Yield all trades ordered by timestamp."""
+        conn = self._conn()
+        try:
+            cur = conn.execute("SELECT * FROM trades ORDER BY timestamp ASC, id ASC")
+            for row in cur:
+                yield self._row_to_trade(row, row["mint"])
         finally:
             conn.close()
 

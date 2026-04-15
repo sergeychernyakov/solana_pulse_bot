@@ -78,7 +78,12 @@ class BaseRepository(Generic[T]):
         stmt = select(self.model_class).where(self.model_class.id == id)
         result = await session.execute(stmt)
         instance = result.scalar_one_or_none()
-        logger.debug("Retrieved %s with ID %s: %s", self.model_class.__name__, id, "found" if instance else "not found")
+        logger.debug(
+            "Retrieved %s with ID %s: %s",
+            self.model_class.__name__,
+            id,
+            "found" if instance else "not found",
+        )
         return instance
 
     async def update(

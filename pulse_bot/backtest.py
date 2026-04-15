@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from pulse_bot.clock import SimulatedClock
-from pulse_bot.execution import SimulatedExecution
+from pulse_bot.execution import FillResult, SimulatedExecution
 from pulse_bot.filters.fast import FastFilter
 from pulse_bot.filters.metrics import MetricsCalculator
 from pulse_bot.filters.scorer import Scorer
@@ -21,8 +22,28 @@ if TYPE_CHECKING:
     from pulse_bot.config import PulseBotConfig
     from pulse_bot.db import Database
     from pulse_bot.models import Token, Trade
+    from pulse_bot.portfolio import ClosedTrade
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class EntryCandidate:
+    """A timestamped backtest entry decision."""
+
+    token: Token
+    entry_time: float
+    entry_type: str
+    fill: FillResult
+
+
+@dataclass
+class PositionMonitor:
+    """Runtime pulse state for one open backtest position."""
+
+    pulse: PulseMonitor
+    exit_manager: ExitManager
+    recent_trades: list[Trade] = field(default_factory=list)
 
 
 class BacktestEngine:
@@ -62,16 +83,17 @@ class BacktestEngine:
         trade_count = self._source.get_trade_count()
         logger.info("Backtest starting: %d tokens, %d trades", token_count, trade_count)
 
-        for token in self._source.iter_tokens():
-            self._tokens_seen += 1
-            self._process_token(token)
+        candidates = self._build_entry_candidates()
+        self._run_timeline(candidates)
 
-            if self._tokens_seen % 100 == 0:
-                logger.info(
-                    "Progress: %d/%d tokens, %d trades, balance=%.4f, positions=%d",
-                    self._tokens_seen, token_count, len(self._portfolio.closed_trades),
-                    self._portfolio.balance, self._portfolio.open_count,
-                )
+        logger.info(
+            "Processed signals: %d/%d tokens, %d entries, balance=%.4f, positions=%d",
+            self._tokens_seen,
+            token_count,
+            len(candidates),
+            self._portfolio.balance,
+            self._portfolio.open_count,
+        )
 
         # Force close any remaining positions at last known price
         self._close_remaining_positions()
@@ -79,100 +101,172 @@ class BacktestEngine:
         elapsed = time.time() - start_wall
         logger.info(
             "Backtest done in %.1fs: %d tokens, %d trades, final_balance=%.4f SOL",
-            elapsed, self._tokens_seen, len(self._portfolio.closed_trades), self._portfolio.balance,
+            elapsed,
+            self._tokens_seen,
+            len(self._portfolio.closed_trades),
+            self._portfolio.balance,
         )
 
         return self._build_result(elapsed)
 
-    def _process_token(self, token: Token) -> None:
-        """Process one token through the full pipeline."""
-        # Get fast phase trades
+    def _build_entry_candidates(self) -> list[EntryCandidate]:
+        """Score tokens and return entries ordered by their real entry time."""
+        candidates: list[EntryCandidate] = []
+        for token in self._source.iter_tokens():
+            self._tokens_seen += 1
+            candidate = self._score_token_for_entry(token)
+            if candidate:
+                candidates.append(candidate)
+            if self._tokens_seen % 100 == 0:
+                logger.info(
+                    "Scored %d tokens, candidates=%d",
+                    self._tokens_seen,
+                    len(candidates),
+                )
+        return sorted(candidates, key=lambda item: item.entry_time)
+
+    def _score_token_for_entry(self, token: Token) -> EntryCandidate | None:
+        """Score one token and build a deferred entry candidate."""
         fast_trades = self._source.get_fast_trades(
-            token.mint, token.created_at, self._cfg.fast_observe_seconds,
+            token.mint,
+            token.created_at,
+            self._cfg.fast_observe_seconds,
         )
 
         if not fast_trades:
-            return
+            return None
 
         self._tokens_with_trades += 1
 
-        # ── Phase 1: Fast entry ────────────────────────────
-        entered = False
         if self._cfg.entry_mode in ("fast", "both"):
             fast_result = self._fast_filter.evaluate(token, fast_trades)
-            if fast_result.decision == "FAST_BUY" and self._portfolio.can_buy:
-                self._fast_buys_attempted += 1
+            if fast_result.decision == "FAST_BUY":
                 fill = self._execution.simulate_buy(fast_trades)
                 entry_time = token.created_at + self._cfg.fast_observe_seconds
-                entered = self._portfolio.open_position(token.mint, token.symbol, fill, entry_time, "fast")
+                return EntryCandidate(token, entry_time, "fast", fill)
 
-        # ── Phase 2: Full scoring ──────────────────────────
         full_trades = self._source.get_full_trades(
-            token.mint, token.created_at, self._cfg.observe_seconds,
+            token.mint,
+            token.created_at,
+            self._cfg.observe_seconds,
         )
-        if not entered and self._cfg.entry_mode in ("full", "both") and full_trades:
+        if self._cfg.entry_mode in ("full", "both") and full_trades:
             result = self._scorer.score(token, full_trades)
-            if result.decision == "BUY" and self._portfolio.can_buy:
-                self._full_buys_attempted += 1
+            if result.decision == "BUY":
                 fill = self._execution.simulate_buy(full_trades)
                 entry_time = token.created_at + self._cfg.observe_seconds
-                entered = self._portfolio.open_position(token.mint, token.symbol, fill, entry_time, "full")
+                return EntryCandidate(token, entry_time, "full", fill)
 
-        # ── Phase 3: Pulse monitoring → exit ───────────────
-        if entered:
-            self._monitor_and_exit(token)
+        return None
 
-    def _monitor_and_exit(self, token: Token) -> None:
-        """Monitor position with pulse and exit based on rules."""
-        pos = self._portfolio.positions.get(token.mint)
-        if not pos:
-            return
+    def _run_timeline(self, candidates: list[EntryCandidate]) -> None:
+        """Replay entries and exits in global timestamp order."""
+        monitors: dict[str, PositionMonitor] = {}
+        candidate_index = 0
+        self._clock.set(0.0)
 
-        # Get all trades after entry for pulse monitoring
-        monitor_trades = self._source.get_all_trades_after(token.mint, pos.entry_time)
-
-        if not monitor_trades:
-            # No trades after entry — timeout exit
-            dummy_fill = self._execution.simulate_sell([], pos.tokens_held)
-            self._portfolio.close_position(token.mint, dummy_fill, pos.entry_time + 60, "no_data")
-            return
-
-        pulse = PulseMonitor(self._cfg)
-        exit_mgr = ExitManager(self._cfg)
-
-        for trade in monitor_trades:
+        for trade in self._source.iter_trades():
             self._clock.advance_to(trade.timestamp)
-            snapshot = pulse.update(trade)
+            self._close_expired_positions(trade.timestamp, monitors)
+            candidate_index = self._open_due_candidates(candidates, candidate_index, trade.timestamp, monitors)
+            if trade.mint in monitors:
+                self._handle_position_trade(trade, monitors)
 
-            if not snapshot:
+        while candidate_index < len(candidates):
+            candidate = candidates[candidate_index]
+            self._clock.advance_to(candidate.entry_time)
+            self._close_expired_positions(candidate.entry_time, monitors)
+            candidate_index = self._open_due_candidates(candidates, candidate_index, candidate.entry_time, monitors)
+
+    def _open_due_candidates(
+        self,
+        candidates: list[EntryCandidate],
+        start_index: int,
+        now_ts: float,
+        monitors: dict[str, PositionMonitor],
+    ) -> int:
+        """Open all entry candidates whose entry time has arrived."""
+        index = start_index
+        while index < len(candidates) and candidates[index].entry_time <= now_ts:
+            candidate = candidates[index]
+            self._open_candidate(candidate, monitors)
+            index += 1
+        return index
+
+    def _open_candidate(
+        self,
+        candidate: EntryCandidate,
+        monitors: dict[str, PositionMonitor],
+    ) -> None:
+        """Open a position if portfolio constraints allow it at entry time."""
+        if not self._portfolio.can_buy or candidate.token.mint in self._portfolio.positions:
+            return
+        opened = self._portfolio.open_position(
+            candidate.token.mint,
+            candidate.token.symbol,
+            candidate.fill,
+            candidate.entry_time,
+            candidate.entry_type,
+        )
+        if not opened:
+            return
+        if candidate.entry_type == "fast":
+            self._fast_buys_attempted += 1
+        else:
+            self._full_buys_attempted += 1
+        monitors[candidate.token.mint] = PositionMonitor(
+            pulse=PulseMonitor(self._cfg),
+            exit_manager=ExitManager(self._cfg),
+        )
+
+    def _handle_position_trade(
+        self,
+        trade: Trade,
+        monitors: dict[str, PositionMonitor],
+    ) -> None:
+        """Feed one trade into the active position monitor."""
+        pos = self._portfolio.positions.get(trade.mint)
+        monitor = monitors.get(trade.mint)
+        if not pos or not monitor:
+            return
+
+        monitor.recent_trades.append(trade)
+        monitor.recent_trades = monitor.recent_trades[-20:]
+        snapshot = monitor.pulse.update(trade)
+        if not snapshot:
+            return
+
+        current_price = trade.sol_amount / trade.token_amount if trade.token_amount > 0 else pos.entry_price
+        pnl_pct = ((current_price - pos.entry_price) / pos.entry_price) * 100 if pos.entry_price > 0 else 0
+        elapsed = trade.timestamp - pos.entry_time
+        signal = monitor.exit_manager.decide(snapshot, pnl_pct, elapsed)
+
+        if signal.action == "sell_partial":
+            tokens_to_sell = pos.tokens_held * signal.sell_pct
+            fill = self._execution.simulate_sell(monitor.recent_trades, tokens_to_sell)
+            self._portfolio.partial_sell(trade.mint, signal.sell_pct, fill, trade.timestamp, signal.reason)
+
+        elif signal.action == "sell_all":
+            tokens_to_sell = pos.tokens_held * pos.remaining_pct
+            fill = self._execution.simulate_sell(monitor.recent_trades, tokens_to_sell)
+            self._portfolio.close_position(trade.mint, fill, trade.timestamp, signal.reason)
+            monitors.pop(trade.mint, None)
+
+    def _close_expired_positions(
+        self,
+        now_ts: float,
+        monitors: dict[str, PositionMonitor],
+    ) -> None:
+        """Close positions whose max hold time elapsed before the next event."""
+        for mint, pos in list(self._portfolio.positions.items()):
+            if now_ts - pos.entry_time <= self._cfg.exit_max_hold_seconds:
                 continue
-
-            # Calculate current P&L
-            current_price = trade.sol_amount / trade.token_amount if trade.token_amount > 0 else pos.entry_price
-            pnl_pct = ((current_price - pos.entry_price) / pos.entry_price) * 100 if pos.entry_price > 0 else 0
-            elapsed = trade.timestamp - pos.entry_time
-
-            signal = exit_mgr.decide(snapshot, pnl_pct, elapsed)
-
-            if signal.action == "sell_partial":
-                tokens_to_sell = pos.tokens_held * signal.sell_pct * pos.remaining_pct
-                recent = [t for t in monitor_trades if t.timestamp <= trade.timestamp][-20:]
-                fill = self._execution.simulate_sell(recent, tokens_to_sell)
-                self._portfolio.partial_sell(token.mint, signal.sell_pct, fill, trade.timestamp, signal.reason)
-
-            elif signal.action == "sell_all":
-                tokens_to_sell = pos.tokens_held * pos.remaining_pct
-                recent = [t for t in monitor_trades if t.timestamp <= trade.timestamp][-20:]
-                fill = self._execution.simulate_sell(recent, tokens_to_sell)
-                self._portfolio.close_position(token.mint, fill, trade.timestamp, signal.reason)
-                return
-
-        # If we get here, never hit an exit signal — close on timeout
-        if token.mint in self._portfolio.positions:
-            last_trades = monitor_trades[-20:] if monitor_trades else []
-            tokens_left = pos.tokens_held * exit_mgr.remaining_pct
-            fill = self._execution.simulate_sell(last_trades, tokens_left)
-            self._portfolio.close_position(token.mint, fill, monitor_trades[-1].timestamp, "end_of_data")
+            monitor = monitors.get(mint)
+            recent = monitor.recent_trades if monitor else []
+            tokens_left = pos.tokens_held * pos.remaining_pct
+            fill = self._execution.simulate_sell(recent, tokens_left)
+            self._portfolio.close_position(mint, fill, pos.entry_time + self._cfg.exit_max_hold_seconds, "timeout")
+            monitors.pop(mint, None)
 
     def _close_remaining_positions(self) -> None:
         """Force close all open positions at last available price."""
@@ -215,63 +309,99 @@ class BacktestEngine:
             max_drawdown_pct=self._portfolio.max_drawdown_pct,
             final_balance_sol=self._portfolio.balance,
             initial_balance_sol=self._cfg.portfolio_initial_sol,
-            roi_pct=((self._portfolio.balance - self._cfg.portfolio_initial_sol) / self._cfg.portfolio_initial_sol) * 100,
+            roi_pct=((self._portfolio.balance - self._cfg.portfolio_initial_sol) / self._cfg.portfolio_initial_sol)
+            * 100,
             avg_hold_seconds=sum(t.hold_seconds for t in trades) / max(len(trades), 1),
             exit_reasons={r: sum(1 for t in trades if t.exit_reason == r) for r in set(t.exit_reason for t in trades)},
-            entry_types={"fast": sum(1 for t in trades if t.entry_type == "fast"), "full": sum(1 for t in trades if t.entry_type == "full")},
+            entry_types={
+                "fast": sum(1 for t in trades if t.entry_type == "fast"),
+                "full": sum(1 for t in trades if t.entry_type == "full"),
+            },
             elapsed_wall_seconds=elapsed_wall,
             closed_trades=trades,
         )
 
 
+@dataclass
 class BacktestResult:
     """Summary of a backtest run."""
 
-    def __init__(self, **kwargs) -> None:  # noqa: ANN003
-        for k, v in kwargs.items():
-            setattr(self, k, v)
+    tokens_seen: int
+    tokens_with_trades: int
+    fast_buys_attempted: int
+    full_buys_attempted: int
+    total_trades: int
+    wins: int
+    losses: int
+    win_rate: float
+    total_pnl_sol: float
+    gross_profit_sol: float
+    gross_loss_sol: float
+    profit_factor: float
+    avg_win_sol: float
+    avg_loss_sol: float
+    avg_win_pct: float
+    avg_loss_pct: float
+    max_drawdown_pct: float
+    final_balance_sol: float
+    initial_balance_sol: float
+    roi_pct: float
+    avg_hold_seconds: float
+    exit_reasons: dict[str, int]
+    entry_types: dict[str, int]
+    elapsed_wall_seconds: float
+    closed_trades: list[ClosedTrade]
 
     def print_report(self) -> None:
-        """Print formatted report to console."""
-        print("\n" + "=" * 60)
-        print("  BACKTEST REPORT")
-        print("=" * 60)
-        print(f"  Tokens seen:       {self.tokens_seen}")
-        print(f"  Tokens w/ trades:  {self.tokens_with_trades}")
-        print(f"  Fast buys tried:   {self.fast_buys_attempted}")
-        print(f"  Full buys tried:   {self.full_buys_attempted}")
-        print(f"  Total trades:      {self.total_trades}")
-        print("-" * 60)
-        print(f"  Wins:              {self.wins}")
-        print(f"  Losses:            {self.losses}")
-        print(f"  Win rate:          {self.win_rate:.1f}%")
-        print(f"  Avg win:           +{self.avg_win_pct:.1f}%  ({self.avg_win_sol:.4f} SOL)")
-        print(f"  Avg loss:          -{self.avg_loss_pct:.1f}%  ({self.avg_loss_sol:.4f} SOL)")
-        print("-" * 60)
-        print(f"  Total P&L:         {self.total_pnl_sol:+.4f} SOL")
-        print(f"  Profit factor:     {self.profit_factor:.2f}")
-        print(f"  Max drawdown:      {self.max_drawdown_pct:.1f}%")
-        print(f"  ROI:               {self.roi_pct:+.1f}%")
-        print(f"  Initial balance:   {self.initial_balance_sol:.4f} SOL")
-        print(f"  Final balance:     {self.final_balance_sol:.4f} SOL")
-        print(f"  Avg hold time:     {self.avg_hold_seconds:.0f}s")
-        print("-" * 60)
-        print("  Entry types:")
-        for etype, count in self.entry_types.items():
-            print(f"    {etype}: {count}")
-        print("  Exit reasons:")
-        for reason, count in sorted(self.exit_reasons.items(), key=lambda x: -x[1]):
-            print(f"    {reason}: {count}")
-        print("-" * 60)
-        print(f"  Wall time:         {self.elapsed_wall_seconds:.1f}s")
-        print("=" * 60)
+        """Log formatted report to console."""
+        logger.info("\n%s", self.format_report())
 
-        # Top winners/losers
+    def format_report(self) -> str:
+        """Build a formatted backtest report."""
+        lines = [
+            "=" * 60,
+            "  BACKTEST REPORT",
+            "=" * 60,
+            f"  Tokens seen:       {self.tokens_seen}",
+            f"  Tokens w/ trades:  {self.tokens_with_trades}",
+            f"  Fast buys tried:   {self.fast_buys_attempted}",
+            f"  Full buys tried:   {self.full_buys_attempted}",
+            f"  Total trades:      {self.total_trades}",
+            "-" * 60,
+            f"  Wins:              {self.wins}",
+            f"  Losses:            {self.losses}",
+            f"  Win rate:          {self.win_rate:.1f}%",
+            f"  Avg win:           +{self.avg_win_pct:.1f}%  ({self.avg_win_sol:.4f} SOL)",
+            f"  Avg loss:          -{self.avg_loss_pct:.1f}%  ({self.avg_loss_sol:.4f} SOL)",
+            "-" * 60,
+            f"  Total P&L:         {self.total_pnl_sol:+.4f} SOL",
+            f"  Profit factor:     {self.profit_factor:.2f}",
+            f"  Max drawdown:      {self.max_drawdown_pct:.1f}%",
+            f"  ROI:               {self.roi_pct:+.1f}%",
+            f"  Initial balance:   {self.initial_balance_sol:.4f} SOL",
+            f"  Final balance:     {self.final_balance_sol:.4f} SOL",
+            f"  Avg hold time:     {self.avg_hold_seconds:.0f}s",
+            "-" * 60,
+            "  Entry types:",
+        ]
+        lines.extend(f"    {etype}: {count}" for etype, count in self.entry_types.items())
+        lines.append("  Exit reasons:")
+        lines.extend(
+            f"    {reason}: {count}" for reason, count in sorted(self.exit_reasons.items(), key=lambda item: -item[1])
+        )
+        lines.extend(["-" * 60, f"  Wall time:         {self.elapsed_wall_seconds:.1f}s", "=" * 60])
+
         by_pnl = sorted(self.closed_trades, key=lambda t: t.pnl_pct, reverse=True)
-        print("\n  TOP 5 WINNERS:")
+        lines.append("")
+        lines.append("  TOP 5 WINNERS:")
         for t in by_pnl[:5]:
-            print(f"    {t.symbol:14s} {t.pnl_pct:+7.1f}%  {t.pnl_sol:+.4f} SOL  hold={t.hold_seconds:.0f}s  entry={t.entry_type}  exit={t.exit_reason}")
-        print("\n  TOP 5 LOSERS:")
+            lines.append(
+                f"    {t.symbol:14s} {t.pnl_pct:+7.1f}%  {t.pnl_sol:+.4f} SOL  hold={t.hold_seconds:.0f}s  entry={t.entry_type}  exit={t.exit_reason}"
+            )
+        lines.append("")
+        lines.append("  TOP 5 LOSERS:")
         for t in by_pnl[-5:]:
-            print(f"    {t.symbol:14s} {t.pnl_pct:+7.1f}%  {t.pnl_sol:+.4f} SOL  hold={t.hold_seconds:.0f}s  entry={t.entry_type}  exit={t.exit_reason}")
-        print()
+            lines.append(
+                f"    {t.symbol:14s} {t.pnl_pct:+7.1f}%  {t.pnl_sol:+.4f} SOL  hold={t.hold_seconds:.0f}s  entry={t.entry_type}  exit={t.exit_reason}"
+            )
+        return "\n".join(lines)

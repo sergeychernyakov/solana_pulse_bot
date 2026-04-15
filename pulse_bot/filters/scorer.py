@@ -8,7 +8,7 @@ import time
 from typing import TYPE_CHECKING
 
 from pulse_bot.filters.metrics import MetricsCalculator, TokenMetrics
-from pulse_bot.models import FilterResult, ScoringResult, Token, Trade
+from pulse_bot.models import ScoringResult, Token, Trade
 
 if TYPE_CHECKING:
     from pulse_bot.config import PulseBotConfig
@@ -36,7 +36,8 @@ class Scorer:
         creator_tokens_today = self._db.get_creator_tokens_today_sync(token.creator)
 
         m = self._metrics.compute(
-            token, trades,
+            token,
+            trades,
             creator_tokens_today=creator_tokens_today,
             tokens_last_5min=tokens_last_5min,
             concurrent_observations=concurrent_observations,
@@ -70,37 +71,64 @@ class Scorer:
 
         # Build result with ALL metrics
         result = ScoringResult(
-            mint=token.mint, symbol=token.symbol, name=token.name, creator=token.creator,
-            total_score=total_score, decision=decision,
+            mint=token.mint,
+            symbol=token.symbol,
+            name=token.name,
+            creator=token.creator,
+            total_score=total_score,
+            decision=decision,
             reasons_summary=" | ".join(reasons),
             # Trade metrics
-            buy_count=m.buy_count, sell_count=m.sell_count,
-            unique_buyers=m.unique_buyers, unique_sellers=m.unique_sellers,
-            buy_volume_sol=m.total_buy_volume_sol, sell_volume_sol=m.total_sell_volume_sol,
-            buy_diversity=m.buy_diversity, max_buy_sol=m.max_buy_sol,
-            creator_sold=m.creator_sold, sell_pressure=m.sell_ratio,
-            avg_buy_sol=m.avg_buy_sol, median_buy_sol=m.median_buy_sol,
-            std_buy_sol=m.std_buy_sol, top3_buyer_pct=m.top3_buyer_pct,
-            repeat_buyer_count=m.repeat_buyer_count, first_buy_sol=m.first_buy_sol,
-            buy_velocity_trend=m.buy_velocity_trend, buy_size_trend=m.buy_size_trend,
-            time_to_first_buy=m.time_to_first_buy, buys_per_unique=m.buys_per_unique,
+            buy_count=m.buy_count,
+            sell_count=m.sell_count,
+            unique_buyers=m.unique_buyers,
+            unique_sellers=m.unique_sellers,
+            buy_volume_sol=m.total_buy_volume_sol,
+            sell_volume_sol=m.total_sell_volume_sol,
+            buy_diversity=m.buy_diversity,
+            max_buy_sol=m.max_buy_sol,
+            creator_sold=m.creator_sold,
+            sell_pressure=m.sell_ratio,
+            avg_buy_sol=m.avg_buy_sol,
+            median_buy_sol=m.median_buy_sol,
+            std_buy_sol=m.std_buy_sol,
+            top3_buyer_pct=m.top3_buyer_pct,
+            repeat_buyer_count=m.repeat_buyer_count,
+            first_buy_sol=m.first_buy_sol,
+            buy_velocity_trend=m.buy_velocity_trend,
+            buy_size_trend=m.buy_size_trend,
+            time_to_first_buy=m.time_to_first_buy,
+            buys_per_unique=m.buys_per_unique,
             # Curve
-            curve_progress_pct=m.curve_progress_pct, curve_velocity=m.curve_velocity,
-            curve_acceleration=m.curve_acceleration, sol_to_graduation=m.sol_to_graduation,
+            curve_progress_pct=m.curve_progress_pct,
+            curve_velocity=m.curve_velocity,
+            curve_acceleration=m.curve_acceleration,
+            sol_to_graduation=m.sol_to_graduation,
             market_cap_sol=m.market_cap_sol,
             # Price
-            token_price_sol=m.token_price_sol, exit_price=m.exit_price,
-            pnl_5th_pct=pnl_5, pnl_10th_pct=pnl_10, pnl_20th_pct=pnl_20, pnl_50th_pct=pnl_50, pnl_100th_pct=pnl_100,
+            token_price_sol=m.token_price_sol,
+            exit_price=m.exit_price,
+            pnl_5th_pct=pnl_5,
+            pnl_10th_pct=pnl_10,
+            pnl_20th_pct=pnl_20,
+            pnl_50th_pct=pnl_50,
+            pnl_100th_pct=pnl_100,
             # Metadata
-            name_length=m.name_length, symbol_length=m.symbol_length,
-            has_uri=m.has_uri, is_all_caps=m.is_all_caps, has_numbers=m.has_numbers,
+            name_length=m.name_length,
+            symbol_length=m.symbol_length,
+            has_uri=m.has_uri,
+            is_all_caps=m.is_all_caps,
+            has_numbers=m.has_numbers,
             # Timing
-            hour_utc=m.hour_utc, creator_tokens_today=m.creator_tokens_today,
+            hour_utc=m.hour_utc,
+            creator_tokens_today=m.creator_tokens_today,
             gap_create_to_first_trade=m.gap_create_to_first_trade,
             # Context
-            tokens_last_5min=m.tokens_last_5min, concurrent_observations=m.concurrent_observations,
+            tokens_last_5min=m.tokens_last_5min,
+            concurrent_observations=m.concurrent_observations,
             # Timestamps
-            created_at=token.created_at, scored_at=time.time(),
+            created_at=token.created_at,
+            scored_at=time.time(),
         )
         return result
 

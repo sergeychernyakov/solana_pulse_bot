@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -72,7 +71,9 @@ class Pipeline:
             await self._launchpad.disconnect()
             logger.info(
                 "Pipeline stopped — seen=%d, scored=%d, fast_buys=%d",
-                self._tokens_seen, self._tokens_scored, self._fast_buys,
+                self._tokens_seen,
+                self._tokens_scored,
+                self._fast_buys,
             )
 
     def stop(self) -> None:
@@ -109,9 +110,13 @@ class Pipeline:
                 self._fast_buys += 1
                 logger.info(
                     "FAST_BUY %s (%s): score=%d buyers=%d vol=%.2f rate=%.1f/s | %s",
-                    token.symbol, mint_short, fast_result.score,
-                    fast_result.unique_buyers, fast_result.volume_sol,
-                    fast_result.buy_rate, fast_result.reasons[:80],
+                    token.symbol,
+                    mint_short,
+                    fast_result.score,
+                    fast_result.unique_buyers,
+                    fast_result.volume_sol,
+                    fast_result.buy_rate,
+                    fast_result.reasons[:80],
                 )
 
             # ── Phase 2: Full (remaining seconds) ──────────
@@ -130,7 +135,8 @@ class Pipeline:
             tokens_5min = self._db.get_tokens_last_5min_sync()
             concurrent = self._config.max_concurrent_observations - self._semaphore._value  # noqa: SLF001
             result = self._scorer.score(
-                token, all_trades,
+                token,
+                all_trades,
                 tokens_last_5min=tokens_5min,
                 concurrent_observations=concurrent,
             )
@@ -150,9 +156,7 @@ class Pipeline:
 
             # P&L at fast entry point vs end of full observation
             if fast_entry_price > 0 and result.exit_price > 0:
-                result.pnl_at_fast_entry_pct = (
-                    (result.exit_price - fast_entry_price) / fast_entry_price
-                ) * 100.0
+                result.pnl_at_fast_entry_pct = ((result.exit_price - fast_entry_price) / fast_entry_price) * 100.0
 
             # Store
             await self._db.upsert_scoring_result(result)
@@ -162,28 +166,36 @@ class Pipeline:
             log_fn = logger.info if result.decision == "BUY" or fast_result.decision == "FAST_BUY" else logger.debug
             log_fn(
                 "Scored %s (%s): fast=%s(%d) full=%s(%d) buyers=%d vol=%.1f pnl_fast=%+.0f%%",
-                token.symbol, mint_short,
-                fast_result.decision, fast_result.score,
-                result.decision, result.total_score,
-                result.unique_buyers, result.buy_volume_sol,
+                token.symbol,
+                mint_short,
+                fast_result.decision,
+                fast_result.score,
+                result.decision,
+                result.total_score,
+                result.unique_buyers,
+                result.buy_volume_sol,
                 result.pnl_at_fast_entry_pct,
             )
 
-            await self._db.log_event("score", {
-                "mint": token.mint, "symbol": token.symbol,
-                "fast": fast_result.decision, "full": result.decision,
-                "fast_score": fast_result.score, "full_score": result.total_score,
-            })
+            await self._db.log_event(
+                "score",
+                {
+                    "mint": token.mint,
+                    "symbol": token.symbol,
+                    "fast": fast_result.decision,
+                    "full": result.decision,
+                    "fast_score": fast_result.score,
+                    "full_score": result.total_score,
+                },
+            )
 
         except Exception:
             logger.exception("Error processing token %s (%s)", token.symbol, mint_short)
         finally:
             await self._launchpad.unsubscribe_trades(token.mint)
 
-    async def _collect_trades(self, token: Token, duration: float) -> list:
+    async def _collect_trades(self, token: Token, duration: float) -> list[Trade]:
         """Collect trades during a time window."""
-        from pulse_bot.models import Trade
-
         trades: list[Trade] = []
         if duration <= 0:
             return trades

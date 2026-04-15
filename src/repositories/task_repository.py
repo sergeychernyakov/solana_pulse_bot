@@ -66,7 +66,12 @@ class TaskRepository(BaseRepository[Task]):
 
         if search is not None:
             search_pattern = f"%{search}%"
-            stmt = stmt.where(or_(Task.title.ilike(search_pattern), Task.description.ilike(search_pattern)))
+            stmt = stmt.where(
+                or_(
+                    Task.title.ilike(search_pattern),
+                    Task.description.ilike(search_pattern),
+                )
+            )
 
         # Order and pagination
         stmt = stmt.order_by(Task.created_at.desc())
@@ -139,11 +144,22 @@ class TaskRepository(BaseRepository[Task]):
 
         if search is not None:
             search_pattern = f"%{search}%"
-            stmt = stmt.where(or_(Task.title.ilike(search_pattern), Task.description.ilike(search_pattern)))
+            stmt = stmt.where(
+                or_(
+                    Task.title.ilike(search_pattern),
+                    Task.description.ilike(search_pattern),
+                )
+            )
 
         result = await session.execute(stmt)
         count = result.scalar_one()
 
-        logger.debug("Counted %d tasks (completed=%s, priority=%s, search=%s)", count, completed, priority, search)
+        logger.debug(
+            "Counted %d tasks (completed=%s, priority=%s, search=%s)",
+            count,
+            completed,
+            priority,
+            search,
+        )
 
         return count

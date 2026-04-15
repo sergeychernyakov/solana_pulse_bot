@@ -144,13 +144,19 @@ class PumpFunLaunchpad(Launchpad):
             mint=raw.get("mint", ""),
             wallet=wallet,
             tx_type=raw.get("txType", "buy"),
-            sol_amount=float(raw.get("solAmount", 0)) / 1e9 if raw.get("solAmount", 0) > 1000 else float(raw.get("solAmount", 0)),
+            sol_amount=float(raw.get("solAmount", 0)) / 1e9
+            if raw.get("solAmount", 0) > 1000
+            else float(raw.get("solAmount", 0)),
             token_amount=float(raw.get("tokenAmount", 0)),
             new_token_balance=float(raw.get("newTokenBalance", 0)),
             bonding_curve_key=raw.get("bondingCurveKey", ""),
-            v_sol_in_bonding_curve=float(raw.get("vSolInBondingCurve", 0)) / 1e9 if raw.get("vSolInBondingCurve", 0) > 1000 else float(raw.get("vSolInBondingCurve", 0)),
+            v_sol_in_bonding_curve=float(raw.get("vSolInBondingCurve", 0)) / 1e9
+            if raw.get("vSolInBondingCurve", 0) > 1000
+            else float(raw.get("vSolInBondingCurve", 0)),
             v_tokens_in_bonding_curve=float(raw.get("vTokensInBondingCurve", 0)),
-            market_cap_sol=float(raw.get("marketCapSol", 0)) / 1e9 if raw.get("marketCapSol", 0) > 1000 else float(raw.get("marketCapSol", 0)),
+            market_cap_sol=float(raw.get("marketCapSol", 0)) / 1e9
+            if raw.get("marketCapSol", 0) > 1000
+            else float(raw.get("marketCapSol", 0)),
             timestamp=raw.get("timestamp", time.time()),
             is_creator=(wallet == creator),
         )
@@ -183,7 +189,9 @@ class PumpFunLaunchpad(Launchpad):
                 delay = min(_RECONNECT_BASE_DELAY * (2 ** (reconnect_count - 1)), 30.0)
                 logger.warning(
                     "WS connection lost (attempt %d): %s. Reconnecting in %.1fs...",
-                    reconnect_count, exc, delay,
+                    reconnect_count,
+                    exc,
+                    delay,
                 )
                 await asyncio.sleep(delay)
                 try:

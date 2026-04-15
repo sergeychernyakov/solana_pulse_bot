@@ -50,14 +50,28 @@ class SimulatedExecution:
         sol = amount_sol or self._cfg.buy_amount_sol
 
         if not trades:
-            return FillResult(side="buy", sol_spent=sol, tokens_received=0,
-                              price_per_token=0, fee_sol=0, slippage_pct=0, success=False)
+            return FillResult(
+                side="buy",
+                sol_spent=sol,
+                tokens_received=0,
+                price_per_token=0,
+                fee_sol=0,
+                slippage_pct=0,
+                success=False,
+            )
 
         # Estimate price from recent buy trades
         buy_trades = [t for t in trades if t.tx_type == "buy" and t.token_amount > 0 and t.sol_amount > 0]
         if not buy_trades:
-            return FillResult(side="buy", sol_spent=sol, tokens_received=0,
-                              price_per_token=0, fee_sol=0, slippage_pct=0, success=False)
+            return FillResult(
+                side="buy",
+                sol_spent=sol,
+                tokens_received=0,
+                price_per_token=0,
+                fee_sol=0,
+                slippage_pct=0,
+                success=False,
+            )
 
         last_price = buy_trades[-1].sol_amount / buy_trades[-1].token_amount
 
@@ -73,8 +87,11 @@ class SimulatedExecution:
         tokens = net_sol / fill_price if fill_price > 0 else 0
 
         return FillResult(
-            side="buy", sol_spent=sol, tokens_received=tokens,
-            price_per_token=fill_price, fee_sol=fee + self._cfg.execution_priority_fee,
+            side="buy",
+            sol_spent=sol,
+            tokens_received=tokens,
+            price_per_token=fill_price,
+            fee_sol=fee + self._cfg.execution_priority_fee,
             slippage_pct=slippage * 100,
         )
 
@@ -86,14 +103,28 @@ class SimulatedExecution:
             tokens_to_sell: Number of tokens to sell.
         """
         if not trades or tokens_to_sell <= 0:
-            return FillResult(side="sell", sol_spent=0, tokens_received=0,
-                              price_per_token=0, fee_sol=0, slippage_pct=0, success=False)
+            return FillResult(
+                side="sell",
+                sol_spent=0,
+                tokens_received=0,
+                price_per_token=0,
+                fee_sol=0,
+                slippage_pct=0,
+                success=False,
+            )
 
         # Use last trade price
         priced = [t for t in trades if t.token_amount > 0 and t.sol_amount > 0]
         if not priced:
-            return FillResult(side="sell", sol_spent=0, tokens_received=0,
-                              price_per_token=0, fee_sol=0, slippage_pct=0, success=False)
+            return FillResult(
+                side="sell",
+                sol_spent=0,
+                tokens_received=0,
+                price_per_token=0,
+                fee_sol=0,
+                slippage_pct=0,
+                success=False,
+            )
 
         last_price = priced[-1].sol_amount / priced[-1].token_amount
 
@@ -106,8 +137,11 @@ class SimulatedExecution:
         net_sol = gross_sol - fee
 
         return FillResult(
-            side="sell", sol_spent=net_sol, tokens_received=tokens_to_sell,
-            price_per_token=fill_price, fee_sol=fee,
+            side="sell",
+            sol_spent=net_sol,
+            tokens_received=tokens_to_sell,
+            price_per_token=fill_price,
+            fee_sol=fee,
             slippage_pct=slippage * 100,
         )
 

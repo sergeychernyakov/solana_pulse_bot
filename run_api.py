@@ -24,7 +24,7 @@ def main() -> None:
         host=config.HOST,
         port=config.PORT,
         reload=config.DEBUG,
-        log_level="debug" if config.DEBUG else "info"
+        log_level="debug" if config.DEBUG else "info",
     )
 
 

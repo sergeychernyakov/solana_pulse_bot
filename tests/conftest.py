@@ -62,7 +62,11 @@ async def async_session(test_engine: AsyncEngine) -> AsyncGenerator[AsyncSession
         AsyncSession: Database session for testing
     """
     async_session_maker = sessionmaker(
-        test_engine, class_=AsyncSession, expire_on_commit=False, autocommit=False, autoflush=False
+        test_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+        autocommit=False,
+        autoflush=False,
     )
 
     async with async_session_maker() as session:
@@ -71,7 +75,9 @@ async def async_session(test_engine: AsyncEngine) -> AsyncGenerator[AsyncSession
 
 
 @pytest_asyncio.fixture(scope="function")
-async def async_client(async_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
+async def async_client(
+    async_session: AsyncSession,
+) -> AsyncGenerator[AsyncClient, None]:
     """
     Provide async HTTP client for API tests.
 
@@ -108,7 +114,12 @@ async def sample_task(async_session: AsyncSession) -> Task:
     Returns:
         Task: Created task instance
     """
-    task = Task(title="Sample Task", description="Sample Description", priority=PriorityEnum.MEDIUM, completed=False)
+    task = Task(
+        title="Sample Task",
+        description="Sample Description",
+        priority=PriorityEnum.MEDIUM,
+        completed=False,
+    )
     async_session.add(task)
     await async_session.commit()
     await async_session.refresh(task)

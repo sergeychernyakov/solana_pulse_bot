@@ -87,11 +87,14 @@ class ObservationFilter(Filter):
         curve_pct = 0.0
         if trades:
             last_trade = trades[-1]
-            from pulse_bot.config import PulseBotConfig
-            curve_pct = min(
-                (last_trade.v_sol_in_bonding_curve / self._config.pumpfun_graduation_sol) * 100.0,
-                100.0,
-            ) if last_trade.v_sol_in_bonding_curve > 0 else 0.0
+            curve_pct = (
+                min(
+                    (last_trade.v_sol_in_bonding_curve / self._config.pumpfun_graduation_sol) * 100.0,
+                    100.0,
+                )
+                if last_trade.v_sol_in_bonding_curve > 0
+                else 0.0
+            )
 
         elapsed = 0.0
         if trades:

@@ -106,25 +106,69 @@ CREATE INDEX IF NOT EXISTS idx_token_scores_fast ON token_scores(fast_decision);
 
 # All columns in token_scores for INSERT (order must match VALUES)
 _SCORE_COLUMNS = [
-    "mint", "symbol", "name", "creator",
-    "total_score", "decision", "fast_decision", "fast_score",
-    "fast_reasons", "reasons",
-    "fast_buy_count", "fast_volume_sol", "fast_buy_rate", "fast_unique_buyers",
-    "fast_sell_ratio", "fast_elapsed", "fast_scored_at", "fast_entry_price",
+    "mint",
+    "symbol",
+    "name",
+    "creator",
+    "total_score",
+    "decision",
+    "fast_decision",
+    "fast_score",
+    "fast_reasons",
+    "reasons",
+    "fast_buy_count",
+    "fast_volume_sol",
+    "fast_buy_rate",
+    "fast_unique_buyers",
+    "fast_sell_ratio",
+    "fast_elapsed",
+    "fast_scored_at",
+    "fast_entry_price",
     "pnl_at_fast_entry_pct",
-    "buy_count", "sell_count", "unique_buyers", "unique_sellers",
-    "buy_volume_sol", "sell_volume_sol", "buy_diversity", "max_buy_sol",
-    "creator_sold", "sell_pressure",
-    "avg_buy_sol", "median_buy_sol", "std_buy_sol", "top3_buyer_pct",
-    "repeat_buyer_count", "first_buy_sol", "buy_velocity_trend", "buy_size_trend",
-    "time_to_first_buy", "buys_per_unique",
-    "curve_progress_pct", "curve_velocity", "curve_acceleration", "sol_to_graduation",
+    "buy_count",
+    "sell_count",
+    "unique_buyers",
+    "unique_sellers",
+    "buy_volume_sol",
+    "sell_volume_sol",
+    "buy_diversity",
+    "max_buy_sol",
+    "creator_sold",
+    "sell_pressure",
+    "avg_buy_sol",
+    "median_buy_sol",
+    "std_buy_sol",
+    "top3_buyer_pct",
+    "repeat_buyer_count",
+    "first_buy_sol",
+    "buy_velocity_trend",
+    "buy_size_trend",
+    "time_to_first_buy",
+    "buys_per_unique",
+    "curve_progress_pct",
+    "curve_velocity",
+    "curve_acceleration",
+    "sol_to_graduation",
     "market_cap_sol",
-    "token_price_sol", "exit_price", "pnl_5th_pct", "pnl_10th_pct", "pnl_20th_pct", "pnl_50th_pct", "pnl_100th_pct",
-    "name_length", "symbol_length", "has_uri", "is_all_caps", "has_numbers",
-    "hour_utc", "creator_tokens_today", "gap_create_to_first_trade",
-    "tokens_last_5min", "concurrent_observations",
-    "created_at", "scored_at",
+    "token_price_sol",
+    "exit_price",
+    "pnl_5th_pct",
+    "pnl_10th_pct",
+    "pnl_20th_pct",
+    "pnl_50th_pct",
+    "pnl_100th_pct",
+    "name_length",
+    "symbol_length",
+    "has_uri",
+    "is_all_caps",
+    "has_numbers",
+    "hour_utc",
+    "creator_tokens_today",
+    "gap_create_to_first_trade",
+    "tokens_last_5min",
+    "concurrent_observations",
+    "created_at",
+    "scored_at",
 ]
 
 
@@ -139,6 +183,7 @@ class Database:
         conn = self._get_sync_conn()
         try:
             conn.executescript(_SCHEMA_SQL)
+            self._ensure_token_score_columns(conn)
             conn.commit()
         finally:
             conn.close()
@@ -170,16 +215,28 @@ class Database:
         """Aggregate stats."""
         conn = self._get_sync_conn()
         try:
-            cur = conn.execute("""
+            cur = conn.execute(
+                """
                 SELECT COUNT(*) as total_seen,
                     SUM(CASE WHEN decision = 'BUY' THEN 1 ELSE 0 END) as total_buy,
                     SUM(CASE WHEN decision = 'SKIP' THEN 1 ELSE 0 END) as total_skip,
                     SUM(CASE WHEN decision = 'BORDERLINE' THEN 1 ELSE 0 END) as total_borderline,
                     SUM(CASE WHEN fast_decision = 'FAST_BUY' THEN 1 ELSE 0 END) as total_fast_buy
                 FROM token_scores
-            """)
+            """
+            )
             row = cur.fetchone()
-            return dict(row) if row else {"total_seen": 0, "total_buy": 0, "total_skip": 0, "total_borderline": 0, "total_fast_buy": 0}
+            return (
+                dict(row)
+                if row
+                else {
+                    "total_seen": 0,
+                    "total_buy": 0,
+                    "total_skip": 0,
+                    "total_borderline": 0,
+                    "total_fast_buy": 0,
+                }
+            )
         finally:
             conn.close()
 
@@ -187,22 +244,36 @@ class Database:
         """Aggregate stats for a specific date."""
         conn = self._get_sync_conn()
         try:
-            cur = conn.execute("""
+            cur = conn.execute(
+                """
                 SELECT COUNT(*) as total_seen,
                     SUM(CASE WHEN decision = 'BUY' THEN 1 ELSE 0 END) as total_buy,
                     SUM(CASE WHEN decision = 'SKIP' THEN 1 ELSE 0 END) as total_skip,
                     SUM(CASE WHEN decision = 'BORDERLINE' THEN 1 ELSE 0 END) as total_borderline,
                     SUM(CASE WHEN fast_decision = 'FAST_BUY' THEN 1 ELSE 0 END) as total_fast_buy
                 FROM token_scores WHERE date(scored_at, 'unixepoch', 'localtime') = ?
-            """, (date_str,))
+            """,
+                (date_str,),
+            )
             row = cur.fetchone()
-            return dict(row) if row else {"total_seen": 0, "total_buy": 0, "total_skip": 0, "total_borderline": 0, "total_fast_buy": 0}
+            return (
+                dict(row)
+                if row
+                else {
+                    "total_seen": 0,
+                    "total_buy": 0,
+                    "total_skip": 0,
+                    "total_borderline": 0,
+                    "total_fast_buy": 0,
+                }
+            )
         finally:
             conn.close()
 
     def get_creator_stats_sync(self, wallet: str) -> CreatorStats | None:
         """Lookup creator from cache."""
         from pulse_bot.models import CreatorStats
+
         conn = self._get_sync_conn()
         try:
             cur = conn.execute("SELECT * FROM creators WHERE wallet = ?", (wallet,))
@@ -210,10 +281,12 @@ class Database:
             if not row:
                 return None
             return CreatorStats(
-                wallet=row["wallet"], total_tokens_created=row["total_tokens_created"],
+                wallet=row["wallet"],
+                total_tokens_created=row["total_tokens_created"],
                 times_seen=row["times_seen"],
                 tokens_where_creator_sold_early=row["tokens_where_creator_sold_early"],
-                first_seen_at=row["first_seen_at"], last_seen_at=row["last_seen_at"],
+                first_seen_at=row["first_seen_at"],
+                last_seen_at=row["last_seen_at"],
                 blacklisted=bool(row["blacklisted"]),
             )
         finally:
@@ -236,7 +309,10 @@ class Database:
         """Count tokens created in last 5 minutes."""
         conn = self._get_sync_conn()
         try:
-            cur = conn.execute("SELECT COUNT(*) as cnt FROM tokens WHERE created_at > ?", (time.time() - 300,))
+            cur = conn.execute(
+                "SELECT COUNT(*) as cnt FROM tokens WHERE created_at > ?",
+                (time.time() - 300,),
+            )
             row = cur.fetchone()
             return row["cnt"] if row else 0
         finally:
@@ -261,7 +337,15 @@ class Database:
             await conn.execute("PRAGMA journal_mode=WAL")
             await conn.execute(
                 "INSERT OR IGNORE INTO tokens (mint, name, symbol, creator, created_at, uri, launchpad) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (token.mint, token.name, token.symbol, token.creator, token.created_at, token.uri, token.launchpad),
+                (
+                    token.mint,
+                    token.name,
+                    token.symbol,
+                    token.creator,
+                    token.created_at,
+                    token.uri,
+                    token.launchpad,
+                ),
             )
             await conn.commit()
 
@@ -273,7 +357,20 @@ class Database:
             await conn.execute("PRAGMA journal_mode=WAL")
             await conn.executemany(
                 "INSERT INTO trades (mint, wallet, tx_type, sol_amount, token_amount, market_cap_sol, v_sol_in_bonding_curve, timestamp, is_creator) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [(t.mint, t.wallet, t.tx_type, t.sol_amount, t.token_amount, t.market_cap_sol, t.v_sol_in_bonding_curve, t.timestamp, int(t.is_creator)) for t in trades],
+                [
+                    (
+                        t.mint,
+                        t.wallet,
+                        t.tx_type,
+                        t.sol_amount,
+                        t.token_amount,
+                        t.market_cap_sol,
+                        t.v_sol_in_bonding_curve,
+                        t.timestamp,
+                        int(t.is_creator),
+                    )
+                    for t in trades
+                ],
             )
             await conn.commit()
 
@@ -281,12 +378,13 @@ class Database:
         """Insert or update scoring result with all metrics."""
         placeholders = ", ".join(["?"] * len(_SCORE_COLUMNS))
         cols = ", ".join(_SCORE_COLUMNS)
-        values = tuple(
-            self._get_score_value(result, col) for col in _SCORE_COLUMNS
-        )
+        values = tuple(self._get_score_value(result, col) for col in _SCORE_COLUMNS)
         async with aiosqlite.connect(self.db_path) as conn:
             await conn.execute("PRAGMA journal_mode=WAL")
-            await conn.execute(f"INSERT OR REPLACE INTO token_scores ({cols}) VALUES ({placeholders})", values)
+            await conn.execute(
+                f"INSERT OR REPLACE INTO token_scores ({cols}) VALUES ({placeholders})",
+                values,
+            )
             await conn.commit()
 
     async def upsert_creator(self, wallet: str, sold_early: bool) -> None:
@@ -307,8 +405,10 @@ class Database:
         """Append to event_log."""
         async with aiosqlite.connect(self.db_path) as conn:
             await conn.execute("PRAGMA journal_mode=WAL")
-            await conn.execute("INSERT INTO event_log (event_type, data, timestamp) VALUES (?, ?, ?)",
-                               (event_type, json.dumps(data, default=str), time.time()))
+            await conn.execute(
+                "INSERT INTO event_log (event_type, data, timestamp) VALUES (?, ?, ?)",
+                (event_type, json.dumps(data, default=str), time.time()),
+            )
             await conn.commit()
 
     # ── Internal ───────────────────────────────────────────
@@ -320,6 +420,18 @@ class Database:
         conn.execute("PRAGMA busy_timeout = 5000")
         conn.row_factory = sqlite3.Row
         return conn
+
+    @staticmethod
+    def _ensure_token_score_columns(conn: sqlite3.Connection) -> None:
+        """Add new token_scores columns for existing SQLite databases."""
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(token_scores)")}
+        columns = {
+            "pnl_50th_pct": "REAL DEFAULT 0.0",
+            "pnl_100th_pct": "REAL DEFAULT 0.0",
+        }
+        for name, definition in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE token_scores ADD COLUMN {name} {definition}")
 
     @staticmethod
     def _get_score_value(result: ScoringResult, col: str) -> object:

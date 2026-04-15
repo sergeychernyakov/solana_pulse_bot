@@ -93,14 +93,21 @@ class PulseMonitor:
         if self._window:
             last = self._window[-1]
             if last.v_sol_in_bonding_curve > 0:
-                curve_pct = min((last.v_sol_in_bonding_curve / self._cfg.pumpfun_graduation_sol) * 100, 100)
+                curve_pct = min(
+                    (last.v_sol_in_bonding_curve / self._cfg.pumpfun_graduation_sol) * 100,
+                    100,
+                )
 
         return PulseSnapshot(
-            buy_rate=buy_rate, sell_rate=sell_rate,
+            buy_rate=buy_rate,
+            sell_rate=sell_rate,
             new_wallet_rate=new_wallet_rate,
-            avg_buy_size_sol=avg_buy, total_sol_in_window=total_sol,
-            creator_selling=creator_selling, whale_exit=whale_exit,
-            buy_rate_trend=buy_rate_trend, buy_size_trend=buy_size_trend,
+            avg_buy_size_sol=avg_buy,
+            total_sol_in_window=total_sol,
+            creator_selling=creator_selling,
+            whale_exit=whale_exit,
+            buy_rate_trend=buy_rate_trend,
+            buy_size_trend=buy_size_trend,
             trend_declining_count=self._trend_declining_count,
             curve_progress_pct=curve_pct,
             window_events=len(self._window),

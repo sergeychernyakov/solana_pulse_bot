@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import statistics
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -22,27 +22,27 @@ class TokenMetrics:
     unique_sellers: int = 0
     total_buy_volume_sol: float = 0.0
     total_sell_volume_sol: float = 0.0
-    buy_diversity: int = 0              # unique buy amounts (rounded)
-    max_buy_sol: float = 0.0            # largest single buy
+    buy_diversity: int = 0  # unique buy amounts (rounded)
+    max_buy_sol: float = 0.0  # largest single buy
     creator_sold: bool = False
 
     # New: trade pattern analysis
-    avg_buy_sol: float = 0.0            # mean buy size
-    median_buy_sol: float = 0.0         # median buy size (diff from avg = skew)
-    std_buy_sol: float = 0.0            # std dev of buy sizes (high = organic)
-    top3_buyer_pct: float = 0.0         # top 3 buyers % of total volume
-    repeat_buyer_count: int = 0         # wallets that bought more than once
-    first_buy_sol: float = 0.0          # first buy amount (large = sniper)
-    buy_velocity_trend: float = 0.0     # >1 = accelerating, <1 = decelerating
-    buy_size_trend: float = 0.0         # >1 = buys getting larger, <1 = smaller
-    time_to_first_buy: float = 0.0      # seconds from create to first buy
-    buys_per_unique: float = 0.0        # buy_count / unique_buyers (>1.5 = wash)
+    avg_buy_sol: float = 0.0  # mean buy size
+    median_buy_sol: float = 0.0  # median buy size (diff from avg = skew)
+    std_buy_sol: float = 0.0  # std dev of buy sizes (high = organic)
+    top3_buyer_pct: float = 0.0  # top 3 buyers % of total volume
+    repeat_buyer_count: int = 0  # wallets that bought more than once
+    first_buy_sol: float = 0.0  # first buy amount (large = sniper)
+    buy_velocity_trend: float = 0.0  # >1 = accelerating, <1 = decelerating
+    buy_size_trend: float = 0.0  # >1 = buys getting larger, <1 = smaller
+    time_to_first_buy: float = 0.0  # seconds from create to first buy
+    buys_per_unique: float = 0.0  # buy_count / unique_buyers (>1.5 = wash)
 
     # ── Bonding curve metrics ──────────────────────────────
-    curve_progress_pct: float = 0.0     # % of graduation threshold
-    curve_velocity: float = 0.0         # SOL/sec into curve
-    curve_acceleration: float = 0.0     # velocity change: >0 accelerating
-    sol_to_graduation: float = 0.0      # SOL remaining to graduate
+    curve_progress_pct: float = 0.0  # % of graduation threshold
+    curve_velocity: float = 0.0  # SOL/sec into curve
+    curve_acceleration: float = 0.0  # velocity change: >0 accelerating
+    sol_to_graduation: float = 0.0  # SOL remaining to graduate
     market_cap_sol: float = 0.0
 
     # ── Token metadata ─────────────────────────────────────
@@ -53,16 +53,16 @@ class TokenMetrics:
     has_numbers: bool = False
 
     # ── Timing ─────────────────────────────────────────────
-    hour_utc: int = 0                   # hour of creation (0-23)
-    creator_tokens_today: int = 0       # how many tokens creator made today
+    hour_utc: int = 0  # hour of creation (0-23)
+    creator_tokens_today: int = 0  # how many tokens creator made today
     gap_create_to_first_trade: float = 0.0  # delay in seconds
 
     # ── Market context ─────────────────────────────────────
-    tokens_last_5min: int = 0           # market activity
-    concurrent_observations: int = 0    # how busy the bot is
+    tokens_last_5min: int = 0  # market activity
+    concurrent_observations: int = 0  # how busy the bot is
 
     # ── Sell pressure ──────────────────────────────────────
-    sell_ratio: float = 0.0             # sell_count / buy_count
+    sell_ratio: float = 0.0  # sell_count / buy_count
 
     # ── Price data ─────────────────────────────────────────
     token_price_sol: float = 0.0
@@ -128,6 +128,7 @@ class MetricsCalculator:
         # ── Repeat buyers ──────────────────────────────────
         if buyer_wallets:
             from collections import Counter
+
             wallet_counts = Counter(buyer_wallets)
             m.repeat_buyer_count = sum(1 for c in wallet_counts.values() if c > 1)
 
@@ -199,6 +200,7 @@ class MetricsCalculator:
 
         # ── Timing ─────────────────────────────────────────
         import datetime
+
         m.hour_utc = datetime.datetime.utcfromtimestamp(token.created_at).hour
         m.creator_tokens_today = creator_tokens_today
         if trades:

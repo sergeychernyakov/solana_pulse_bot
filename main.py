@@ -15,14 +15,26 @@ def main() -> None:
     elif command == "backtest":
         _run_backtest()
     elif command == "dashboard":
-        print("Run the dashboard with: streamlit run pulse_bot/dashboard.py")
+        _log_cli_message("Run the dashboard with: streamlit run pulse_bot/dashboard.py")
         sys.exit(0)
     else:
-        print("Usage:")
-        print("  python main.py monitor     — start the token monitoring pipeline")
-        print("  python main.py backtest    — run backtest on collected data")
-        print("  streamlit run pulse_bot/dashboard.py  — start the dashboard")
+        _log_cli_message(
+            "\n".join(
+                [
+                    "Usage:",
+                    "  python main.py monitor     — start the token monitoring pipeline",
+                    "  python main.py backtest    — run backtest on collected data",
+                    "  streamlit run pulse_bot/dashboard.py  — start the dashboard",
+                ]
+            )
+        )
         sys.exit(0)
+
+
+def _log_cli_message(message: str) -> None:
+    """Log a CLI message when no command-specific logging is configured."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logging.getLogger(__name__).info(message)
 
 
 def _run_monitor() -> None:

@@ -25,7 +25,11 @@ def upgrade() -> None:
         sa.Column("title", sa.String(length=200), nullable=False),
         sa.Column("description", sa.String(length=2000), nullable=True),
         sa.Column("completed", sa.Boolean(), nullable=False),
-        sa.Column("priority", sa.Enum("LOW", "MEDIUM", "HIGH", name="priorityenum"), nullable=False),
+        sa.Column(
+            "priority",
+            sa.Enum("LOW", "MEDIUM", "HIGH", name="priorityenum"),
+            nullable=False,
+        ),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("due_date", sa.DateTime(timezone=True), nullable=True),

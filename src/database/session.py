@@ -36,7 +36,12 @@ def get_async_engine() -> AsyncEngine:
 
     if _engine is None:
         logger.info("Creating async database engine: %s", config.DATABASE_URL)
-        _engine = create_async_engine(config.DATABASE_URL, echo=config.DATABASE_ECHO, pool_pre_ping=True, future=True)
+        _engine = create_async_engine(
+            config.DATABASE_URL,
+            echo=config.DATABASE_ECHO,
+            pool_pre_ping=True,
+            future=True,
+        )
         logger.info("Database engine created successfully")
 
     return _engine
@@ -54,7 +59,11 @@ def _get_session_factory() -> async_sessionmaker[AsyncSession]:
     if _async_session_factory is None:
         engine = get_async_engine()
         _async_session_factory = async_sessionmaker(
-            engine, class_=AsyncSession, expire_on_commit=False, autocommit=False, autoflush=False
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+            autocommit=False,
+            autoflush=False,
         )
 
     return _async_session_factory

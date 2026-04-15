@@ -22,7 +22,9 @@ logger = get_logger(__name__)
 
 
 @router.get("/health", response_model=HealthResponse)
-async def health_check(session: AsyncSession = Depends(get_db_session)) -> HealthResponse:
+async def health_check(
+    session: AsyncSession = Depends(get_db_session),
+) -> HealthResponse:
     """
     Health check endpoint.
 

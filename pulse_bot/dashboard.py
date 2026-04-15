@@ -22,7 +22,8 @@ st.set_page_config(
 )
 
 # Compact CSS for mobile
-st.markdown("""
+st.markdown(
+    """
 <style>
     .block-container { padding-top: 0.5rem; padding-bottom: 0rem; padding-left: 0.5rem; padding-right: 0.5rem; }
     [data-testid="stMetric"], [data-testid="stMetricValue"], [data-testid="stMetricLabel"] { display: none; }
@@ -34,7 +35,9 @@ st.markdown("""
     .stat-buy b { color: #4ade80 !important; }
     .stat-skip b { color: #888 !important; }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 
 def main() -> None:
@@ -138,20 +141,54 @@ def render_token_table(rows: list[dict]) -> None:
     df["score_f"] = df["total_score"].apply(lambda s: f"{s:+d}")
 
     # Select and rename
-    display_df = df[[
-        "time", "symbol", "mint_s",
-        "fast", "f_sc", "f_buys", "f_rate", "pnl_f",
-        "mcap", "unique_buyers", "buys", "sells", "vol",
-        "curve", "pnl5", "pnl10", "pnl20", "pnl50", "pnl100",
-        "score_f", "decision",
-    ]].copy()
+    display_df = df[
+        [
+            "time",
+            "symbol",
+            "mint_s",
+            "fast",
+            "f_sc",
+            "f_buys",
+            "f_rate",
+            "pnl_f",
+            "mcap",
+            "unique_buyers",
+            "buys",
+            "sells",
+            "vol",
+            "curve",
+            "pnl5",
+            "pnl10",
+            "pnl20",
+            "pnl50",
+            "pnl100",
+            "score_f",
+            "decision",
+        ]
+    ].copy()
 
     display_df.columns = [
-        "Time", "Sym", "Mint",
-        "Fast", "F.Sc", "F.Buys", "Rate/s", "F.P&L",
-        "MCap", "Uniq", "Buys", "Sells", "Vol",
-        "Curve", "~5", "~10", "~20", "~50", "~100",
-        "Score", "Full",
+        "Time",
+        "Sym",
+        "Mint",
+        "Fast",
+        "F.Sc",
+        "F.Buys",
+        "Rate/s",
+        "F.P&L",
+        "MCap",
+        "Uniq",
+        "Buys",
+        "Sells",
+        "Vol",
+        "Curve",
+        "~5",
+        "~10",
+        "~20",
+        "~50",
+        "~100",
+        "Score",
+        "Full",
     ]
 
     # Color by FULL decision only. Fast shown in column text.

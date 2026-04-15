@@ -6,6 +6,8 @@ Test task API endpoints.
 This module tests all REST API endpoints for task management.
 """
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from httpx import AsyncClient
 
@@ -17,7 +19,12 @@ from src.models.task import Task
 async def test_create_task(async_client: AsyncClient) -> None:
     """Test creating a task."""
     response = await async_client.post(
-        "/api/v1/tasks", json={"title": "Test Task", "description": "Test Description", "priority": "HIGH"}
+        "/api/v1/tasks",
+        json={
+            "title": "Test Task",
+            "description": "Test Description",
+            "priority": "HIGH",
+        },
     )
 
     assert response.status_code == 201
@@ -94,7 +101,8 @@ async def test_get_task_not_found(async_client: AsyncClient) -> None:
 async def test_update_task(async_client: AsyncClient, sample_task: Task) -> None:
     """Test PUT /api/v1/tasks/{id}."""
     response = await async_client.put(
-        f"/api/v1/tasks/{sample_task.id}", json={"title": "Updated Title", "completed": True}
+        f"/api/v1/tasks/{sample_task.id}",
+        json={"title": "Updated Title", "completed": True},
     )
 
     assert response.status_code == 200
@@ -209,13 +217,14 @@ async def test_list_tasks_with_limit_offset(async_client: AsyncClient, sample_ta
 @pytest.mark.asyncio
 async def test_create_task_with_all_params(async_client: AsyncClient) -> None:
     """Test creating task with all optional parameters."""
+    future_due_date = (datetime.now(UTC) + timedelta(days=30)).isoformat()
     response = await async_client.post(
         "/api/v1/tasks",
         json={
             "title": "Full Task",
             "description": "Complete description",
             "priority": "HIGH",
-            "due_date": "2025-12-31T23:59:59Z",
+            "due_date": future_due_date,
         },
     )
 

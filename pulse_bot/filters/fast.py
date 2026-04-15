@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from pulse_bot.models import FilterResult, Token, Trade
+from pulse_bot.models import Token, Trade
 
 if TYPE_CHECKING:
     from pulse_bot.config import PulseBotConfig
@@ -63,12 +63,17 @@ class FastFilter:
 
         if self._cfg.fast_creator_sold_reject and creator_sold:
             return FastResult(
-                decision="WAIT", score=0,
+                decision="WAIT",
+                score=0,
                 reasons="creator_sold_fast",
-                buy_count=buy_count, sell_count=sell_count,
-                unique_buyers=unique_buyers, volume_sol=total_volume,
-                buy_rate=buy_rate, sell_ratio=sell_ratio,
-                curve_pct=curve_pct, elapsed=elapsed,
+                buy_count=buy_count,
+                sell_count=sell_count,
+                unique_buyers=unique_buyers,
+                volume_sol=total_volume,
+                buy_rate=buy_rate,
+                sell_ratio=sell_ratio,
+                curve_pct=curve_pct,
+                elapsed=elapsed,
             )
 
         # ── Scoring ────────────────────────────────────────
@@ -119,12 +124,17 @@ class FastFilter:
         decision = "FAST_BUY" if total_score >= self._cfg.fast_score_threshold else "WAIT"
 
         return FastResult(
-            decision=decision, score=total_score,
+            decision=decision,
+            score=total_score,
             reasons=" | ".join(reasons),
-            buy_count=buy_count, sell_count=sell_count,
-            unique_buyers=unique_buyers, volume_sol=total_volume,
-            buy_rate=buy_rate, sell_ratio=sell_ratio,
-            curve_pct=curve_pct, elapsed=elapsed,
+            buy_count=buy_count,
+            sell_count=sell_count,
+            unique_buyers=unique_buyers,
+            volume_sol=total_volume,
+            buy_rate=buy_rate,
+            sell_ratio=sell_ratio,
+            curve_pct=curve_pct,
+            elapsed=elapsed,
         )
 
 
@@ -132,10 +142,17 @@ class FastResult:
     """Result of fast phase evaluation."""
 
     __slots__ = (
-        "decision", "score", "reasons",
-        "buy_count", "sell_count", "unique_buyers",
-        "volume_sol", "buy_rate", "sell_ratio",
-        "curve_pct", "elapsed",
+        "decision",
+        "score",
+        "reasons",
+        "buy_count",
+        "sell_count",
+        "unique_buyers",
+        "volume_sol",
+        "buy_rate",
+        "sell_ratio",
+        "curve_pct",
+        "elapsed",
     )
 
     def __init__(

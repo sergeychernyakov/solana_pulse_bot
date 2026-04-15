@@ -19,7 +19,12 @@ async def test_create_success(async_session: AsyncSession) -> None:
     """Test successful record creation."""
     repository = BaseRepository(Task)
 
-    task = await repository.create(async_session, title="Test Task", description="Test Description", completed=False)
+    task = await repository.create(
+        async_session,
+        title="Test Task",
+        description="Test Description",
+        completed=False,
+    )
 
     assert task.id is not None
     assert task.title == "Test Task"

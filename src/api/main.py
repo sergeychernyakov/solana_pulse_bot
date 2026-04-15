@@ -113,7 +113,8 @@ def create_app() -> FastAPI:
         """
         logger.warning("Validation error: %s (field: %s)", exc.message, exc.field)
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, content={"detail": exc.message, "field": exc.field}
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"detail": exc.message, "field": exc.field},
         )
 
     @app.exception_handler(DatabaseError)
@@ -132,7 +133,8 @@ def create_app() -> FastAPI:
         """
         logger.error("Database error: %s", exc, exc_info=True)
         return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content={"detail": "Internal server error"}
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": "Internal server error"},
         )
 
     return app

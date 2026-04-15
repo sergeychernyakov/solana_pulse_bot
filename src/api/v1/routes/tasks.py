@@ -24,7 +24,9 @@ logger = get_logger(__name__)
 
 @router.post("/tasks", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
 async def create_task(
-    task: TaskCreate, service: TaskService = Depends(get_task_service), session: AsyncSession = Depends(get_db_session)
+    task: TaskCreate,
+    service: TaskService = Depends(get_task_service),
+    session: AsyncSession = Depends(get_db_session),
 ) -> TaskResponse:
     """
     Create a new task.
@@ -48,7 +50,11 @@ async def create_task(
     logger.info("POST /tasks - Creating task: %s", task.title)
 
     created_task = await service.create_task(
-        session=session, title=task.title, description=task.description, priority=task.priority, due_date=task.due_date
+        session=session,
+        title=task.title,
+        description=task.description,
+        priority=task.priority,
+        due_date=task.due_date,
     )
 
     logger.info("Task created with ID: %d", created_task.id)
@@ -94,7 +100,12 @@ async def list_tasks(
     )
 
     tasks = await service.get_tasks(
-        session=session, completed=completed, priority=priority, search=search, limit=limit, offset=offset
+        session=session,
+        completed=completed,
+        priority=priority,
+        search=search,
+        limit=limit,
+        offset=offset,
     )
 
     logger.info("Retrieved %d tasks", len(tasks))
@@ -103,7 +114,9 @@ async def list_tasks(
 
 @router.get("/tasks/{task_id}", response_model=TaskResponse)
 async def get_task(
-    task_id: int, service: TaskService = Depends(get_task_service), session: AsyncSession = Depends(get_db_session)
+    task_id: int,
+    service: TaskService = Depends(get_task_service),
+    session: AsyncSession = Depends(get_db_session),
 ) -> TaskResponse:
     """
     Get a single task by ID.
@@ -177,7 +190,9 @@ async def update_task(
 
 @router.patch("/tasks/{task_id}/complete", response_model=TaskResponse)
 async def mark_task_complete(
-    task_id: int, service: TaskService = Depends(get_task_service), session: AsyncSession = Depends(get_db_session)
+    task_id: int,
+    service: TaskService = Depends(get_task_service),
+    session: AsyncSession = Depends(get_db_session),
 ) -> TaskResponse:
     """
     Mark a task as complete.
@@ -207,7 +222,9 @@ async def mark_task_complete(
 
 @router.delete("/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_task(
-    task_id: int, service: TaskService = Depends(get_task_service), session: AsyncSession = Depends(get_db_session)
+    task_id: int,
+    service: TaskService = Depends(get_task_service),
+    session: AsyncSession = Depends(get_db_session),
 ) -> None:
     """
     Delete a task.

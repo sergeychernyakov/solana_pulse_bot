@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -27,6 +27,7 @@ class Position:
     remaining_pct: float = 1.0  # 1.0 → 0.1 after partial sells
     total_sol_received: float = 0.0
     partial_sell_count: int = 0
+    entry_type: str = "full"
 
 
 @dataclass
@@ -68,10 +69,7 @@ class Portfolio:
 
     @property
     def can_buy(self) -> bool:
-        return (
-            self.open_count < self._cfg.portfolio_max_positions
-            and self.balance >= self._cfg.buy_amount_sol
-        )
+        return self.open_count < self._cfg.portfolio_max_positions and self.balance >= self._cfg.buy_amount_sol
 
     @property
     def total_value(self) -> float:
@@ -86,7 +84,14 @@ class Portfolio:
             return 0.0
         return ((self._peak_balance - self.total_value) / self._peak_balance) * 100.0
 
-    def open_position(self, mint: str, symbol: str, fill: FillResult, entry_time: float, entry_type: str = "fast") -> bool:
+    def open_position(
+        self,
+        mint: str,
+        symbol: str,
+        fill: FillResult,
+        entry_time: float,
+        entry_type: str = "fast",
+    ) -> bool:
         """Open a new position after a simulated buy."""
         if not fill.success or mint in self.positions:
             return False
@@ -95,18 +100,31 @@ class Portfolio:
 
         self.balance -= fill.sol_spent
         self.positions[mint] = Position(
-            mint=mint, symbol=symbol,
+            mint=mint,
+            symbol=symbol,
             entry_price=fill.price_per_token,
             entry_time=entry_time,
             tokens_held=fill.tokens_received,
             sol_invested=fill.sol_spent,
+            entry_type=entry_type,
         )
-        # Store entry_type on position for the report
-        self.positions[mint]._entry_type = entry_type  # noqa: SLF001
-        logger.debug("Opened %s: %.4f SOL → %.0f tokens @ %e", symbol, fill.sol_spent, fill.tokens_received, fill.price_per_token)
+        logger.debug(
+            "Opened %s: %.4f SOL → %.0f tokens @ %e",
+            symbol,
+            fill.sol_spent,
+            fill.tokens_received,
+            fill.price_per_token,
+        )
         return True
 
-    def partial_sell(self, mint: str, sell_pct: float, fill: FillResult, exit_time: float, reason: str) -> None:
+    def partial_sell(
+        self,
+        mint: str,
+        sell_pct: float,
+        fill: FillResult,
+        exit_time: float,
+        reason: str,
+    ) -> None:
         """Execute a partial sell of a position."""
         pos = self.positions.get(mint)
         if not pos or not fill.success:
@@ -118,7 +136,13 @@ class Portfolio:
         pos.partial_sell_count += 1
         self._update_peak()
 
-        logger.debug("Partial sell %s: %.0f%% for %.4f SOL (%s)", pos.symbol, sell_pct * 100, fill.sol_spent, reason)
+        logger.debug(
+            "Partial sell %s: %.0f%% for %.4f SOL (%s)",
+            pos.symbol,
+            sell_pct * 100,
+            fill.sol_spent,
+            reason,
+        )
 
     def close_position(self, mint: str, fill: FillResult, exit_time: float, reason: str) -> ClosedTrade | None:
         """Close a position completely."""
@@ -134,19 +158,21 @@ class Portfolio:
         pnl_sol = total_received - pos.sol_invested
         pnl_pct = (pnl_sol / pos.sol_invested) * 100 if pos.sol_invested > 0 else 0
 
-        entry_type = getattr(pos, "_entry_type", "full")
-
         trade = ClosedTrade(
-            mint=mint, symbol=pos.symbol,
+            mint=mint,
+            symbol=pos.symbol,
             entry_price=pos.entry_price,
             exit_price=fill.price_per_token if fill.success else pos.entry_price,
-            entry_time=pos.entry_time, exit_time=exit_time,
-            sol_invested=pos.sol_invested, sol_received=total_received,
-            pnl_sol=pnl_sol, pnl_pct=pnl_pct,
+            entry_time=pos.entry_time,
+            exit_time=exit_time,
+            sol_invested=pos.sol_invested,
+            sol_received=total_received,
+            pnl_sol=pnl_sol,
+            pnl_pct=pnl_pct,
             hold_seconds=exit_time - pos.entry_time,
             exit_reason=reason,
             partial_sells=pos.partial_sell_count,
-            entry_type=entry_type,
+            entry_type=pos.entry_type,
         )
         self.closed_trades.append(trade)
         del self.positions[mint]
@@ -154,7 +180,11 @@ class Portfolio:
 
         logger.debug(
             "Closed %s: %+.4f SOL (%+.1f%%) after %.0fs (%s)",
-            trade.symbol, pnl_sol, pnl_pct, trade.hold_seconds, reason,
+            trade.symbol,
+            pnl_sol,
+            pnl_pct,
+            trade.hold_seconds,
+            reason,
         )
         return trade
 

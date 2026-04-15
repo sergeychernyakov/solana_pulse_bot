@@ -147,7 +147,12 @@ class TaskService:
         )
 
         tasks = await self.repository.get_all(
-            session=session, completed=completed, priority=priority, search=search, limit=limit, offset=offset
+            session=session,
+            completed=completed,
+            priority=priority,
+            search=search,
+            limit=limit,
+            offset=offset,
         )
 
         return tasks
