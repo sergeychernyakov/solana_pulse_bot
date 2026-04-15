@@ -1,10 +1,11 @@
 """Initial schema
 
 Revision ID: 619d7e413fa3
-Revises: 
+Revises:
 Create Date: 2025-10-23 12:41:14.558719
 
 """
+
 from typing import Sequence, Union
 
 import sqlalchemy as sa

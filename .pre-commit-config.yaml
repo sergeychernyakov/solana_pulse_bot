@@ -1,56 +1,74 @@
+default_language_version:
+  python: python3
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
     hooks:
-      - id: check-merge-conflict
-      - id: end-of-file-fixer
-      - id: trailing-whitespace
-      - id: check-yaml
-      - id: detect-private-key
       - id: check-added-large-files
-
-  - repo: https://github.com/PyCQA/isort
-    rev: 5.12.0
-    hooks:
-      - id: isort
-        language_version: python3
-        args: ["--profile", "black", "--line-length", "120"]
-
-  - repo: https://github.com/psf/black
-    rev: 23.9.1
-    hooks:
-      - id: black
-        language_version: python3
-        args: ["--line-length", "120"]
-
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.11.9
-    hooks:
-      - id: ruff
-        args: ["--line-length=120"]
+      - id: check-ast
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-yaml
+      - id: debug-statements
+      - id: detect-private-key
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+      - id: trailing-whitespace
 
   - repo: local
     hooks:
-      - id: test-coverage
-        name: Test Coverage Check
-        entry: bash -c "rm -f .coverage && coverage run -m pytest && coverage report --fail-under=90"
+      - id: bash-syntax
+        name: Bash syntax check
+        entry: bash -n scripts/check_quality.sh
         language: system
         pass_filenames: false
-        stages: [pre-push]
 
-      - id: mypyc-compile-check
-        name: MyPyC Compilation Check
-        entry: python compile.py --no-strict --no-clean
+      - id: compileall
+        name: Python syntax compile
+        entry: .venv/bin/python -m compileall -q main.py run_api.py src pulse_bot tests
         language: system
         pass_filenames: false
-        stages: [pre-commit]
-        verbose: true
 
-  - repo: https://github.com/pylint-dev/pylint
-    rev: v3.3.6
-    hooks:
+      - id: ruff
+        name: Ruff lint
+        entry: .venv/bin/python -m ruff check .
+        language: system
+        pass_filenames: false
+
+      - id: black
+        name: Black format check
+        entry: .venv/bin/python -m black --line-length 120 --check .
+        language: system
+        pass_filenames: false
+
+      - id: isort
+        name: isort import check
+        entry: .venv/bin/python -m isort --profile black --line-length 120 --check-only .
+        language: system
+        pass_filenames: false
+
+      - id: mypy
+        name: mypy type check
+        entry: .venv/bin/python -m mypy src main.py pulse_bot
+        language: system
+        pass_filenames: false
+
       - id: pylint
-        name: Code Quality Check
-        entry: pylint --rcfile .pylintrc --fail-under=10.0 src main.py
-        exclude: '^tests/'
+        name: pylint static analysis
+        entry: env PYLINTHOME=.cache/pylint .venv/bin/python -m pylint --rcfile .pylintrc --fail-under=10.0 src main.py
         language: system
+        pass_filenames: false
+
+      - id: pytest-coverage
+        name: pytest with coverage
+        entry: bash -c "rm -f .coverage && .venv/bin/python -m pytest -q --cov=src --cov-report=term-missing --cov-fail-under=90"
+        language: system
+        pass_filenames: false
+
+      - id: bandit
+        name: Bandit security scan
+        entry: .venv/bin/python -m bandit -q -r src pulse_bot main.py run_api.py -x tests
+        language: system
+        pass_filenames: false

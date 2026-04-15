@@ -121,6 +121,18 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### Проверки качества
+
+```bash
+# Установить локальный git hook
+python -m pre_commit install
+
+# Запустить все проверки вручную
+bash scripts/check_quality.sh
+```
+
+Скрипт запускает compileall, Ruff, Black, isort, mypy, Pylint, pytest с покрытием `src >= 90%`, Bandit, pip-audit и все pre-commit hooks. `pip-audit` требует доступ к сети для проверки vulnerability metadata.
+
 ### Запуск
 
 ```bash

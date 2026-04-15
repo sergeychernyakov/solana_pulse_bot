@@ -1,4 +1,5 @@
 # src/config/settings.py
+# pylint: disable=invalid-name,too-many-instance-attributes
 
 """
 Settings Module
@@ -32,7 +33,7 @@ class Config:
     CORS_ORIGINS: list[str] = field(default_factory=lambda: ["*"])
 
     # Server Configuration
-    HOST: str = os.getenv("HOST", "0.0.0.0")
+    HOST: str = os.getenv("HOST", "127.0.0.1")
     PORT: int = int(os.getenv("PORT", "8000"))
 
 

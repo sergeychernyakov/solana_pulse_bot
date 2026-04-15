@@ -7,21 +7,14 @@ This module provides a generic base repository class with common
 database operations that can be inherited by specific repositories.
 """
 
-from typing import Any, Generic, Protocol, TypeVar
+from typing import Any, Generic, TypeVar
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.helpers.logger import get_logger
 
-
-class HasID(Protocol):
-    """Protocol for models with an ID attribute."""
-
-    id: int
-
-
-T = TypeVar("T", bound=HasID)
+T = TypeVar("T")
 
 logger = get_logger(__name__)
 
@@ -61,7 +54,7 @@ class BaseRepository(Generic[T]):
         session.add(instance)
         await session.flush()
         await session.refresh(instance)
-        logger.debug("Created %s with ID: %s", self.model_class.__name__, instance.id)
+        logger.debug("Created %s with ID: %s", self.model_class.__name__, getattr(instance, "id", None))
         return instance
 
     async def get_by_id(self, session: AsyncSession, id: int) -> T | None:  # pylint: disable=redefined-builtin
@@ -75,7 +68,7 @@ class BaseRepository(Generic[T]):
         Returns:
             Model instance or None if not found
         """
-        stmt = select(self.model_class).where(self.model_class.id == id)
+        stmt = select(self.model_class).where(getattr(self.model_class, "id") == id)
         result = await session.execute(stmt)
         instance = result.scalar_one_or_none()
         logger.debug(

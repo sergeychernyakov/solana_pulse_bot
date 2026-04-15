@@ -47,7 +47,7 @@ async def test_session_rollback_on_error() -> None:
     except ValueError:
         # Session should rollback automatically
         try:
-            await session_gen.athrow(ValueError, ValueError("Test error"), None)
+            await session_gen.athrow(ValueError("Test error"))
         except ValueError:
             pass  # Expected
 

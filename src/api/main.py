@@ -17,13 +17,14 @@ from fastapi.responses import JSONResponse
 from src.api.exceptions import DatabaseError, TaskNotFoundError, TaskValidationError
 from src.api.v1.routes import health, tasks
 from src.config.settings import config
+from src.database.session import close_db
 from src.helpers.logger import get_logger
 
 logger = get_logger(__name__)
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     """
     Application lifespan handler.
 
@@ -45,8 +46,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Shutdown
     logger.info("Shutting down Task Management API")
-    from src.database.session import close_db
-
     await close_db()
 
 
@@ -57,7 +56,7 @@ def create_app() -> FastAPI:
     Returns:
         FastAPI: Configured application instance
     """
-    app = FastAPI(
+    application = FastAPI(
         title="Task Management API",
         version="1.0.0",
         description="REST API for managing tasks with database persistence",
@@ -67,7 +66,7 @@ def create_app() -> FastAPI:
     )
 
     # Add CORS middleware
-    app.add_middleware(
+    application.add_middleware(
         CORSMiddleware,
         allow_origins=config.CORS_ORIGINS,
         allow_credentials=True,
@@ -76,11 +75,11 @@ def create_app() -> FastAPI:
     )
 
     # Include routers with API prefix
-    app.include_router(tasks.router, prefix=config.API_V1_PREFIX, tags=["tasks"])
-    app.include_router(health.router, prefix=config.API_V1_PREFIX, tags=["health"])
+    application.include_router(tasks.router, prefix=config.API_V1_PREFIX, tags=["tasks"])
+    application.include_router(health.router, prefix=config.API_V1_PREFIX, tags=["health"])
 
     # Register exception handlers
-    @app.exception_handler(TaskNotFoundError)
+    @application.exception_handler(TaskNotFoundError)
     async def task_not_found_handler(
         request: Request, exc: TaskNotFoundError  # pylint: disable=unused-argument
     ) -> JSONResponse:
@@ -97,7 +96,7 @@ def create_app() -> FastAPI:
         logger.warning("Task not found: %d", exc.task_id)
         return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content={"detail": exc.message})
 
-    @app.exception_handler(TaskValidationError)
+    @application.exception_handler(TaskValidationError)
     async def task_validation_handler(
         request: Request, exc: TaskValidationError  # pylint: disable=unused-argument
     ) -> JSONResponse:
@@ -113,11 +112,11 @@ def create_app() -> FastAPI:
         """
         logger.warning("Validation error: %s (field: %s)", exc.message, exc.field)
         return JSONResponse(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"detail": exc.message, "field": exc.field},
         )
 
-    @app.exception_handler(DatabaseError)
+    @application.exception_handler(DatabaseError)
     async def database_error_handler(
         request: Request, exc: DatabaseError  # pylint: disable=unused-argument
     ) -> JSONResponse:
@@ -137,7 +136,7 @@ def create_app() -> FastAPI:
             content={"detail": "Internal server error"},
         )
 
-    return app
+    return application
 
 
 # Create app instance

@@ -167,29 +167,31 @@ def render_token_table(rows: list[dict]) -> None:
         ]
     ].copy()
 
-    display_df.columns = [
-        "Time",
-        "Sym",
-        "Mint",
-        "Fast",
-        "F.Sc",
-        "F.Buys",
-        "Rate/s",
-        "F.P&L",
-        "MCap",
-        "Uniq",
-        "Buys",
-        "Sells",
-        "Vol",
-        "Curve",
-        "~5",
-        "~10",
-        "~20",
-        "~50",
-        "~100",
-        "Score",
-        "Full",
-    ]
+    display_df.columns = pd.Index(
+        [
+            "Time",
+            "Sym",
+            "Mint",
+            "Fast",
+            "F.Sc",
+            "F.Buys",
+            "Rate/s",
+            "F.P&L",
+            "MCap",
+            "Uniq",
+            "Buys",
+            "Sells",
+            "Vol",
+            "Curve",
+            "~5",
+            "~10",
+            "~20",
+            "~50",
+            "~100",
+            "Score",
+            "Full",
+        ]
+    )
 
     # Color by FULL decision only. Fast shown in column text.
     def color_row(row: pd.Series) -> list[str]:

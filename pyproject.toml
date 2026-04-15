@@ -1,0 +1,30 @@
+# pyproject.toml
+
+[tool.coverage.run]
+branch = true
+source = ["src"]
+omit = [
+    "src/database/migrations/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+fail_under = 90
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__ == ['\"]__main__['\"]:",
+]
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_configs = true
+ignore_missing_imports = false
+plugins = []
+
+[[tool.mypy.overrides]]
+module = [
+    "streamlit",
+]
+ignore_missing_imports = true

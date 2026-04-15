@@ -35,8 +35,6 @@ class TaskCreate(TaskBase):
     Inherits all fields from TaskBase. Used for POST requests.
     """
 
-    pass
-
 
 class TaskUpdate(BaseModel):
     """

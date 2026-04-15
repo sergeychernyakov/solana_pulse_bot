@@ -105,13 +105,14 @@ class PulseBotConfig:
 
     # ── PULSE MONITOR ──────────────────────────────────────
     pulse_window_size: int = 20
-    pulse_min_events: int = 5
+    pulse_min_events: int = 15  # need enough events for pulse to be meaningful
     pulse_dead_buy_rate: float = 0.10
     pulse_weak_buy_rate: float = 0.30
     pulse_trend_threshold: float = 0.15  # % change for trend detection
     pulse_whale_exit_sol: float = 1.0  # sell > this = whale exit
 
     # ── EXIT RULES ─────────────────────────────────────────
+    exit_min_hold_seconds: float = 10.0  # min hold before pulse can exit (warmup)
     exit_on_creator_dump: bool = True
     exit_on_whale: bool = True
     exit_sell_pressure_ratio: float = 2.0  # sell_rate > buy_rate × this → exit

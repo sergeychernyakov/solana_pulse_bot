@@ -15,7 +15,7 @@ See **[`README.md`](./README.md)** for an overview of the project’s purpose, r
 ## 📐 Coding Conventions
 - Follow the style guide in **[`PYTHON_STYLE_GUIDE.md`](./PYTHON_STYLE_GUIDE.md)**.
 - File names: **snake_case** (`email_service.py`), class names: **CamelCase** (`EmailService`).
-- First line of each code file must be a comment with the file path, e.g.  
+- First line of each code file must be a comment with the file path, e.g.
   `# src/services/email_service.py`
 - Use type hints everywhere and Google-style docstrings for all public APIs.
 - Do **not** use `print()` for output—use the standard `logging` module.

@@ -49,6 +49,24 @@ class FilterResult:
 
 
 @dataclass
+class ObservationResult:
+    """Aggregated trade metrics for an observation window."""
+
+    mint: str
+    unique_buyers: int
+    unique_sellers: int
+    total_buy_volume_sol: float
+    total_sell_volume_sol: float
+    buy_count: int
+    sell_count: int
+    buy_amounts: list[float]
+    curve_progress_pct: float
+    creator_sold: bool
+    max_single_buy_sol: float
+    observation_seconds: float
+
+
+@dataclass
 class ScoringResult:
     """Final scoring decision for a token. All metrics stored for backtesting."""
 

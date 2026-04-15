@@ -34,7 +34,7 @@ class Base(BaseModel):
             self._validation_errors = None
             return True
         except ValidationError as e:
-            self._validation_errors = {err["loc"][0]: err["msg"] for err in e.errors()}
+            self._validation_errors = {str(err["loc"][0]): err["msg"] for err in e.errors()}
             return False
 
     def get_validation_errors(self) -> Optional[Dict[str, str]]:
@@ -42,7 +42,7 @@ class Base(BaseModel):
         return self._validation_errors
 
     @classmethod
-    def validate_phone_number(cls, v: Any, field_name: str) -> str:
+    def validate_phone_number(cls, v: Any, field_name: str) -> str | None:
         """
         Validates UK phone numbers.
 
@@ -92,7 +92,7 @@ class Base(BaseModel):
         return v
 
     @classmethod
-    def validate_zipcode(cls, v: Any) -> str:
+    def validate_zipcode(cls, v: Any) -> str | None:
         """
         Validates UK postal codes using a regex pattern.
 

@@ -26,7 +26,7 @@ class Launchpad(ABC):
         ...
 
     @abstractmethod
-    async def stream_new_tokens(self) -> AsyncIterator[Token]:
+    def stream_new_tokens(self) -> AsyncIterator[Token]:
         """Yield newly created tokens as they arrive from the WebSocket."""
         ...
 
@@ -41,7 +41,7 @@ class Launchpad(ABC):
         ...
 
     @abstractmethod
-    async def stream_trades(self, mint: str, duration_seconds: float) -> AsyncIterator[Trade]:
+    def stream_trades(self, mint: str, duration_seconds: float) -> AsyncIterator[Trade]:
         """Yield trades for a mint during the observation window."""
         ...
 

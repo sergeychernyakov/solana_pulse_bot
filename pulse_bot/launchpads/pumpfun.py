@@ -7,7 +7,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -35,7 +35,7 @@ class PumpFunLaunchpad(Launchpad):
 
     def __init__(self, config: PulseBotConfig) -> None:
         self._config = config
-        self._ws: websockets.WebSocketClientProtocol | None = None
+        self._ws: Any | None = None
         self._create_queue: asyncio.Queue[dict] = asyncio.Queue()
         self._trade_queues: dict[str, asyncio.Queue[dict]] = {}
         self._reader_task: asyncio.Task | None = None  # type: ignore[type-arg]
@@ -144,19 +144,25 @@ class PumpFunLaunchpad(Launchpad):
             mint=raw.get("mint", ""),
             wallet=wallet,
             tx_type=raw.get("txType", "buy"),
-            sol_amount=float(raw.get("solAmount", 0)) / 1e9
-            if raw.get("solAmount", 0) > 1000
-            else float(raw.get("solAmount", 0)),
+            sol_amount=(
+                float(raw.get("solAmount", 0)) / 1e9
+                if raw.get("solAmount", 0) > 1000
+                else float(raw.get("solAmount", 0))
+            ),
             token_amount=float(raw.get("tokenAmount", 0)),
             new_token_balance=float(raw.get("newTokenBalance", 0)),
             bonding_curve_key=raw.get("bondingCurveKey", ""),
-            v_sol_in_bonding_curve=float(raw.get("vSolInBondingCurve", 0)) / 1e9
-            if raw.get("vSolInBondingCurve", 0) > 1000
-            else float(raw.get("vSolInBondingCurve", 0)),
+            v_sol_in_bonding_curve=(
+                float(raw.get("vSolInBondingCurve", 0)) / 1e9
+                if raw.get("vSolInBondingCurve", 0) > 1000
+                else float(raw.get("vSolInBondingCurve", 0))
+            ),
             v_tokens_in_bonding_curve=float(raw.get("vTokensInBondingCurve", 0)),
-            market_cap_sol=float(raw.get("marketCapSol", 0)) / 1e9
-            if raw.get("marketCapSol", 0) > 1000
-            else float(raw.get("marketCapSol", 0)),
+            market_cap_sol=(
+                float(raw.get("marketCapSol", 0)) / 1e9
+                if raw.get("marketCapSol", 0) > 1000
+                else float(raw.get("marketCapSol", 0))
+            ),
             timestamp=raw.get("timestamp", time.time()),
             is_creator=(wallet == creator),
         )
@@ -196,6 +202,8 @@ class PumpFunLaunchpad(Launchpad):
                 await asyncio.sleep(delay)
                 try:
                     await self._establish_connection()
+                    if self._ws is None:
+                        raise ConnectionError("WebSocket reconnect returned no connection")
                     # Re-subscribe to all active trade mints
                     for mint in list(self._trade_queues.keys()):
                         sub_msg = json.dumps({"method": "subscribeTokenTrade", "keys": [mint]})

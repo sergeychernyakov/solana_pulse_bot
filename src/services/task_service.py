@@ -157,7 +157,7 @@ class TaskService:
 
         return tasks
 
-    async def update_task(
+    async def update_task(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
         session: AsyncSession,
         task_id: int,

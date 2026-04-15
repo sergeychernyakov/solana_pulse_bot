@@ -5,6 +5,14 @@ import asyncio
 import logging
 import sys
 
+from pulse_bot.backtest import BacktestEngine
+from pulse_bot.config import get_config
+from pulse_bot.db import Database
+from pulse_bot.filters.fast import FastFilter
+from pulse_bot.filters.scorer import Scorer
+from pulse_bot.launchpads.pumpfun import PumpFunLaunchpad
+from pulse_bot.pipeline import Pipeline
+
 
 def main() -> None:
     """Run the application based on the command argument."""
@@ -14,6 +22,10 @@ def main() -> None:
         _run_monitor()
     elif command == "backtest":
         _run_backtest()
+    elif command == "optimize":
+        _run_optimize()
+    elif command == "qa":
+        _run_qa()
     elif command == "dashboard":
         _log_cli_message("Run the dashboard with: streamlit run pulse_bot/dashboard.py")
         sys.exit(0)
@@ -24,7 +36,10 @@ def main() -> None:
                     "Usage:",
                     "  python main.py monitor     — start the token monitoring pipeline",
                     "  python main.py backtest    — run backtest on collected data",
-                    "  streamlit run pulse_bot/dashboard.py  — start the dashboard",
+                    "  python main.py optimize    — run grid search optimizer",
+                    "  python main.py qa          — run all tests and quality checks",
+                    "  streamlit run pulse_bot/dashboard.py          — live dashboard",
+                    "  streamlit run pulse_bot/backtest_dashboard.py — backtest results",
                 ]
             )
         )
@@ -39,13 +54,6 @@ def _log_cli_message(message: str) -> None:
 
 def _run_monitor() -> None:
     """Start the async monitoring pipeline."""
-    from pulse_bot.config import get_config
-    from pulse_bot.db import Database
-    from pulse_bot.filters.fast import FastFilter
-    from pulse_bot.filters.scorer import Scorer
-    from pulse_bot.launchpads.pumpfun import PumpFunLaunchpad
-    from pulse_bot.pipeline import Pipeline
-
     config = get_config()
 
     # Setup logging
@@ -71,10 +79,6 @@ def _run_monitor() -> None:
 
 def _run_backtest() -> None:
     """Run backtest on collected historical data."""
-    from pulse_bot.backtest import BacktestEngine
-    from pulse_bot.config import get_config
-    from pulse_bot.db import Database
-
     config = get_config()
 
     # Parse optional args
@@ -107,6 +111,92 @@ def _run_backtest() -> None:
     engine = BacktestEngine(config, db)
     result = engine.run()
     result.print_report()
+
+
+def _run_qa() -> None:
+    """Run all tests and quality checks."""
+    import subprocess
+
+    checks = [
+        ("Compile check", ["python", "-m", "compileall", "-q", "pulse_bot/", "src/"]),
+        ("Ruff lint", ["python", "-m", "ruff", "check", "pulse_bot/", "src/"]),
+        ("Black format check", ["python", "-m", "black", "--check", "--quiet", "pulse_bot/", "src/"]),
+        ("isort check", ["python", "-m", "isort", "--check-only", "--quiet", "pulse_bot/", "src/"]),
+        ("Pytest", ["python", "-m", "pytest", "-q", "--tb=short"]),
+    ]
+
+    passed = 0
+    failed = 0
+
+    for name, cmd in checks:
+        print(f"\n{'─' * 40}")
+        print(f"  {name}")
+        print(f"{'─' * 40}")
+        result = subprocess.run(cmd, capture_output=False)  # noqa: S603
+        if result.returncode == 0:
+            print(f"  ✓ {name} passed")
+            passed += 1
+        else:
+            print(f"  ✗ {name} FAILED (exit {result.returncode})")
+            failed += 1
+
+    print(f"\n{'=' * 40}")
+    print(f"  QA: {passed} passed, {failed} failed")
+    print(f"{'=' * 40}")
+    sys.exit(1 if failed > 0 else 0)
+
+
+def _run_optimize() -> None:
+    """Run grid search optimizer."""
+    from pulse_bot.optimizer import Optimizer
+
+    config = get_config()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    db = Database(config.backtest_db_path)
+    db.init_schema()
+
+    optimizer = Optimizer(config, db)
+
+    # Parse custom grid from CLI args
+    custom_grid: dict[str, list] = {}
+    for arg in sys.argv[2:]:
+        if "=" in arg and arg.startswith("--"):
+            key = arg.split("=")[0].lstrip("-").replace("-", "_")
+            values_str = arg.split("=")[1]
+            # Parse comma-separated values
+            values = []
+            for v in values_str.split(","):
+                v = v.strip()
+                try:
+                    if "." in v:
+                        values.append(float(v))
+                    else:
+                        values.append(int(v))
+                except ValueError:
+                    values.append(v)
+            custom_grid[key] = values
+
+    if custom_grid:
+        optimizer.set_grid(custom_grid)
+        logging.getLogger(__name__).info("Custom grid: %s", custom_grid)
+    else:
+        optimizer.use_default_grid()
+
+    logging.getLogger(__name__).info(
+        "Starting optimizer: %d combinations, session=%s",
+        optimizer.estimate_runs(), optimizer.session_id,
+    )
+    logging.getLogger(__name__).info(
+        "View results: streamlit run pulse_bot/backtest_dashboard.py --server.port 8502",
+    )
+
+    optimizer.run()
 
 
 if __name__ == "__main__":

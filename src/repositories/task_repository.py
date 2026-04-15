@@ -133,7 +133,7 @@ class TaskRepository(BaseRepository[Task]):
         Returns:
             Count of matching tasks
         """
-        stmt = select(func.count(Task.id))
+        stmt = select(func.count(Task.id))  # pylint: disable=not-callable
 
         # Apply same filters as get_all
         if completed is not None:

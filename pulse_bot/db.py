@@ -98,10 +98,46 @@ CREATE TABLE IF NOT EXISTS event_log (
     event_type TEXT, data TEXT, timestamp REAL
 );
 
+CREATE TABLE IF NOT EXISTS optimization_runs (
+    run_id TEXT PRIMARY KEY,
+    optimizer_session TEXT,
+    params TEXT,
+    entry_mode TEXT,
+    total_trades INTEGER, wins INTEGER, losses INTEGER,
+    win_rate REAL, total_pnl_sol REAL,
+    gross_profit_sol REAL, gross_loss_sol REAL,
+    profit_factor REAL,
+    avg_win_pct REAL, avg_loss_pct REAL,
+    avg_win_sol REAL, avg_loss_sol REAL,
+    max_drawdown_pct REAL,
+    initial_balance_sol REAL, final_balance_sol REAL,
+    roi_pct REAL,
+    avg_hold_seconds REAL,
+    fast_buys INTEGER, full_buys INTEGER,
+    exit_reasons TEXT,
+    trades_json TEXT,
+    created_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS optimization_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT,
+    mint TEXT, symbol TEXT,
+    entry_type TEXT, exit_reason TEXT,
+    entry_price REAL, exit_price REAL,
+    entry_time REAL, exit_time REAL,
+    sol_invested REAL, sol_received REAL,
+    pnl_sol REAL, pnl_pct REAL,
+    hold_seconds REAL, partial_sells INTEGER
+);
+
 CREATE INDEX IF NOT EXISTS idx_trades_mint_ts ON trades(mint, timestamp);
 CREATE INDEX IF NOT EXISTS idx_token_scores_scored ON token_scores(scored_at);
 CREATE INDEX IF NOT EXISTS idx_token_scores_decision ON token_scores(decision);
 CREATE INDEX IF NOT EXISTS idx_token_scores_fast ON token_scores(fast_decision);
+CREATE INDEX IF NOT EXISTS idx_opt_runs_session ON optimization_runs(optimizer_session);
+CREATE INDEX IF NOT EXISTS idx_opt_runs_pf ON optimization_runs(profit_factor);
+CREATE INDEX IF NOT EXISTS idx_opt_trades_run ON optimization_trades(run_id);
 """
 
 # All columns in token_scores for INSERT (order must match VALUES)
@@ -215,16 +251,14 @@ class Database:
         """Aggregate stats."""
         conn = self._get_sync_conn()
         try:
-            cur = conn.execute(
-                """
+            cur = conn.execute("""
                 SELECT COUNT(*) as total_seen,
                     SUM(CASE WHEN decision = 'BUY' THEN 1 ELSE 0 END) as total_buy,
                     SUM(CASE WHEN decision = 'SKIP' THEN 1 ELSE 0 END) as total_skip,
                     SUM(CASE WHEN decision = 'BORDERLINE' THEN 1 ELSE 0 END) as total_borderline,
                     SUM(CASE WHEN fast_decision = 'FAST_BUY' THEN 1 ELSE 0 END) as total_fast_buy
                 FROM token_scores
-            """
-            )
+            """)
             row = cur.fetchone()
             return (
                 dict(row)
@@ -326,6 +360,111 @@ class Database:
                 "SELECT DISTINCT date(scored_at, 'unixepoch', 'localtime') as d FROM token_scores ORDER BY d DESC LIMIT 30"
             )
             return [row["d"] for row in cur.fetchall()]
+        finally:
+            conn.close()
+
+    # ── Optimizer reads (backtest dashboard) ─────────────────
+
+    def get_optimization_runs(self, session: str | None = None, limit: int = 500) -> list[dict]:
+        """Get optimization runs, optionally filtered by session."""
+        conn = self._get_sync_conn()
+        try:
+            if session:
+                cur = conn.execute(
+                    "SELECT * FROM optimization_runs WHERE optimizer_session = ? ORDER BY profit_factor DESC LIMIT ?",
+                    (session, limit),
+                )
+            else:
+                cur = conn.execute(
+                    "SELECT * FROM optimization_runs ORDER BY created_at DESC LIMIT ?", (limit,),
+                )
+            return [dict(row) for row in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def get_optimization_sessions(self) -> list[dict]:
+        """Get list of optimizer sessions with summary stats."""
+        conn = self._get_sync_conn()
+        try:
+            cur = conn.execute("""
+                SELECT optimizer_session,
+                    COUNT(*) as run_count,
+                    MAX(profit_factor) as best_pf,
+                    MAX(win_rate) as best_wr,
+                    MAX(roi_pct) as best_roi,
+                    MIN(created_at) as started_at,
+                    MAX(created_at) as last_run_at
+                FROM optimization_runs
+                GROUP BY optimizer_session
+                ORDER BY last_run_at DESC
+            """)
+            return [dict(row) for row in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def get_optimization_trades(self, run_id: str) -> list[dict]:
+        """Get all trades for a specific optimization run."""
+        conn = self._get_sync_conn()
+        try:
+            cur = conn.execute(
+                "SELECT * FROM optimization_trades WHERE run_id = ? ORDER BY entry_time ASC",
+                (run_id,),
+            )
+            return [dict(row) for row in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def save_optimization_run(self, run_data: dict) -> None:
+        """Save a single optimization run result (sync, called from optimizer)."""
+        conn = self._get_sync_conn()
+        try:
+            conn.execute(
+                """INSERT OR REPLACE INTO optimization_runs
+                (run_id, optimizer_session, params, entry_mode,
+                 total_trades, wins, losses, win_rate, total_pnl_sol,
+                 gross_profit_sol, gross_loss_sol, profit_factor,
+                 avg_win_pct, avg_loss_pct, avg_win_sol, avg_loss_sol,
+                 max_drawdown_pct, initial_balance_sol, final_balance_sol, roi_pct,
+                 avg_hold_seconds, fast_buys, full_buys, exit_reasons, trades_json, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    run_data["run_id"], run_data["session"], run_data["params"],
+                    run_data["entry_mode"],
+                    run_data["total_trades"], run_data["wins"], run_data["losses"],
+                    run_data["win_rate"], run_data["total_pnl_sol"],
+                    run_data["gross_profit_sol"], run_data["gross_loss_sol"],
+                    run_data["profit_factor"],
+                    run_data["avg_win_pct"], run_data["avg_loss_pct"],
+                    run_data["avg_win_sol"], run_data["avg_loss_sol"],
+                    run_data["max_drawdown_pct"],
+                    run_data["initial_balance_sol"], run_data["final_balance_sol"],
+                    run_data["roi_pct"],
+                    run_data["avg_hold_seconds"],
+                    run_data["fast_buys"], run_data["full_buys"],
+                    run_data["exit_reasons"], run_data["trades_json"],
+                    run_data["created_at"],
+                ),
+            )
+            # Save individual trades
+            for t in run_data.get("trades", []):
+                conn.execute(
+                    """INSERT INTO optimization_trades
+                    (run_id, mint, symbol, entry_type, exit_reason,
+                     entry_price, exit_price, entry_time, exit_time,
+                     sol_invested, sol_received, pnl_sol, pnl_pct,
+                     hold_seconds, partial_sells)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        run_data["run_id"], t["mint"], t["symbol"],
+                        t["entry_type"], t["exit_reason"],
+                        t["entry_price"], t["exit_price"],
+                        t["entry_time"], t["exit_time"],
+                        t["sol_invested"], t["sol_received"],
+                        t["pnl_sol"], t["pnl_pct"],
+                        t["hold_seconds"], t["partial_sells"],
+                    ),
+                )
+            conn.commit()
         finally:
             conn.close()
 

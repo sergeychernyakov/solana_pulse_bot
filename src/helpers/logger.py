@@ -3,7 +3,7 @@
 """
 Logger utility module.
 
-This module provides a utility function for setting up and retrieving a logger 
+This module provides a utility function for setting up and retrieving a logger
 with specific configurations such as log level and handlers.
 """
 

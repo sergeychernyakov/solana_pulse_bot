@@ -15,8 +15,6 @@ class TaskAPIException(Exception):
     All custom exceptions for the task API should inherit from this.
     """
 
-    pass
-
 
 class TaskNotFoundError(TaskAPIException):
     """
@@ -67,5 +65,3 @@ class DatabaseError(TaskAPIException):
 
     Used for unexpected database errors that should result in 500 responses.
     """
-
-    pass
