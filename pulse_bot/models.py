@@ -151,6 +151,12 @@ class ScoringResult:
     tokens_last_5min: int = 0
     concurrent_observations: int = 0
 
+    # ── Trade counts for replay (exact match live ↔ backtest) ─
+    fast_trade_count: int = 0  # total trades (buy+sell) in fast window
+    full_trade_count: int = 0  # total trades (buy+sell) in full window
+    fast_trade_ids: str = ""   # comma-separated trade DB ids
+    full_trade_ids: str = ""   # comma-separated trade DB ids
+
     # ── Timestamps ─────────────────────────────────────────
     created_at: float = 0.0
     scored_at: float = 0.0

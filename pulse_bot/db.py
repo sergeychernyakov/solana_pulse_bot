@@ -83,6 +83,12 @@ CREATE TABLE IF NOT EXISTS token_scores (
     -- Market context
     tokens_last_5min INTEGER DEFAULT 0, concurrent_observations INTEGER DEFAULT 0,
 
+    -- Trade data for exact replay
+    fast_trade_count INTEGER DEFAULT 0,
+    full_trade_count INTEGER DEFAULT 0,
+    fast_trade_ids TEXT DEFAULT '',   -- comma-separated trade DB ids
+    full_trade_ids TEXT DEFAULT '',   -- comma-separated trade DB ids
+
     -- Timestamps
     created_at REAL, scored_at REAL,
 
@@ -221,6 +227,10 @@ _SCORE_COLUMNS = [
     "gap_create_to_first_trade",
     "tokens_last_5min",
     "concurrent_observations",
+    "fast_trade_count",
+    "full_trade_count",
+    "fast_trade_ids",
+    "full_trade_ids",
     "created_at",
     "scored_at",
 ]
@@ -515,10 +525,10 @@ class Database:
             )
             await conn.commit()
 
-    async def insert_trades_batch(self, trades: list[Trade]) -> None:
-        """Insert a batch of observed trades."""
+    async def insert_trades_batch(self, trades: list[Trade]) -> list[int]:
+        """Insert a batch of observed trades. Returns list of DB row IDs."""
         if not trades:
-            return
+            return []
         async with aiosqlite.connect(self.db_path) as conn:
             await conn.execute("PRAGMA journal_mode=WAL")
             await conn.executemany(
@@ -539,6 +549,13 @@ class Database:
                 ],
             )
             await conn.commit()
+            # Get IDs of inserted rows
+            cur = await conn.execute(
+                "SELECT id FROM trades WHERE mint = ? ORDER BY id DESC LIMIT ?",
+                (trades[0].mint, len(trades)),
+            )
+            rows = await cur.fetchall()
+            return [r[0] for r in reversed(rows)]
 
     async def upsert_scoring_result(self, result: ScoringResult) -> None:
         """Insert or update scoring result with all metrics."""

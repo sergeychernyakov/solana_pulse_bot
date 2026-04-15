@@ -171,10 +171,15 @@ def _run_verify() -> None:
         sys.exit(1)
     log.info("Live scores: %d tokens", len(live_rows))
 
-    # Step 2: Run backtest (writes to same table with source='backtest')
+    # Step 2: Run backtest via Pipeline+ReplayLaunchpad (same code as live)
     log.info("Running backtest on same data...")
-    engine = BacktestEngine(config, db)
-    engine.run()
+    from pulse_bot.sources.replay import ReplayLaunchpad
+
+    launchpad = ReplayLaunchpad(config.db_path, speed=0.0)
+    scorer = Scorer(config, db)
+    fast_filter = FastFilter(config)
+    pipeline = Pipeline(config, db, launchpad, scorer, fast_filter)
+    asyncio.run(pipeline.run())
 
     # Step 3: Compare live vs backtest from same table
     bt_rows = db.get_recent_scores(limit=10000, source="backtest")

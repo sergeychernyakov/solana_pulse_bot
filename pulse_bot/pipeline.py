@@ -134,8 +134,10 @@ class Pipeline:
             creator_sold = any(t.wallet == token.creator and t.tx_type == "sell" for t in all_trades)
             await self._db.upsert_creator(token.creator, creator_sold)
 
-            # Store all trades
-            await self._db.insert_trades_batch(all_trades)
+            # Store all trades and get DB IDs
+            trade_ids = await self._db.insert_trades_batch(all_trades)
+            fast_ids = trade_ids[:len(fast_trades)] if trade_ids else []
+            full_ids = trade_ids if trade_ids else []
 
             # Full scoring with market context
             tokens_5min = self._db.get_tokens_last_5min_sync()
@@ -149,6 +151,10 @@ class Pipeline:
 
             # Attach fast phase data
             result.source = "backtest" if self._launchpad.name == "replay" else "live"
+            result.fast_trade_count = len(fast_trades)
+            result.full_trade_count = len(all_trades)
+            result.fast_trade_ids = ",".join(str(i) for i in fast_ids)
+            result.full_trade_ids = ",".join(str(i) for i in full_ids)
             result.fast_decision = fast_result.decision
             result.fast_score = fast_result.score
             result.fast_reasons = fast_result.reasons

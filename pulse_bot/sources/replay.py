@@ -39,6 +39,8 @@ class ReplayLaunchpad(Launchpad):
         self._speed = speed
         self._trade_queues: dict[str, asyncio.Queue[Trade]] = {}
         self._token_creators: dict[str, str] = {}
+        self._live_counts: dict[str, dict] = {}  # mint → {fast_trade_count, full_trade_count}
+        self._trades_yielded: dict[str, int] = {}  # mint → count of trades yielded so far
         self._running = False
         self._feeder_task: asyncio.Task | None = None
 
@@ -92,15 +94,45 @@ class ReplayLaunchpad(Launchpad):
         """Create a queue for this mint and immediately load historical trades."""
         if mint not in self._trade_queues:
             self._trade_queues[mint] = asyncio.Queue()
-            # Pre-load trades from DB — feeder may have already passed them
             await self._preload_trades(mint)
+            # Load live trade counts for exact replay
+            self._load_live_counts(mint)
 
-    async def _preload_trades(self, mint: str) -> None:
-        """Load all trades for this mint from DB into its queue."""
+    def _load_live_counts(self, mint: str) -> None:
+        """Load exact trade IDs from live scoring for exact replay."""
         conn = sqlite3.connect(self._db_path)
         conn.row_factory = sqlite3.Row
         try:
-            cur = conn.execute("SELECT * FROM trades WHERE mint = ? ORDER BY timestamp ASC", (mint,))
+            row = conn.execute(
+                "SELECT fast_trade_count, full_trade_count, fast_trade_ids, full_trade_ids FROM token_scores WHERE mint = ? AND source = 'live'",
+                (mint,),
+            ).fetchone()
+            if row and row["fast_trade_ids"]:
+                self._live_counts[mint] = {
+                    "fast": row["fast_trade_count"],
+                    "full": row["full_trade_count"],
+                    "fast_ids": set(int(x) for x in row["fast_trade_ids"].split(",") if x),
+                    "full_ids": set(int(x) for x in row["full_trade_ids"].split(",") if x),
+                }
+        finally:
+            conn.close()
+
+    async def _preload_trades(self, mint: str) -> None:
+        """Load trades from DB. If live IDs available, load only those trades."""
+        conn = sqlite3.connect(self._db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            counts = self._live_counts.get(mint)
+            if counts and "full_ids" in counts and counts["full_ids"]:
+                # Exact replay: load only the trades that live pipeline saw
+                full_ids = counts["full_ids"]
+                cur = conn.execute(
+                    f"SELECT * FROM trades WHERE id IN ({','.join(str(i) for i in sorted(full_ids))}) ORDER BY id ASC"
+                )
+            else:
+                # No live data: load all trades for this mint
+                cur = conn.execute("SELECT * FROM trades WHERE mint = ? ORDER BY timestamp ASC, id ASC", (mint,))
+
             creator = self._token_creators.get(mint, "")
             for row in cur:
                 trade = Trade(
@@ -114,6 +146,7 @@ class ReplayLaunchpad(Launchpad):
                     timestamp=row["timestamp"],
                     is_creator=(row["wallet"] == creator),
                 )
+                trade._db_id = row["id"]  # tag with DB id
                 queue = self._trade_queues.get(mint)
                 if queue:
                     await queue.put(trade)
@@ -125,30 +158,56 @@ class ReplayLaunchpad(Launchpad):
         self._token_creators.pop(mint, None)
 
     async def stream_trades(self, mint: str, duration_seconds: float) -> AsyncIterator[Trade]:
-        """Yield trades from queue within the simulated time window.
+        """Yield exactly the same trades that live pipeline collected.
 
-        For replay: reads all preloaded trades whose timestamp falls within
-        [first_trade_ts, first_trade_ts + duration_seconds].
+        Uses ID-based filtering from live scores for 100% exact match.
+        First call = fast trades, second call = remaining full trades.
         """
         queue = self._trade_queues.get(mint)
         if not queue or queue.empty():
             return
 
-        # Peek first trade to get base timestamp
-        first_trade = await queue.get()
-        base_ts = first_trade.timestamp
-        yield first_trade
+        counts = self._live_counts.get(mint)
+        already_yielded = self._trades_yielded.get(mint, 0)
+
+        if counts and "fast_ids" in counts:
+            fast_ids = counts["fast_ids"]
+            full_ids = counts["full_ids"]
+
+            if already_yielded == 0:
+                # First call = fast phase: yield trades whose ID is in fast_ids
+                target_ids = fast_ids
+            else:
+                # Second call = remaining: yield trades in full_ids but not in fast_ids
+                target_ids = full_ids - fast_ids
+        else:
+            target_ids = None
+
+        yielded = 0
+        temp_buffer = []
 
         while not queue.empty():
             try:
                 trade = queue.get_nowait()
-                if trade.timestamp > base_ts + duration_seconds:
-                    # Past the window — put it back for later phases
-                    await queue.put(trade)
-                    break
-                yield trade
+                db_id = getattr(trade, "_db_id", None)
+
+                if target_ids is not None:
+                    if db_id in target_ids:
+                        yielded += 1
+                        self._trades_yielded[mint] = already_yielded + yielded
+                        yield trade
+                    else:
+                        temp_buffer.append(trade)
+                else:
+                    yielded += 1
+                    self._trades_yielded[mint] = already_yielded + yielded
+                    yield trade
             except asyncio.QueueEmpty:
                 break
+
+        # Put back buffered trades for next phase
+        for t in temp_buffer:
+            await queue.put(t)
 
     def parse_create_event(self, raw: dict) -> Token:
         raise NotImplementedError("ReplayLaunchpad doesn't parse raw events")
