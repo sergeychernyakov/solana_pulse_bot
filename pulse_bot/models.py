@@ -155,6 +155,8 @@ class ScoringResult:
     fast_trade_count: int = 0  # total trades (buy+sell) in fast window
     full_trade_count: int = 0  # total trades (buy+sell) in full window
     fast_trade_ids: str = ""   # comma-separated trade DB ids
+    creator_score: int = 0     # creator filter score for exact replay
+    creator_reason: str = ""   # creator filter reason for exact replay
     full_trade_ids: str = ""   # comma-separated trade DB ids
 
     # ── Timestamps ─────────────────────────────────────────

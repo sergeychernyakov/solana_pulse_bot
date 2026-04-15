@@ -88,6 +88,8 @@ CREATE TABLE IF NOT EXISTS token_scores (
     full_trade_count INTEGER DEFAULT 0,
     fast_trade_ids TEXT DEFAULT '',   -- comma-separated trade DB ids
     full_trade_ids TEXT DEFAULT '',   -- comma-separated trade DB ids
+    creator_score INTEGER DEFAULT 0,
+    creator_reason TEXT DEFAULT '',
 
     -- Timestamps
     created_at REAL, scored_at REAL,
@@ -231,6 +233,8 @@ _SCORE_COLUMNS = [
     "full_trade_count",
     "fast_trade_ids",
     "full_trade_ids",
+    "creator_score",
+    "creator_reason",
     "created_at",
     "scored_at",
 ]
@@ -492,6 +496,24 @@ class Database:
                         t["hold_seconds"], t["partial_sells"],
                     ),
                 )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def clear_creators(self) -> None:
+        """Reset creator cache. Called before backtest to build from scratch."""
+        conn = self._get_sync_conn()
+        try:
+            conn.execute("DELETE FROM creators")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def clear_backtest_scores(self) -> None:
+        """Remove backtest scores so replay starts fresh."""
+        conn = self._get_sync_conn()
+        try:
+            conn.execute("DELETE FROM token_scores WHERE source = 'backtest'")
             conn.commit()
         finally:
             conn.close()

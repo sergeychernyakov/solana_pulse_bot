@@ -47,6 +47,8 @@ class Scorer:
         total_score = 0
         reasons: list[str] = []
         hard_rejected = False
+        self._last_creator_score = 0
+        self._last_creator_reason = ""
 
         for rule_score, rule_reason, is_reject in self._apply_rules(m, token, trades):
             total_score += rule_score
@@ -127,6 +129,8 @@ class Scorer:
             tokens_last_5min=m.tokens_last_5min,
             concurrent_observations=m.concurrent_observations,
             # Timestamps
+            creator_score=self._last_creator_score,
+            creator_reason=self._last_creator_reason,
             created_at=token.created_at,
             scored_at=time.time(),
         )

@@ -130,10 +130,9 @@ class Pipeline:
             full_trades_extra = await self._collect_trades(token, max(remaining, 0))
             all_trades = fast_trades + full_trades_extra
 
-            # Update creator cache (skip in replay to match live state)
-            if self._launchpad.name != "replay":
-                creator_sold = any(t.wallet == token.creator and t.tx_type == "sell" for t in all_trades)
-                await self._db.upsert_creator(token.creator, creator_sold)
+            # Update creator cache (both live and replay — builds same cache from scratch)
+            creator_sold = any(t.wallet == token.creator and t.tx_type == "sell" for t in all_trades)
+            await self._db.upsert_creator(token.creator, creator_sold)
 
             # Store all trades and get DB IDs (skip in replay — trades already in DB)
             if self._launchpad.name != "replay":

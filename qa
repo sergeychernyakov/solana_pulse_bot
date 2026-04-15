@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# qa — run all tests and quality checks for this project
+cd "$(dirname "$0")"
+source .venv/bin/activate
+
+PASS=0
+FAIL=0
+
+run() {
+    echo ""
+    echo "── $1 ──"
+    if eval "$2"; then
+        echo "  ✓ $1"
+        ((PASS++))
+    else
+        echo "  ✗ $1 FAILED"
+        ((FAIL++))
+    fi
+}
+
+run "Compile"       "python -m compileall -q pulse_bot/ src/"
+run "Ruff"          "ruff check pulse_bot/ src/"
+run "Black"         "black --check --quiet pulse_bot/ src/"
+run "isort"         "isort --check-only --quiet pulse_bot/ src/"
+run "Pytest"        "pytest -q --tb=short"
+
+echo ""
+echo "════════════════════════════"
+echo "  $PASS passed, $FAIL failed"
+echo "════════════════════════════"
+exit $FAIL

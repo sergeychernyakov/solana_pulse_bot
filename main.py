@@ -116,6 +116,9 @@ def _run_backtest() -> None:
     # Use ReplayLaunchpad — same Pipeline code as live, just different data source
     from pulse_bot.sources.replay import ReplayLaunchpad
 
+    db.clear_backtest_scores()
+    db.clear_creators()
+
     launchpad = ReplayLaunchpad(config.backtest_db_path, speed=0.0)  # instant replay
     scorer = Scorer(config, db)
     fast_filter = FastFilter(config)
@@ -171,8 +174,12 @@ def _run_verify() -> None:
         sys.exit(1)
     log.info("Live scores: %d tokens", len(live_rows))
 
-    # Step 2: Run backtest via Pipeline+ReplayLaunchpad (same code as live)
-    log.info("Running backtest on same data...")
+    # Step 2: Clear backtest state and creator cache, then replay
+    log.info("Clearing backtest scores and creator cache...")
+    db.clear_backtest_scores()
+    db.clear_creators()
+
+    log.info("Running backtest (replay) on same data...")
     from pulse_bot.sources.replay import ReplayLaunchpad
 
     launchpad = ReplayLaunchpad(config.db_path, speed=0.0)
