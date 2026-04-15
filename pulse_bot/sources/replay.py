@@ -134,7 +134,7 @@ class ReplayLaunchpad(Launchpad):
                 # Exact replay: load only the trades that live pipeline saw
                 full_ids = counts["full_ids"]
                 id_list = ",".join(str(int(i)) for i in sorted(full_ids))
-                cur = conn.execute(  # nosec B608 — IDs are integers from our DB
+                cur = conn.execute(  # nosec B608
                     f"SELECT * FROM trades WHERE id IN ({id_list}) ORDER BY id ASC"
                 )
             else:
