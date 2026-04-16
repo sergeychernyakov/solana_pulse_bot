@@ -249,12 +249,10 @@ class Pipeline:
                 },
             )
 
-            # For BUY/FAST_BUY tokens in live mode: keep monitoring price
+            # For BUY/FAST_BUY tokens: paper trade with PulseMonitor (live and replay)
             if (
-                self._launchpad.name != "replay"
-                and (result.decision == "BUY" or fast_result.decision == "FAST_BUY")
-                and result.exit_price > 0
-            ):
+                result.decision == "BUY" or fast_result.decision == "FAST_BUY"
+            ) and result.exit_price > 0:
                 entry_buyer_num = result.buy_count + 1  # we'd be next buyer
                 entry_type = "fast" if fast_result.decision == "FAST_BUY" else "full"
                 entry_score = (
