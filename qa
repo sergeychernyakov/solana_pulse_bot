@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # qa — run all tests and quality checks for pulse_bot
+# Usage:
+#   ./qa          — quick checks (pre-commit, ~5 sec)
+#   ./qa --full   — quick + verify300 integration test (~25 min)
 cd "$(dirname "$0")"
 source .venv/bin/activate
 
@@ -34,6 +37,11 @@ run "isort"           "isort --check-only --quiet pulse_bot/"
 run "Mypy"            "mypy pulse_bot/ --ignore-missing-imports --no-error-summary"
 run "Bandit"          "bandit -r pulse_bot/ -q --skip B101,B608"
 run "Unit Tests"      "PYTHONPATH= pytest tests/pulse_bot/ -v --noconftest --rootdir=tests/pulse_bot"
+
+# Full mode: run verify300
+if [ "$1" = "--full" ]; then
+    run "Verify 300"  "./verify300"
+fi
 
 # Soft checks — advisory, don't block commit
 warn "Docstrings"     "pydocstyle pulse_bot/ --count --select=D100,D101,D102,D103 2>&1 | tail -1"
