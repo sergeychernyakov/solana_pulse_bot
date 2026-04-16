@@ -12,7 +12,7 @@ from typing import Any, AsyncIterator
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from pulse_bot.config import PulseBotConfig
+from pulse_bot.config import PUMPFUN_GRADUATION_SOL, PulseBotConfig
 from pulse_bot.launchpads.base import Launchpad
 from pulse_bot.models import Token, Trade
 
@@ -40,7 +40,7 @@ class PumpFunLaunchpad(Launchpad):
         self._trade_queues: dict[str, asyncio.Queue[dict]] = {}
         self._reader_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._running = False
-        self._graduation_sol = config.pumpfun_graduation_sol
+        self._graduation_sol = PUMPFUN_GRADUATION_SOL
         self._token_creators: dict[str, str] = {}
 
     # ── Lifecycle ──────────────────────────────────────────────

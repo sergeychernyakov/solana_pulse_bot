@@ -7,6 +7,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from pulse_bot.config import PUMPFUN_FEE_PCT, PUMPFUN_PRIORITY_FEE
+
 if TYPE_CHECKING:
     from pulse_bot.config import PulseBotConfig
     from pulse_bot.models import Trade
@@ -86,10 +88,10 @@ class SimulatedExecution:
         fill_price = last_price * (1.0 + slippage)
 
         # Fee
-        fee = sol * self._cfg.execution_fee_pct
+        fee = sol * PUMPFUN_FEE_PCT
 
         # Calculate tokens received
-        net_sol = sol - fee - self._cfg.execution_priority_fee
+        net_sol = sol - fee - PUMPFUN_PRIORITY_FEE
         tokens = net_sol / fill_price if fill_price > 0 else 0
 
         return FillResult(
@@ -97,7 +99,7 @@ class SimulatedExecution:
             sol_spent=sol,
             tokens_received=tokens,
             price_per_token=fill_price,
-            fee_sol=fee + self._cfg.execution_priority_fee,
+            fee_sol=fee + PUMPFUN_PRIORITY_FEE,
             slippage_pct=slippage * 100,
         )
 
@@ -142,7 +144,7 @@ class SimulatedExecution:
         fill_price = last_price * (1.0 - slippage)
 
         gross_sol = tokens_to_sell * fill_price
-        fee = gross_sol * self._cfg.execution_fee_pct
+        fee = gross_sol * PUMPFUN_FEE_PCT
         net_sol = gross_sol - fee
 
         return FillResult(

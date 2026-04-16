@@ -7,6 +7,7 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
+from pulse_bot.config import PUMPFUN_GRADUATION_SOL
 from pulse_bot.filters.metrics import MetricsCalculator, TokenMetrics
 from pulse_bot.models import CreatorStats, ScoringResult, Token, Trade
 
@@ -23,7 +24,7 @@ class Scorer:
     def __init__(self, config: PulseBotConfig, db: Database) -> None:
         self._cfg = config
         self._db = db
-        self._metrics = MetricsCalculator(graduation_sol=config.pumpfun_graduation_sol)
+        self._metrics = MetricsCalculator(graduation_sol=PUMPFUN_GRADUATION_SOL)
 
     def score(
         self,
@@ -151,6 +152,23 @@ class Scorer:
     ):
         """Generator of (score, reason, is_hard_reject, is_creator) tuples."""
         cfg = self._cfg
+
+        # ── Hard entry filters (reject before scoring) ────
+        if cfg.min_market_cap_sol > 0 and m.market_cap_sol < cfg.min_market_cap_sol:
+            yield 0, f"mcap_too_low_{m.market_cap_sol:.0f}", True, False
+            return
+        if (
+            cfg.max_sell_pressure_for_entry < 999
+            and m.sell_ratio > cfg.max_sell_pressure_for_entry
+        ):
+            yield 0, f"sell_pressure_reject_{m.sell_ratio:.1f}", True, False
+            return
+        if (
+            cfg.min_curve_for_entry > 0
+            and m.curve_progress_pct < cfg.min_curve_for_entry
+        ):
+            yield 0, f"curve_too_low_{m.curve_progress_pct:.0f}%", True, False
+            return
 
         # ── Creator (snapshot is local param, no shared state) ──
         stats = (

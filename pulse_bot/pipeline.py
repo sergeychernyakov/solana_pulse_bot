@@ -45,6 +45,7 @@ class Pipeline:
         self._tokens_seen = 0
         self._tokens_scored = 0
         self._fast_buys = 0
+        self._open_paper_trades = 0
 
     async def run(self) -> None:
         """Main entry point. Connect to WS and process tokens until interrupted."""
@@ -257,8 +258,10 @@ class Pipeline:
 
             # For BUY/FAST_BUY tokens: paper trade with PulseMonitor (live and replay)
             if (
-                result.decision == "BUY" or fast_result.decision == "FAST_BUY"
-            ) and result.exit_price > 0:
+                (result.decision == "BUY" or fast_result.decision == "FAST_BUY")
+                and result.exit_price > 0
+                and self._open_paper_trades < self._config.portfolio_max_positions
+            ):
                 entry_buyer_num = result.buy_count + 1  # we'd be next buyer
                 entry_type = "fast" if fast_result.decision == "FAST_BUY" else "full"
                 entry_score = (
@@ -294,6 +297,7 @@ class Pipeline:
         from pulse_bot.pulse.exit_manager import ExitManager
         from pulse_bot.pulse.monitor import PulseMonitor
 
+        self._open_paper_trades += 1
         trade_id = await self._db.open_paper_trade(
             {
                 "mint": token.mint,
@@ -401,6 +405,7 @@ class Pipeline:
         except Exception:
             logger.debug("Paper trade ended for %s", token.symbol)
         finally:
+            self._open_paper_trades = max(0, self._open_paper_trades - 1)
             await self._launchpad.unsubscribe_trades(token.mint)
 
     async def _collect_trades(self, token: Token, duration: float) -> list[Trade]:

@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from pulse_bot.clock import SimulatedClock
+from pulse_bot.config import PUMPFUN_GRADUATION_SOL
 from pulse_bot.execution import FillResult, SimulatedExecution
 from pulse_bot.filters.fast import FastFilter
 from pulse_bot.filters.metrics import MetricsCalculator
@@ -67,9 +68,7 @@ class BacktestEngine:
         self._scorer = Scorer(config, db)
         self._execution = SimulatedExecution(config)
         self._portfolio = Portfolio(config)
-        self._metrics_calc = MetricsCalculator(
-            graduation_sol=config.pumpfun_graduation_sol
-        )
+        self._metrics_calc = MetricsCalculator(graduation_sol=PUMPFUN_GRADUATION_SOL)
 
         # Stats
         self._tokens_seen = 0

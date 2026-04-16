@@ -7,6 +7,8 @@ from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from pulse_bot.config import PUMPFUN_GRADUATION_SOL
+
 if TYPE_CHECKING:
     from pulse_bot.config import PulseBotConfig
     from pulse_bot.models import Trade
@@ -99,8 +101,7 @@ class PulseMonitor:
             last = self._window[-1]
             if last.v_sol_in_bonding_curve > 0:
                 curve_pct = min(
-                    (last.v_sol_in_bonding_curve / self._cfg.pumpfun_graduation_sol)
-                    * 100,
+                    (last.v_sol_in_bonding_curve / PUMPFUN_GRADUATION_SOL) * 100,
                     100,
                 )
 

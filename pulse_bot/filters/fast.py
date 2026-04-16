@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from pulse_bot.config import PUMPFUN_GRADUATION_SOL
 from pulse_bot.models import Token, Trade
 
 if TYPE_CHECKING:
@@ -68,8 +69,7 @@ class FastFilter:
         curve_pct = 0.0
         if trades and trades[-1].v_sol_in_bonding_curve > 0:
             curve_pct = min(
-                (trades[-1].v_sol_in_bonding_curve / self._cfg.pumpfun_graduation_sol)
-                * 100.0,
+                (trades[-1].v_sol_in_bonding_curve / PUMPFUN_GRADUATION_SOL) * 100.0,
                 100.0,
             )
 

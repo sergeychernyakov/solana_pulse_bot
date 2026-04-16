@@ -28,6 +28,7 @@ class ExitManager:
         self._remaining_pct: float = 1.0
         self._partial_count: int = 0
         self._has_taken_profit: bool = False
+        self._peak_pnl_pct: float = 0.0  # for trailing stop
 
     @property
     def remaining_pct(self) -> float:
@@ -75,6 +76,14 @@ class ExitManager:
             and pnl_pct >= self._cfg.exit_take_profit_pct
         ):
             return self._sell_all("take_profit")
+
+        # ── Trailing stop ─────────────────────────────────
+        if self._cfg.exit_trailing_stop_enabled:
+            self._peak_pnl_pct = max(self._peak_pnl_pct, pnl_pct)
+            if self._peak_pnl_pct >= self._cfg.exit_trailing_stop_activation_pct:
+                drawdown_from_peak = self._peak_pnl_pct - pnl_pct
+                if drawdown_from_peak >= self._cfg.exit_trailing_stop_distance_pct:
+                    return self._sell_all("trailing_stop")
 
         if elapsed_sec > self._cfg.exit_max_hold_seconds:
             return self._sell_all("timeout")

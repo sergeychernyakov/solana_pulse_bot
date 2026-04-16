@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from pulse_bot.config import PUMPFUN_GRADUATION_SOL
 from pulse_bot.filters.base import Filter
 from pulse_bot.models import FilterResult, ObservationResult, Token, Trade
 
@@ -91,10 +92,7 @@ class ObservationFilter(Filter):
             last_trade = trades[-1]
             curve_pct = (
                 min(
-                    (
-                        last_trade.v_sol_in_bonding_curve
-                        / self._config.pumpfun_graduation_sol
-                    )
+                    (last_trade.v_sol_in_bonding_curve / PUMPFUN_GRADUATION_SOL)
                     * 100.0,
                     100.0,
                 )
