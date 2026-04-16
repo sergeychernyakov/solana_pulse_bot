@@ -64,46 +64,82 @@ def sample_trades(sample_token: Token) -> list[Trade]:
     base_ts = sample_token.created_at + 1.0
     return [
         Trade(
-            mint=mint, wallet="walletA000000000000000000000000000000000",
-            tx_type="buy", sol_amount=0.1, token_amount=1_000_000.0,
-            new_token_balance=1_000_000.0, bonding_curve_key="curve1",
-            v_sol_in_bonding_curve=30.1, v_tokens_in_bonding_curve=500_000_000.0,
-            market_cap_sol=30.0, timestamp=base_ts + 0.0,
+            mint=mint,
+            wallet="walletA000000000000000000000000000000000",
+            tx_type="buy",
+            sol_amount=0.1,
+            token_amount=1_000_000.0,
+            new_token_balance=1_000_000.0,
+            bonding_curve_key="curve1",
+            v_sol_in_bonding_curve=30.1,
+            v_tokens_in_bonding_curve=500_000_000.0,
+            market_cap_sol=30.0,
+            timestamp=base_ts + 0.0,
         ),
         Trade(
-            mint=mint, wallet="walletB000000000000000000000000000000000",
-            tx_type="buy", sol_amount=0.2, token_amount=1_800_000.0,
-            new_token_balance=1_800_000.0, bonding_curve_key="curve1",
-            v_sol_in_bonding_curve=30.3, v_tokens_in_bonding_curve=498_000_000.0,
-            market_cap_sol=30.3, timestamp=base_ts + 1.0,
+            mint=mint,
+            wallet="walletB000000000000000000000000000000000",
+            tx_type="buy",
+            sol_amount=0.2,
+            token_amount=1_800_000.0,
+            new_token_balance=1_800_000.0,
+            bonding_curve_key="curve1",
+            v_sol_in_bonding_curve=30.3,
+            v_tokens_in_bonding_curve=498_000_000.0,
+            market_cap_sol=30.3,
+            timestamp=base_ts + 1.0,
         ),
         Trade(
-            mint=mint, wallet="walletC000000000000000000000000000000000",
-            tx_type="buy", sol_amount=0.15, token_amount=1_300_000.0,
-            new_token_balance=1_300_000.0, bonding_curve_key="curve1",
-            v_sol_in_bonding_curve=30.45, v_tokens_in_bonding_curve=497_000_000.0,
-            market_cap_sol=30.5, timestamp=base_ts + 2.0,
+            mint=mint,
+            wallet="walletC000000000000000000000000000000000",
+            tx_type="buy",
+            sol_amount=0.15,
+            token_amount=1_300_000.0,
+            new_token_balance=1_300_000.0,
+            bonding_curve_key="curve1",
+            v_sol_in_bonding_curve=30.45,
+            v_tokens_in_bonding_curve=497_000_000.0,
+            market_cap_sol=30.5,
+            timestamp=base_ts + 2.0,
         ),
         Trade(
-            mint=mint, wallet="walletD000000000000000000000000000000000",
-            tx_type="buy", sol_amount=0.3, token_amount=2_500_000.0,
-            new_token_balance=2_500_000.0, bonding_curve_key="curve1",
-            v_sol_in_bonding_curve=30.75, v_tokens_in_bonding_curve=495_000_000.0,
-            market_cap_sol=30.8, timestamp=base_ts + 3.0,
+            mint=mint,
+            wallet="walletD000000000000000000000000000000000",
+            tx_type="buy",
+            sol_amount=0.3,
+            token_amount=2_500_000.0,
+            new_token_balance=2_500_000.0,
+            bonding_curve_key="curve1",
+            v_sol_in_bonding_curve=30.75,
+            v_tokens_in_bonding_curve=495_000_000.0,
+            market_cap_sol=30.8,
+            timestamp=base_ts + 3.0,
         ),
         Trade(
-            mint=mint, wallet="walletA000000000000000000000000000000000",
-            tx_type="sell", sol_amount=0.05, token_amount=500_000.0,
-            new_token_balance=500_000.0, bonding_curve_key="curve1",
-            v_sol_in_bonding_curve=30.70, v_tokens_in_bonding_curve=495_500_000.0,
-            market_cap_sol=30.7, timestamp=base_ts + 3.5,
+            mint=mint,
+            wallet="walletA000000000000000000000000000000000",
+            tx_type="sell",
+            sol_amount=0.05,
+            token_amount=500_000.0,
+            new_token_balance=500_000.0,
+            bonding_curve_key="curve1",
+            v_sol_in_bonding_curve=30.70,
+            v_tokens_in_bonding_curve=495_500_000.0,
+            market_cap_sol=30.7,
+            timestamp=base_ts + 3.5,
         ),
         Trade(
-            mint=mint, wallet="walletB000000000000000000000000000000000",
-            tx_type="buy", sol_amount=0.25, token_amount=2_000_000.0,
-            new_token_balance=3_800_000.0, bonding_curve_key="curve1",
-            v_sol_in_bonding_curve=30.95, v_tokens_in_bonding_curve=493_500_000.0,
-            market_cap_sol=31.0, timestamp=base_ts + 4.0,
+            mint=mint,
+            wallet="walletB000000000000000000000000000000000",
+            tx_type="buy",
+            sol_amount=0.25,
+            token_amount=2_000_000.0,
+            new_token_balance=3_800_000.0,
+            bonding_curve_key="curve1",
+            v_sol_in_bonding_curve=30.95,
+            v_tokens_in_bonding_curve=493_500_000.0,
+            market_cap_sol=31.0,
+            timestamp=base_ts + 4.0,
         ),
     ]
 
@@ -159,8 +195,15 @@ def _make_replay_db(
     )
     conn.execute(
         "INSERT INTO tokens VALUES (?,?,?,?,?,?,?)",
-        (token.mint, token.name, token.symbol, token.creator,
-         token.created_at, token.uri, token.launchpad),
+        (
+            token.mint,
+            token.name,
+            token.symbol,
+            token.creator,
+            token.created_at,
+            token.uri,
+            token.launchpad,
+        ),
     )
 
     conn.execute(
@@ -174,9 +217,17 @@ def _make_replay_db(
             "INSERT INTO trades (mint, wallet, tx_type, sol_amount, token_amount, "
             "market_cap_sol, v_sol_in_bonding_curve, timestamp, is_creator) "
             "VALUES (?,?,?,?,?,?,?,?,?)",
-            (trade.mint, trade.wallet, trade.tx_type, trade.sol_amount,
-             trade.token_amount, trade.market_cap_sol,
-             trade.v_sol_in_bonding_curve, trade.timestamp, int(trade.is_creator)),
+            (
+                trade.mint,
+                trade.wallet,
+                trade.tx_type,
+                trade.sol_amount,
+                trade.token_amount,
+                trade.market_cap_sol,
+                trade.v_sol_in_bonding_curve,
+                trade.timestamp,
+                int(trade.is_creator),
+            ),
         )
 
     conn.execute(
@@ -191,9 +242,14 @@ def _make_replay_db(
         conn.execute(
             "INSERT INTO token_scores (mint, source, fast_trade_count, full_trade_count, "
             "fast_trade_ids, full_trade_ids) VALUES (?,?,?,?,?,?)",
-            (token.mint, "live",
-             len(fast_trade_ids or []), len(full_trade_ids or []),
-             fast_ids_str, full_ids_str),
+            (
+                token.mint,
+                "live",
+                len(fast_trade_ids or []),
+                len(full_trade_ids or []),
+                fast_ids_str,
+                full_ids_str,
+            ),
         )
 
     conn.commit()
@@ -210,7 +266,9 @@ class TestFastFilterNoTrades:
     """FastFilter must return WAIT with score=0 when given zero trades."""
 
     def test_fast_filter_no_trades_returns_wait(
-        self, config: PulseBotConfig, sample_token: Token,
+        self,
+        config: PulseBotConfig,
+        sample_token: Token,
     ) -> None:
         """Passing an empty trade list produces WAIT decision and zero score."""
         # Arrange
@@ -282,13 +340,17 @@ class TestScorerDeterministic:
 
         # Act
         result_a = scorer.score(
-            sample_token, sample_trades,
-            tokens_last_5min=0, concurrent_observations=0,
+            sample_token,
+            sample_trades,
+            tokens_last_5min=0,
+            concurrent_observations=0,
             creator_snapshot=creator_snapshot,
         )
         result_b = scorer.score(
-            sample_token, sample_trades,
-            tokens_last_5min=0, concurrent_observations=0,
+            sample_token,
+            sample_trades,
+            tokens_last_5min=0,
+            concurrent_observations=0,
             creator_snapshot=creator_snapshot,
         )
 
@@ -332,7 +394,8 @@ class TestScorerCreatorSnapshot:
 
         # Act
         result = scorer.score(
-            sample_token, sample_trades,
+            sample_token,
+            sample_trades,
             creator_snapshot=snapshot,
         )
 
@@ -389,7 +452,9 @@ class TestPipelineSourceLive:
         launchpad.subscribe_trades = AsyncMock()
         launchpad.unsubscribe_trades = AsyncMock()
 
-        async def _stream_trades_gen(mint: str, duration: float) -> AsyncIterator[Trade]:
+        async def _stream_trades_gen(
+            mint: str, duration: float
+        ) -> AsyncIterator[Trade]:
             for trade in sample_trades:
                 yield trade
 
@@ -431,7 +496,9 @@ class TestPipelineSourceBacktest:
         launchpad.subscribe_trades = AsyncMock()
         launchpad.unsubscribe_trades = AsyncMock()
 
-        async def _stream_trades_gen(mint: str, duration: float) -> AsyncIterator[Trade]:
+        async def _stream_trades_gen(
+            mint: str, duration: float
+        ) -> AsyncIterator[Trade]:
             for trade in sample_trades:
                 # Tag with _db_id as ReplayLaunchpad does
                 trade._db_id = sample_trades.index(trade) + 1
@@ -461,7 +528,9 @@ class TestReplayStreamTradesUsesIds:
     """ReplayLaunchpad must yield only trades whose DB IDs match live scoring."""
 
     async def test_replay_stream_trades_uses_ids(
-        self, sample_token: Token, sample_trades: list[Trade],
+        self,
+        sample_token: Token,
+        sample_trades: list[Trade],
     ) -> None:
         """When live scores specify trade IDs, replay yields exactly those trades."""
         # Arrange -- create a temp DB with 6 trades (IDs 1..6)
@@ -469,7 +538,8 @@ class TestReplayStreamTradesUsesIds:
         fast_ids = [1, 2, 3]
         full_ids = [1, 2, 3, 4, 5, 6]
         db_path = _make_replay_db(
-            sample_token, sample_trades,
+            sample_token,
+            sample_trades,
             fast_trade_ids=fast_ids,
             full_trade_ids=full_ids,
         )
@@ -482,12 +552,16 @@ class TestReplayStreamTradesUsesIds:
 
         # First call = fast phase
         fast_collected: list[Trade] = []
-        async for trade in replay.stream_trades(sample_token.mint, duration_seconds=5.0):
+        async for trade in replay.stream_trades(
+            sample_token.mint, duration_seconds=5.0
+        ):
             fast_collected.append(trade)
 
         # Second call = full phase (remaining trades)
         full_extra_collected: list[Trade] = []
-        async for trade in replay.stream_trades(sample_token.mint, duration_seconds=40.0):
+        async for trade in replay.stream_trades(
+            sample_token.mint, duration_seconds=40.0
+        ):
             full_extra_collected.append(trade)
 
         # Assert
@@ -511,14 +585,17 @@ class TestReplayFastZeroTrades:
     """ReplayLaunchpad must yield zero trades in fast phase when live recorded zero."""
 
     async def test_replay_fast_zero_trades(
-        self, sample_token: Token, sample_trades: list[Trade],
+        self,
+        sample_token: Token,
+        sample_trades: list[Trade],
     ) -> None:
         """When live fast_trade_ids is empty, fast phase yields nothing."""
         # Arrange -- live had 0 fast trades, all trades in full phase
         fast_ids: list[int] = []
         full_ids = [1, 2, 3, 4, 5, 6]
         db_path = _make_replay_db(
-            sample_token, sample_trades,
+            sample_token,
+            sample_trades,
             fast_trade_ids=fast_ids,
             full_trade_ids=full_ids,
         )
@@ -530,11 +607,15 @@ class TestReplayFastZeroTrades:
         await replay.subscribe_trades(sample_token.mint)
 
         fast_collected: list[Trade] = []
-        async for trade in replay.stream_trades(sample_token.mint, duration_seconds=5.0):
+        async for trade in replay.stream_trades(
+            sample_token.mint, duration_seconds=5.0
+        ):
             fast_collected.append(trade)
 
         full_collected: list[Trade] = []
-        async for trade in replay.stream_trades(sample_token.mint, duration_seconds=40.0):
+        async for trade in replay.stream_trades(
+            sample_token.mint, duration_seconds=40.0
+        ):
             full_collected.append(trade)
 
         # Assert
@@ -542,3 +623,95 @@ class TestReplayFastZeroTrades:
         assert len(full_collected) == 6
 
         await replay.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Scorer has no shared state between parallel calls (race condition)
+# ---------------------------------------------------------------------------
+
+
+class TestScorerNoSharedState:
+    """Scorer must not use instance variables for per-call state.
+
+    When called in parallel, two calls must not interfere with each other's
+    creator_snapshot or creator_reason.
+    """
+
+    def test_parallel_scorer_creator_reason(
+        self,
+        config: PulseBotConfig,
+        mock_db: MagicMock,
+        sample_token: Token,
+        sample_trades: list[Trade],
+    ) -> None:
+        """Two scorer calls with different snapshots must produce independent results."""
+        scorer = Scorer(config, mock_db)
+
+        # Call 1: snapshot with 5 tokens → clean_creator(5tok)
+        snapshot_a = CreatorStats(
+            wallet=sample_token.creator,
+            total_tokens_created=5,
+            times_seen=5,
+            blacklisted=False,
+        )
+        result_a = scorer.score(
+            sample_token, sample_trades, creator_snapshot=snapshot_a
+        )
+
+        # Call 2: no snapshot → no creator rule
+        result_b = scorer.score(sample_token, sample_trades, creator_snapshot=None)
+
+        # Call 1 again — must still get same result, not contaminated by call 2
+        result_a2 = scorer.score(
+            sample_token, sample_trades, creator_snapshot=snapshot_a
+        )
+
+        assert result_a.creator_reason == f"clean_creator(5tok)"
+        assert result_a.creator_score == 10
+        assert result_b.creator_reason == ""
+        assert result_b.creator_score == 0
+        assert result_a2.creator_reason == f"clean_creator(5tok)"
+        assert result_a2.creator_score == 10
+
+    def test_creator_reason_saved_in_result(
+        self,
+        config: PulseBotConfig,
+        mock_db: MagicMock,
+        sample_token: Token,
+        sample_trades: list[Trade],
+    ) -> None:
+        """creator_reason must be non-empty when clean_creator is in reasons."""
+        scorer = Scorer(config, mock_db)
+        snapshot = CreatorStats(
+            wallet=sample_token.creator,
+            total_tokens_created=3,
+            times_seen=3,
+            blacklisted=False,
+        )
+        result = scorer.score(sample_token, sample_trades, creator_snapshot=snapshot)
+
+        assert "clean_creator(3tok)" in result.reasons_summary
+        assert result.creator_reason == "clean_creator(3tok)"
+        assert result.creator_score == 10
+
+    def test_serial_creator_reason_saved(
+        self,
+        config: PulseBotConfig,
+        mock_db: MagicMock,
+        sample_token: Token,
+        sample_trades: list[Trade],
+    ) -> None:
+        """serial_creator reason must be saved in creator_reason field."""
+        config.creator_serial_threshold = 5
+        scorer = Scorer(config, mock_db)
+        snapshot = CreatorStats(
+            wallet=sample_token.creator,
+            total_tokens_created=10,
+            times_seen=10,
+            blacklisted=False,
+        )
+        result = scorer.score(sample_token, sample_trades, creator_snapshot=snapshot)
+
+        assert "serial_creator(10tok)" in result.reasons_summary
+        assert result.creator_reason == "serial_creator(10tok)"
+        assert result.creator_score == -5

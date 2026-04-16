@@ -34,7 +34,6 @@ class Scorer:
         creator_snapshot: CreatorStats | None = None,
     ) -> ScoringResult:
         """Compute all metrics, run scoring rules, produce decision."""
-        self._creator_snapshot = creator_snapshot
         creator_tokens_today = self._db.get_creator_tokens_today_sync(token.creator)
 
         m = self._metrics.compute(
@@ -49,12 +48,17 @@ class Scorer:
         total_score = 0
         reasons: list[str] = []
         hard_rejected = False
-        self._last_creator_score = 0
-        self._last_creator_reason = ""
+        creator_score_local = 0
+        creator_reason_local = ""
 
-        for rule_score, rule_reason, is_reject in self._apply_rules(m, token, trades):
+        for rule_score, rule_reason, is_reject, is_creator in self._apply_rules(
+            m, token, trades, creator_snapshot
+        ):
             total_score += rule_score
             reasons.append(rule_reason)
+            if is_creator:
+                creator_score_local = rule_score
+                creator_reason_local = rule_reason
             if is_reject:
                 hard_rejected = True
                 total_score = 0
@@ -131,120 +135,128 @@ class Scorer:
             tokens_last_5min=m.tokens_last_5min,
             concurrent_observations=m.concurrent_observations,
             # Timestamps
-            creator_score=self._last_creator_score,
-            creator_reason=self._last_creator_reason,
+            creator_score=creator_score_local,
+            creator_reason=creator_reason_local,
             created_at=token.created_at,
             scored_at=time.time(),
         )
         return result
 
-    def _apply_rules(self, m: TokenMetrics, token: Token, trades: list[Trade]):
-        """Generator of (score, reason, is_hard_reject) tuples. All configurable."""
+    def _apply_rules(
+        self,
+        m: TokenMetrics,
+        token: Token,
+        trades: list[Trade],
+        creator_snapshot: CreatorStats | None = None,
+    ):
+        """Generator of (score, reason, is_hard_reject, is_creator) tuples."""
         cfg = self._cfg
 
-        # ── Creator (use snapshot taken in main loop for deterministic parallel scoring) ──
+        # ── Creator (snapshot is local param, no shared state) ──
         stats = (
-            self._creator_snapshot
-            if self._creator_snapshot
+            creator_snapshot
+            if creator_snapshot
             else self._db.get_creator_stats_sync(token.creator)
         )
         if stats and stats.blacklisted:
-            yield 0, "creator_blacklisted", True
+            yield 0, "creator_blacklisted", True, True
             return
         if stats and stats.total_tokens_created > cfg.creator_serial_threshold:
-            yield -5, f"serial_creator({stats.total_tokens_created}tok)", False
+            reason = f"serial_creator({stats.total_tokens_created}tok)"
+            yield -5, reason, False, True
         elif stats and stats.total_tokens_created > 1:
-            yield 10, f"clean_creator({stats.total_tokens_created}tok)", False
+            reason = f"clean_creator({stats.total_tokens_created}tok)"
+            yield 10, reason, False, True
 
         # ── Unique buyers ──────────────────────────────────
         if m.unique_buyers >= 30:
-            yield cfg.buyers_30_score, f"buyers_{m.unique_buyers}(30+)", False
+            yield cfg.buyers_30_score, f"buyers_{m.unique_buyers}(30+)", False, False
         elif m.unique_buyers >= 10:
-            yield cfg.buyers_10_score, f"buyers_{m.unique_buyers}(10+)", False
+            yield cfg.buyers_10_score, f"buyers_{m.unique_buyers}(10+)", False, False
         elif m.unique_buyers >= 5:
-            yield cfg.buyers_5_score, f"buyers_{m.unique_buyers}(5+)", False
+            yield cfg.buyers_5_score, f"buyers_{m.unique_buyers}(5+)", False, False
         else:
-            yield cfg.buyers_low_score, f"buyers_low_{m.unique_buyers}", False
+            yield cfg.buyers_low_score, f"buyers_low_{m.unique_buyers}", False, False
 
         # ── Volume ─────────────────────────────────────────
         vol = m.total_buy_volume_sol
         if vol > cfg.volume_massive_sol:
-            yield cfg.volume_massive_score, f"vol_{vol:.0f}(massive)", False
+            yield cfg.volume_massive_score, f"vol_{vol:.0f}(massive)", False, False
         elif vol > cfg.volume_high_sol:
-            yield cfg.volume_high_score, f"vol_{vol:.1f}(high)", False
+            yield cfg.volume_high_score, f"vol_{vol:.1f}(high)", False, False
         elif vol > cfg.min_buy_volume_sol:
-            yield cfg.volume_ok_score, f"vol_{vol:.2f}(ok)", False
+            yield cfg.volume_ok_score, f"vol_{vol:.2f}(ok)", False, False
         else:
-            yield cfg.volume_low_score, f"vol_{vol:.2f}(low)", False
+            yield cfg.volume_low_score, f"vol_{vol:.2f}(low)", False, False
 
         # ── Diversity ──────────────────────────────────────
         if m.buy_diversity >= 4:
-            yield 10, f"diverse_{m.buy_diversity}", False
+            yield 10, f"diverse_{m.buy_diversity}", False, False
         elif m.buy_diversity < 2 and m.buy_count > 3:
-            yield -15, "uniform_amounts(bot?)", False
+            yield -15, "uniform_amounts(bot?)", False, False
 
         # ── Curve ──────────────────────────────────────────
         pct = m.curve_progress_pct
         if pct > cfg.curve_near_grad_pct:
-            yield cfg.curve_near_grad_score, f"near_grad_{pct:.0f}%", False
+            yield cfg.curve_near_grad_score, f"near_grad_{pct:.0f}%", False, False
         elif pct > cfg.max_curve_progress_pct:
-            yield cfg.curve_mid_score, f"mid_curve_{pct:.0f}%", False
+            yield cfg.curve_mid_score, f"mid_curve_{pct:.0f}%", False, False
         elif pct > cfg.curve_low_pct:
-            yield cfg.curve_healthy_score, f"curve_{pct:.0f}%(ok)", False
+            yield cfg.curve_healthy_score, f"curve_{pct:.0f}%(ok)", False, False
         else:
-            yield cfg.curve_low_score, f"curve_low_{pct:.0f}%", False
+            yield cfg.curve_low_score, f"curve_low_{pct:.0f}%", False, False
 
         # ── Creator sold ───────────────────────────────────
         if m.creator_sold:
-            yield cfg.creator_sold_score, "creator_sold", False
+            yield cfg.creator_sold_score, "creator_sold", False, False
         else:
-            yield 5, "creator_hold", False
+            yield 5, "creator_hold", False, False
 
         # ── Whale dominance ────────────────────────────────
         if m.total_buy_volume_sol > 0 and m.max_buy_sol > 0:
             dom = (m.max_buy_sol / m.total_buy_volume_sol) * 100
             if dom > cfg.whale_dominance_pct:
-                yield -20, f"whale_{dom:.0f}%", False
+                yield -20, f"whale_{dom:.0f}%", False, False
 
         # ── Sell pressure ──────────────────────────────────
         if m.buy_count >= 3:
             ratio = m.sell_ratio
             if ratio >= cfg.sell_ratio_dump:
-                yield cfg.sell_dump_penalty, f"dump_{ratio:.1f}x", False
+                yield cfg.sell_dump_penalty, f"dump_{ratio:.1f}x", False, False
             elif ratio >= cfg.sell_ratio_heavy:
-                yield cfg.sell_heavy_penalty, f"sell_heavy_{ratio:.1f}x", False
+                yield cfg.sell_heavy_penalty, f"sell_heavy_{ratio:.1f}x", False, False
             elif ratio >= cfg.sell_ratio_moderate:
-                yield cfg.sell_moderate_penalty, f"sell_mod_{ratio:.1f}x", False
+                yield cfg.sell_moderate_penalty, f"sell_mod_{ratio:.1f}x", False, False
             else:
-                yield cfg.sell_dominant_bonus, f"buy_dominant_{ratio:.1f}x", False
+                yield cfg.sell_dominant_bonus, f"buy_dominant_{ratio:.1f}x", False, False
 
         # ── Top3 concentration ─────────────────────────────
         if m.top3_buyer_pct > 80:
-            yield -10, f"top3_{m.top3_buyer_pct:.0f}%", False
+            yield -10, f"top3_{m.top3_buyer_pct:.0f}%", False, False
         elif m.top3_buyer_pct < 50 and m.unique_buyers >= 5:
-            yield 5, f"spread_{m.top3_buyer_pct:.0f}%", False
+            yield 5, f"spread_{m.top3_buyer_pct:.0f}%", False, False
 
         # ── Velocity trend ─────────────────────────────────
         if m.buy_velocity_trend > 1.5:
-            yield 10, f"accelerating_{m.buy_velocity_trend:.1f}x", False
+            yield 10, f"accelerating_{m.buy_velocity_trend:.1f}x", False, False
         elif m.buy_velocity_trend < 0.5 and m.buy_count >= 6:
-            yield -10, f"decelerating_{m.buy_velocity_trend:.1f}x", False
+            yield -10, f"decelerating_{m.buy_velocity_trend:.1f}x", False, False
 
         # ── Wash trading detection ─────────────────────────
         if m.buys_per_unique > 2.0 and m.buy_count >= 6:
-            yield -15, f"wash_{m.buys_per_unique:.1f}x", False
+            yield -15, f"wash_{m.buys_per_unique:.1f}x", False, False
 
         # ── First buy sniper ───────────────────────────────
         if m.first_buy_sol > 2.0:
-            yield -10, f"sniper_{m.first_buy_sol:.1f}sol", False
+            yield -10, f"sniper_{m.first_buy_sol:.1f}sol", False, False
 
         # ── Curve velocity ─────────────────────────────────
         if m.curve_velocity > 0.5:
-            yield 5, f"curve_fast_{m.curve_velocity:.2f}sol/s", False
+            yield 5, f"curve_fast_{m.curve_velocity:.2f}sol/s", False, False
 
         # N/A filters (need RPC)
-        yield 0, "authority:N/A", False
-        yield 0, "bundled_buy:N/A", False
+        yield 0, "authority:N/A", False, False
+        yield 0, "bundled_buy:N/A", False, False
 
     def _compute_pnl(
         self, trades: list[Trade], exit_price: float

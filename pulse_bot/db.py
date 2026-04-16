@@ -588,6 +588,39 @@ class Database:
         finally:
             conn.close()
 
+    def get_creator_snapshot_from_live(self, mint: str) -> CreatorStats | None:
+        """Get creator stats as they were when live scored this token."""
+        from pulse_bot.models import CreatorStats
+
+        conn = self._get_sync_conn()
+        try:
+            row = conn.execute(
+                "SELECT creator_reason, creator FROM token_scores WHERE mint = ? AND source = 'live'",
+                (mint,),
+            ).fetchone()
+            if not row:
+                return None
+            reason = row["creator_reason"] or ""
+            total = 1
+            if "clean_creator(" in reason:
+                try:
+                    total = int(reason.split("(")[1].split("tok")[0])
+                except (IndexError, ValueError):
+                    total = 2
+            elif "serial_creator(" in reason:
+                try:
+                    total = int(reason.split("(")[1].split("tok")[0])
+                except (IndexError, ValueError):
+                    total = 100
+            return CreatorStats(
+                wallet=row["creator"],
+                total_tokens_created=total,
+                times_seen=total,
+                blacklisted=False,
+            )
+        finally:
+            conn.close()
+
     def get_creator_stats_from_tokens_sync(self, wallet: str) -> CreatorStats | None:
         """Compute creator stats directly from tokens table (deterministic, no cache)."""
         from pulse_bot.models import CreatorStats

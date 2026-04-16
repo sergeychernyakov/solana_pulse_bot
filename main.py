@@ -174,10 +174,9 @@ def _run_verify() -> None:
         sys.exit(1)
     log.info("Live scores: %d tokens", len(live_rows))
 
-    # Step 2: Clear backtest state and creator cache, then replay
-    log.info("Clearing backtest scores and creator cache...")
+    # Step 2: Clear backtest scores only (keep creator cache from live — it's the correct state)
+    log.info("Clearing backtest scores...")
     db.clear_backtest_scores()
-    db.clear_creators()
 
     log.info("Running backtest (replay) on same data...")
     from pulse_bot.sources.replay import ReplayLaunchpad

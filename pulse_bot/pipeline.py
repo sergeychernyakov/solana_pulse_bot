@@ -68,9 +68,15 @@ class Pipeline:
                 self._tokens_seen += 1
 
                 # Insert token and update creator count (sequential in main loop)
-                await self._db.insert_token(token)
-                await self._db.upsert_creator(token.creator, sold_early=False)
-                creator_snapshot = self._db.get_creator_stats_sync(token.creator)
+                if self._launchpad.name != "replay":
+                    await self._db.insert_token(token)
+                    await self._db.upsert_creator(token.creator, sold_early=False)
+                    creator_snapshot = self._db.get_creator_stats_sync(token.creator)
+                else:
+                    # Replay: use creator_score saved by live (exact match)
+                    creator_snapshot = self._db.get_creator_snapshot_from_live(
+                        token.mint
+                    )
 
                 # Both live and replay: parallel processing, deterministic snapshot
                 task = asyncio.create_task(
