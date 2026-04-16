@@ -93,9 +93,9 @@ class PulseBotConfig:
     pumpfun_graduation_sol: float = 85.0
 
     # ── PORTFOLIO / EXECUTION ──────────────────────────────
-    portfolio_initial_sol: float = 0.15
+    portfolio_initial_sol: float = 0.05
     portfolio_max_positions: int = 3
-    buy_amount_sol: float = 0.03
+    buy_amount_sol: float = 0.001
     execution_fee_pct: float = 0.01  # 1% Pump.fun fee
     execution_priority_fee: float = 0.0001  # priority fee SOL
     execution_base_slippage: float = 0.02  # 2% base slippage
