@@ -257,12 +257,13 @@ class Pipeline:
             )
 
             # For BUY/FAST_BUY tokens: paper trade with PulseMonitor (live and replay)
+            entry_buyer_num = result.buy_count + 1  # we'd be next buyer
             if (
                 (result.decision == "BUY" or fast_result.decision == "FAST_BUY")
                 and result.exit_price > 0
                 and self._open_paper_trades < self._config.portfolio_max_positions
+                and entry_buyer_num <= self._config.max_entry_buyer_number
             ):
-                entry_buyer_num = result.buy_count + 1  # we'd be next buyer
                 entry_type = "fast" if fast_result.decision == "FAST_BUY" else "full"
                 entry_score = (
                     fast_result.score if entry_type == "fast" else result.total_score

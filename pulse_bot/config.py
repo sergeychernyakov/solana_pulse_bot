@@ -53,6 +53,9 @@ class PulseBotConfig:
         999.0  # hard reject if sell_p > this (999 = disabled)
     )
     min_curve_for_entry: float = 0.0  # hard reject if curve < this (0 = disabled)
+    max_entry_buyer_number: int = (
+        20  # don't enter after Nth buyer (data: >20 = 49% WR, -3%)
+    )
     fast_entry_enabled: bool = True
     full_entry_enabled: bool = True
 
