@@ -78,15 +78,18 @@ python main.py verify
 # Grid search — перебор параметров
 python main.py optimize
 
-# Качество кода
+# Качество кода (pre-commit hook)
 ./qa
+
+# Интеграционный тест: 300+ токенов, live → backtest 100% match (обязательный)
+./verify300
 
 # Dashboards
 streamlit run pulse_bot/dashboard.py --server.port 8501           # live
 streamlit run pulse_bot/backtest_dashboard.py --server.port 8502  # backtest results
 ```
 
-## Backtest = Live (100% match)
+## Backtest = Live (100% match) — обязательное условие
 
 Бэктест использует тот же `Pipeline` код что и live бот. Разница только в источнике данных:
 
@@ -97,7 +100,12 @@ streamlit run pulse_bot/backtest_dashboard.py --server.port 8502  # backtest res
 | Scorer | тот же код | тот же код |
 | token_scores.source | 'live' | 'backtest' |
 
-Верификация:
+**Обязательный тест перед любым изменением:**
+```bash
+./verify300   # 15 мин live → backtest → 100% match на 300+ токенах
+```
+
+Быстрая верификация (2 мин):
 ```bash
 python main.py monitor    # собрать данные (2+ мин)
 python main.py verify     # replay + сравнить
@@ -105,9 +113,11 @@ python main.py verify     # replay + сравнить
 
 Гарантии детерминизма:
 - `insert_token` + `upsert_creator` — в main loop (последовательно)
-- Creator snapshot замораживается ДО параллельной задачи
+- Creator snapshot — локальная переменная, не shared state (нет race conditions)
 - Replay загружает ровно те же trade IDs что видел live (fast_trade_ids, full_trade_ids)
+- Replay использует creator_reason из live scores (exact snapshot)
 - FastFilter возвращает WAIT при 0 трейдов (не фейковый FAST_BUY)
+- 12 unit тестов + интеграционный verify300
 
 ## Двухфазный скоринг
 

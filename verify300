@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# verify300 — collect 300+ tokens live, then verify backtest matches 100%
+# This is the mandatory integration test before any release or config change.
+set -e
+cd "$(dirname "$0")"
+source .venv/bin/activate
+
+MIN_TOKENS=300
+COLLECT_SECONDS=900  # 15 minutes
+
+echo "════════════════════════════════════════════════"
+echo "  VERIFY 300: Live → Backtest 100% Match Test"
+echo "════════════════════════════════════════════════"
+
+# Step 1: Fresh DB
+echo ""
+echo "── Step 1: Fresh DB ──"
+rm -f pulse_bot.db
+python -c "from pulse_bot.db import Database; Database('pulse_bot.db').init_schema()"
+echo "  ✓ DB created"
+
+# Step 2: Collect live data
+echo ""
+echo "── Step 2: Collecting live data (${COLLECT_SECONDS}s)... ──"
+timeout $COLLECT_SECONDS python main.py monitor 2>&1 | tail -3
+
+LIVE_COUNT=$(python -c "
+from pulse_bot.db import Database
+db = Database('pulse_bot.db')
+print(len(db.get_recent_scores(limit=99999, source='live')))
+")
+echo "  Live tokens scored: $LIVE_COUNT"
+
+if [ "$LIVE_COUNT" -lt "$MIN_TOKENS" ]; then
+    echo "  ✗ Not enough tokens ($LIVE_COUNT < $MIN_TOKENS). Increase COLLECT_SECONDS."
+    exit 1
+fi
+
+# Step 3: Verify
+echo ""
+echo "── Step 3: Running verify... ──"
+python main.py verify 2>&1 | tee /tmp/verify300_result.txt
+
+# Step 4: Check result
+FAST=$(grep "FAST decisions" /tmp/verify300_result.txt | grep -o "[0-9]*/[0-9]*" | head -1)
+FULL=$(grep "FULL decisions" /tmp/verify300_result.txt | grep -o "[0-9]*/[0-9]*" | head -1)
+SCORES=$(grep "FULL scores" /tmp/verify300_result.txt | grep -o "[0-9]*/[0-9]*" | head -1)
+PERFECT=$(grep -c "100%% PERFECT MATCH" /tmp/verify300_result.txt || true)
+
+echo ""
+echo "════════════════════════════════════════════════"
+echo "  FAST:   $FAST"
+echo "  FULL:   $FULL"
+echo "  SCORES: $SCORES"
+
+if [ "$PERFECT" -gt 0 ]; then
+    echo "  RESULT: ✓ 100% PERFECT MATCH"
+    echo "════════════════════════════════════════════════"
+    exit 0
+else
+    FAST_PCT=$(grep "FAST decisions" /tmp/verify300_result.txt | grep -o "[0-9.]*%" | head -1)
+    FULL_PCT=$(grep "FULL decisions" /tmp/verify300_result.txt | grep -o "[0-9.]*%" | head -1)
+    SCORE_PCT=$(grep "FULL scores" /tmp/verify300_result.txt | grep -o "[0-9.]*%" | head -1)
+    echo "  RESULT: ✗ NOT 100% (FAST=$FAST_PCT FULL=$FULL_PCT SCORES=$SCORE_PCT)"
+    echo "════════════════════════════════════════════════"
+    exit 1
+fi

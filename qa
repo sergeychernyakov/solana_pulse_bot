@@ -33,7 +33,7 @@ run "Black"           "black --check --quiet pulse_bot/"
 run "isort"           "isort --check-only --quiet pulse_bot/"
 run "Mypy"            "mypy pulse_bot/ --ignore-missing-imports --no-error-summary"
 run "Bandit"          "bandit -r pulse_bot/ -q --skip B101,B608"
-run "Tests"           "PYTHONPATH= pytest tests/pulse_bot/ -v --noconftest --rootdir=tests/pulse_bot"
+run "Unit Tests"      "PYTHONPATH= pytest tests/pulse_bot/ -v --noconftest --rootdir=tests/pulse_bot"
 
 # Soft checks — advisory, don't block commit
 warn "Docstrings"     "pydocstyle pulse_bot/ --count --select=D100,D101,D102,D103 2>&1 | tail -1"
