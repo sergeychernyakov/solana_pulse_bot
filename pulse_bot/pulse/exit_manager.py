@@ -70,6 +70,12 @@ class ExitManager:
         if pnl_pct < -self._cfg.exit_hard_stop_loss_pct:
             return self._sell_all("hard_stop")
 
+        if (
+            self._cfg.exit_take_profit_enabled
+            and pnl_pct >= self._cfg.exit_take_profit_pct
+        ):
+            return self._sell_all("take_profit")
+
         if elapsed_sec > self._cfg.exit_max_hold_seconds:
             return self._sell_all("timeout")
 

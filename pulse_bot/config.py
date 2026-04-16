@@ -132,6 +132,10 @@ class PulseBotConfig:
     exit_max_hold_seconds: float = 7200  # 2 hours max
     exit_trend_dying_count: int = 2  # N consecutive declining windows → exit
 
+    # ── TAKE PROFIT ────────────────────────────────────────
+    exit_take_profit_pct: float = 100.0  # +100% → sell all (simple TP)
+    exit_take_profit_enabled: bool = True
+
     # ── PARTIAL EXIT RULES ─────────────────────────────────
     exit_partial_on_profit_pct: float = 0.30  # sell 30% on strong profit
     exit_profit_threshold_pct: float = 200.0  # what counts as strong profit (%)
