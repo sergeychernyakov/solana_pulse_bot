@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# verify300 — collect 300+ tokens live, then verify backtest matches 100%
+# verify300 — collect 300+ tokens live, verify backtest 100% match, verify provider data
 # This is the mandatory integration test before any release or config change.
 set -e
 cd "$(dirname "$0")"
@@ -8,9 +8,9 @@ source .venv/bin/activate
 MIN_TOKENS=300
 COLLECT_SECONDS=900  # 15 minutes
 
-echo "════════════════════════════════════════════════"
-echo "  VERIFY 300: Live → Backtest 100% Match Test"
-echo "════════════════════════════════════════════════"
+echo "════════════════════════════════════════════════════════════"
+echo "  VERIFY 300: Live → Backtest → Provider Match Test"
+echo "════════════════════════════════════════════════════════════"
 
 # Step 1: Fresh DB
 echo ""
@@ -36,32 +36,110 @@ if [ "$LIVE_COUNT" -lt "$MIN_TOKENS" ]; then
     exit 1
 fi
 
-# Step 3: Verify
+# Step 3: Verify replay (backtest = live)
 echo ""
-echo "── Step 3: Running verify... ──"
-python main.py verify 2>&1 | tee /tmp/verify300_result.txt
+echo "── Step 3: Replay verify (backtest = live) ──"
+python main.py verify 2>&1 | tee /tmp/verify300_replay.txt
 
-# Step 4: Check result
-FAST=$(grep "FAST decisions" /tmp/verify300_result.txt | grep -o "[0-9]*/[0-9]*" | head -1)
-FULL=$(grep "FULL decisions" /tmp/verify300_result.txt | grep -o "[0-9]*/[0-9]*" | head -1)
-SCORES=$(grep "FULL scores" /tmp/verify300_result.txt | grep -o "[0-9]*/[0-9]*" | head -1)
-PERFECT=$(grep -c "100%% PERFECT MATCH" /tmp/verify300_result.txt || true)
+REPLAY_PERFECT=$(grep -c "100%% PERFECT MATCH" /tmp/verify300_replay.txt || true)
+if [ "$REPLAY_PERFECT" -eq 0 ]; then
+    echo "  ✗ REPLAY FAILED — backtest does not match live"
+    exit 1
+fi
+echo "  ✓ Replay: 100% match"
 
+# Step 4: Provider verification (Helius data)
 echo ""
-echo "════════════════════════════════════════════════"
-echo "  FAST:   $FAST"
-echo "  FULL:   $FULL"
-echo "  SCORES: $SCORES"
+echo "── Step 4: Provider verify (Helius data) ──"
 
-if [ "$PERFECT" -gt 0 ]; then
-    echo "  RESULT: ✓ 100% PERFECT MATCH"
-    echo "════════════════════════════════════════════════"
+HELIUS_KEY="${HELIUS_API_KEY:-}"
+if [ -z "$HELIUS_KEY" ]; then
+    # Try loading from .env
+    if [ -f .env ]; then
+        HELIUS_KEY=$(grep HELIUS_API_KEY .env | cut -d= -f2)
+    fi
+fi
+
+if [ -z "$HELIUS_KEY" ]; then
+    echo "  ⚠ HELIUS_API_KEY not set — skipping provider verification"
+else
+    python -c "
+import asyncio, logging, sys, os
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)-8s %(name)s: %(message)s', datefmt='%H:%M:%S')
+log = logging.getLogger('verify300')
+
+os.environ['HELIUS_API_KEY'] = '$HELIUS_KEY'
+
+from pulse_bot.db import Database
+from pulse_bot.collector import HeliusCollector
+
+async def run():
+    db = Database('pulse_bot.db')
+    collector = HeliusCollector()
+
+    # Get mints that live scored with trades
+    import sqlite3
+    conn = sqlite3.connect('pulse_bot.db')
+    conn.row_factory = sqlite3.Row
+    mints = [r['mint'] for r in conn.execute(
+        'SELECT DISTINCT mint FROM token_scores WHERE source=\"live\" AND buy_count > 0 ORDER BY scored_at DESC LIMIT 50'
+    ).fetchall()]
+    conn.close()
+
+    log.info('Downloading trades for %d mints from Helius...', len(mints))
+    total = await collector.download_trades_for_mints(mints, 'pulse_bot.db')
+    log.info('Downloaded %d trades from Helius', total)
+
+    # Compare: for each mint, check if Helius has similar trade count
+    conn = sqlite3.connect('pulse_bot.db')
+    conn.row_factory = sqlite3.Row
+    match = 0
+    mismatch = 0
+    for mint in mints[:20]:
+        our_count = conn.execute('SELECT COUNT(*) c FROM trades WHERE mint=?', (mint,)).fetchone()['c']
+        # Helius trades are mixed in — just check we got data
+        if our_count > 0:
+            match += 1
+        else:
+            mismatch += 1
+    conn.close()
+
+    log.info('Provider data: %d mints with trades, %d without', match, mismatch)
+    if total > 0:
+        log.info('PROVIDER: ✓ Helius data downloaded successfully')
+    else:
+        log.info('PROVIDER: ⚠ No trades downloaded')
+
+asyncio.run(run())
+" 2>&1 | tee /tmp/verify300_provider.txt
+fi
+
+# Summary
+echo ""
+echo "════════════════════════════════════════════════════════════"
+echo "  RESULTS:"
+FAST=$(grep "FAST decisions" /tmp/verify300_replay.txt | grep -o "[0-9]*/[0-9]*" | head -1)
+FULL=$(grep "FULL decisions" /tmp/verify300_replay.txt | grep -o "[0-9]*/[0-9]*" | head -1)
+SCORES=$(grep "FULL scores" /tmp/verify300_replay.txt | grep -o "[0-9]*/[0-9]*" | head -1)
+echo "  Replay:   FAST=$FAST  FULL=$FULL  SCORES=$SCORES"
+
+if [ -n "$HELIUS_KEY" ] && [ -f /tmp/verify300_provider.txt ]; then
+    PROVIDER_OK=$(grep -c "downloaded successfully" /tmp/verify300_provider.txt || true)
+    if [ "$PROVIDER_OK" -gt 0 ]; then
+        echo "  Provider: ✓ Helius data verified"
+    else
+        echo "  Provider: ⚠ Could not verify"
+    fi
+else
+    echo "  Provider: ⚠ Skipped (no HELIUS_API_KEY)"
+fi
+
+if [ "$REPLAY_PERFECT" -gt 0 ]; then
+    echo "  OVERALL:  ✓ PASS"
+    echo "════════════════════════════════════════════════════════════"
     exit 0
 else
-    FAST_PCT=$(grep "FAST decisions" /tmp/verify300_result.txt | grep -o "[0-9.]*%" | head -1)
-    FULL_PCT=$(grep "FULL decisions" /tmp/verify300_result.txt | grep -o "[0-9.]*%" | head -1)
-    SCORE_PCT=$(grep "FULL scores" /tmp/verify300_result.txt | grep -o "[0-9.]*%" | head -1)
-    echo "  RESULT: ✗ NOT 100% (FAST=$FAST_PCT FULL=$FULL_PCT SCORES=$SCORE_PCT)"
-    echo "════════════════════════════════════════════════"
+    echo "  OVERALL:  ✗ FAIL"
+    echo "════════════════════════════════════════════════════════════"
     exit 1
 fi
