@@ -438,10 +438,12 @@ class ExitMLPolicy:
                 else:
                     raise RuntimeError(detail)
             # Cross-model hash gate (E1 codex #2): refuse if entry hash
-            # drifted since exit training.
+            # drifted since exit training. Uses _resolve_entry_model_path
+            # so the gate follows PULSE_ML_OBJECTIVE — same resolution
+            # used at training time.
             saved_entry_hash = meta.get("entry_model_hash")
             if saved_entry_hash:
-                current_entry = DEFAULT_ENTRY_MODEL_PATH
+                current_entry = _resolve_entry_model_path()
                 if current_entry.exists():
                     try:
                         now_hash = sha256_file(current_entry)

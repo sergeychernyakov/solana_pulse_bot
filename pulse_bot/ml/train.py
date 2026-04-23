@@ -522,6 +522,23 @@ def _search_pnl_thresholds(
             best_ceiling_score = score
             best_ceiling = float(t)
 
+    # Sanity: on fat-tailed small val sets the grid search can pick
+    # ceiling ≤ floor, which makes the live gate (decide_with_confidence)
+    # degenerate — every predicted score either ≥ ceiling or < floor,
+    # producing empty RULES bucket. Override to sensible priors when
+    # that happens. These priors come from the regression training
+    # result: dataset mean PnL ≈ -6%, so +5% is "positive EV" and -10%
+    # is "confident loser".
+    if best_ceiling <= best_floor:
+        logger.warning(
+            "Threshold search gave degenerate (floor=%.2f ≥ ceiling=%.2f). "
+            "Falling back to priors floor=-10%% ceiling=+5%%.",
+            best_floor,
+            best_ceiling,
+        )
+        best_floor = -10.0
+        best_ceiling = 5.0
+
     below = pred < best_floor
     above = pred >= best_ceiling
     return {
@@ -948,12 +965,13 @@ def train_exit(data_path: Path, model_out: Path) -> dict:
     # model feature distribution drifts. ExitMLPolicy.from_path will
     # refuse to load when the hashes diverge.
     from pulse_bot.ml.features import EXIT_FEATURE_SCHEMA_VERSION
-    from pulse_bot.ml.policy import DEFAULT_ENTRY_MODEL_PATH, sha256_file
+    from pulse_bot.ml.policy import _resolve_entry_model_path, sha256_file
 
     entry_hash: str | None = None
-    if DEFAULT_ENTRY_MODEL_PATH.exists():
+    entry_path = _resolve_entry_model_path()  # respects PULSE_ML_OBJECTIVE
+    if entry_path.exists():
         try:
-            entry_hash = sha256_file(DEFAULT_ENTRY_MODEL_PATH)
+            entry_hash = sha256_file(entry_path)
         except Exception as e:
             logger.warning("Couldn't hash entry model: %s", e)
 
