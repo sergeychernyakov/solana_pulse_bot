@@ -1,5 +1,33 @@
 # pulse_bot/pulse/exit_manager.py
-"""ExitManager — decides when and how much to sell based on pulse snapshots."""
+"""ExitManager — decides when and how much to sell.
+
+Architecture (2026-04-23 v2, codex-reviewed):
+
+  1. HARD RULES (immutable, always checked first):
+       creator_dump, pulse_dead, trend_dying, sell_pressure,
+       buy_rate_drop, no_new_blood, whale_exit, near_graduation,
+       hard_stop, take_profit, trailing_stop, timeout.
+     ML can never override these — that would risk holding through a rug.
+
+  2. ML GATED DECISION (ExitMLPolicy.decide_with_confidence, 4-way):
+       * SELL_ALL     — force sell_all (escalates rule hold)
+       * SELL_PARTIAL — force sell_partial at a confidence-sized ladder
+       * HOLD_HARD    — block ONLY ``weak_pulse_profit`` partial exits
+                        (explicit allowlist, not fall-through)
+       * RULES        — defer to rule logic
+
+  3. SOFT RULES (partial exits):
+       strong_profit, weak_pulse_profit. ML's HOLD_HARD can block
+       weak_pulse_profit when PnL is still positive and entry was
+       high-confidence.
+
+Observability (codex E6):
+  * ``ml_override_count`` — ML forced sell_all (rules said hold)
+  * ``ml_partial_count`` — ML forced partial (rules said hold)
+  * ``ml_hold_hard_count`` — ML blocked a soft rule exit
+  * Each counter exposed via ``ExitManager.ml_counters`` for
+    aggregate logging at bot shutdown / daily reports.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +40,26 @@ if TYPE_CHECKING:
     from pulse_bot.pulse.monitor import PulseSnapshot
 
 
+# E5 confidence-sized partial ladder. Hardcoded per codex — val-tuning
+# these on the same N≈3700 already used for sell_ceiling/partial_floor
+# selection is double-dipping. Revisit when N_paper_trades ≥ 300.
+_SIZING_LADDER: tuple[tuple[float, float], ...] = (
+    (0.55, 0.30),  # 30% at proba ≥ 0.55
+    (0.65, 0.50),  # 50% at proba ≥ 0.65
+    (0.75, 0.70),  # 70% at proba ≥ 0.75
+    # ≥ sell_ceiling (0.80) handled as SELL_ALL — not on this ladder.
+)
+
+
+def _sizing_from_proba(p: float) -> float:
+    """Pick the partial-exit fraction for a given proba using the ladder."""
+    frac = 0.30
+    for threshold, f in _SIZING_LADDER:
+        if p >= threshold:
+            frac = f
+    return frac
+
+
 @dataclass
 class ExitSignal:
     """Decision from ExitManager."""
@@ -19,10 +67,11 @@ class ExitSignal:
     action: str  # "hold" | "sell_partial" | "sell_all"
     reason: str
     sell_pct: float  # 0.0 for hold, 0.3 for partial, 1.0 for sell_all
-    # Advisory: exit ML's P(should_sell_now). None when no model loaded
-    # or model predict failed. Not consulted for rule logic — logged
-    # only, for later analysis of ML-vs-rules agreement.
+    # Advisory / active: exit ML's P(should_sell_now). None when no model
+    # loaded or model predict failed.
     ml_exit_proba: float | None = None
+    # 4-way action from ExitMLPolicy.decide_with_confidence, for audit.
+    ml_action: str | None = None  # "SELL_ALL" | "SELL_PARTIAL" | "RULES" | "HOLD_HARD"
 
 
 class ExitManager:
@@ -32,153 +81,196 @@ class ExitManager:
         self,
         config: PulseBotConfig,
         ml_advisor: "ExitMLPolicy | None" = None,
+        entry_ml_proba: float | None = None,
     ) -> None:
         self._cfg = config
         self._remaining_pct: float = 1.0
         self._partial_count: int = 0
         self._has_taken_profit: bool = False
         self._peak_pnl_pct: float = 0.0  # for trailing stop
-        # Optional exit-model advisor. Advisory only — never overrides
-        # the rule logic below. Used for shadow logging of ML opinion
-        # alongside rule-based decisions.
         self._ml_advisor = ml_advisor
+        # E1: entry ML's proba at BUY time. Carried through Position
+        # lifecycle so every exit evaluation sees the same value.
+        self._entry_ml_proba = (
+            float(entry_ml_proba) if entry_ml_proba is not None else None
+        )
+        # E6 counters — per-position. Aggregate across positions happens
+        # in caller.
+        self.ml_counters: dict[str, int] = {
+            "ml_override_count": 0,
+            "ml_partial_count": 0,
+            "ml_hold_hard_count": 0,
+        }
 
     @property
     def remaining_pct(self) -> float:
         return self._remaining_pct
+
+    @property
+    def entry_ml_proba(self) -> float | None:
+        return self._entry_ml_proba
 
     def decide(
         self, pulse: PulseSnapshot, pnl_pct: float, elapsed_sec: float
     ) -> ExitSignal:
         """Evaluate pulse and return exit decision."""
 
-        # Shadow-predict exit probability once per call so we can attach
-        # it to whatever decision the rules pick. Never used to override.
         ml_proba: float | None = None
+        ml_action: str | None = None
+        cfg = self._cfg
         if self._ml_advisor is not None:
             try:
-                # Construct a minimal state object matching extractor fields.
-                # Peak & drawdown are tracked in this manager's state.
                 drawdown = max(self._peak_pnl_pct - pnl_pct, 0.0)
                 state = {
                     "hold_seconds": elapsed_sec,
                     "current_pnl_pct": pnl_pct,
                     "peak_pnl_pct": self._peak_pnl_pct,
                     "drawdown_from_peak": drawdown,
+                    "entry_ml_proba": self._entry_ml_proba or 0.0,
                 }
-                ml_proba = self._ml_advisor.predict_proba(state, pulse)
+                ml_action, ml_proba = self._ml_advisor.decide_with_confidence(
+                    state,
+                    pulse,
+                    entry_ml_proba=self._entry_ml_proba,
+                    current_pnl_pct=pnl_pct,
+                )
             except Exception:
                 ml_proba = None
+                ml_action = None
 
-        # ── Hard exits — sell 100% ─────────────────────────
+        # ── Hard exits — IMMUTABLE, always checked first ──────────
 
-        if pulse.creator_selling and self._cfg.exit_on_creator_dump:
-            return self._sell_all("creator_dump", ml_proba)
+        if pulse.creator_selling and cfg.exit_on_creator_dump:
+            return self._sell_all("creator_dump", ml_proba, ml_action)
 
         if (
-            pulse.buy_rate < self._cfg.pulse_dead_buy_rate
-            and pulse.window_events >= self._cfg.pulse_min_events
+            pulse.buy_rate < cfg.pulse_dead_buy_rate
+            and pulse.window_events >= cfg.pulse_min_events
         ):
-            return self._sell_all("pulse_dead", ml_proba)
+            return self._sell_all("pulse_dead", ml_proba, ml_action)
 
-        if pulse.trend_declining_count >= self._cfg.exit_trend_dying_count:
-            return self._sell_all("trend_dying", ml_proba)
+        if pulse.trend_declining_count >= cfg.exit_trend_dying_count:
+            return self._sell_all("trend_dying", ml_proba, ml_action)
 
-        if pulse.sell_rate > pulse.buy_rate * self._cfg.exit_sell_pressure_ratio:
-            return self._sell_all("sell_pressure", ml_proba)
+        if pulse.sell_rate > pulse.buy_rate * cfg.exit_sell_pressure_ratio:
+            return self._sell_all("sell_pressure", ml_proba, ml_action)
 
-        # Relative buy-rate fade: exit when current buy_rate falls below
-        # `drop_ratio` of the session peak. Guarded by floor to avoid firing
-        # on noise before momentum has actually built up.
         if (
-            self._cfg.exit_peak_buy_rate_drop_ratio > 0.0
-            and pulse.peak_buy_rate >= self._cfg.exit_peak_buy_rate_floor
-            and pulse.buy_rate_drop_from_peak <= self._cfg.exit_peak_buy_rate_drop_ratio
+            cfg.exit_peak_buy_rate_drop_ratio > 0.0
+            and pulse.peak_buy_rate >= cfg.exit_peak_buy_rate_floor
+            and pulse.buy_rate_drop_from_peak <= cfg.exit_peak_buy_rate_drop_ratio
         ):
-            return self._sell_all("buy_rate_drop", ml_proba)
+            return self._sell_all("buy_rate_drop", ml_proba, ml_action)
 
         if (
             pulse.new_wallet_rate == 0
-            and pulse.window_events >= self._cfg.exit_no_new_wallets_events
+            and pulse.window_events >= cfg.exit_no_new_wallets_events
         ):
-            return self._sell_all("no_new_blood", ml_proba)
+            return self._sell_all("no_new_blood", ml_proba, ml_action)
 
-        if pulse.whale_exit and self._cfg.exit_on_whale:
-            return self._sell_all("whale_exit", ml_proba)
+        if pulse.whale_exit and cfg.exit_on_whale:
+            return self._sell_all("whale_exit", ml_proba, ml_action)
 
-        if pulse.curve_progress_pct > self._cfg.exit_near_graduation_pct:
-            return self._sell_all("near_graduation", ml_proba)
+        if pulse.curve_progress_pct > cfg.exit_near_graduation_pct:
+            return self._sell_all("near_graduation", ml_proba, ml_action)
 
-        if pnl_pct < -self._cfg.exit_hard_stop_loss_pct:
-            return self._sell_all("hard_stop", ml_proba)
+        if pnl_pct < -cfg.exit_hard_stop_loss_pct:
+            return self._sell_all("hard_stop", ml_proba, ml_action)
 
-        if (
-            self._cfg.exit_take_profit_enabled
-            and pnl_pct >= self._cfg.exit_take_profit_pct
-        ):
-            return self._sell_all("take_profit", ml_proba)
+        if cfg.exit_take_profit_enabled and pnl_pct >= cfg.exit_take_profit_pct:
+            return self._sell_all("take_profit", ml_proba, ml_action)
 
-        # ── Trailing stop ─────────────────────────────────
-        if self._cfg.exit_trailing_stop_enabled:
+        if cfg.exit_trailing_stop_enabled:
             self._peak_pnl_pct = max(self._peak_pnl_pct, pnl_pct)
-            if self._peak_pnl_pct >= self._cfg.exit_trailing_stop_activation_pct:
+            if self._peak_pnl_pct >= cfg.exit_trailing_stop_activation_pct:
                 drawdown_from_peak = self._peak_pnl_pct - pnl_pct
-                if drawdown_from_peak >= self._cfg.exit_trailing_stop_distance_pct:
-                    return self._sell_all("trailing_stop", ml_proba)
+                if drawdown_from_peak >= cfg.exit_trailing_stop_distance_pct:
+                    return self._sell_all("trailing_stop", ml_proba, ml_action)
 
-        if elapsed_sec > self._cfg.exit_max_hold_seconds:
-            return self._sell_all("timeout", ml_proba)
+        if elapsed_sec > cfg.exit_max_hold_seconds:
+            return self._sell_all("timeout", ml_proba, ml_action)
 
-        # ── Partial exits ──────────────────────────────────
+        # ── Partial exits (soft rules) ────────────────────────────
 
-        available = self._remaining_pct - self._cfg.exit_moonbag_pct
+        available = self._remaining_pct - cfg.exit_moonbag_pct
         if available <= 0.01:
-            return self._maybe_ml_escalate(pnl_pct, elapsed_sec, ml_proba)
+            return self._maybe_ml_escalate(
+                pnl_pct, elapsed_sec, ml_proba, ml_action
+            )
 
-        # Strong profit → take partial
-        if pnl_pct > self._cfg.exit_profit_threshold_pct and not self._has_taken_profit:
-            sell_pct = min(self._cfg.exit_partial_on_profit_pct, available)
+        # Strong profit → take partial (NOT blockable by HOLD_HARD)
+        if pnl_pct > cfg.exit_profit_threshold_pct and not self._has_taken_profit:
+            sell_pct = min(cfg.exit_partial_on_profit_pct, available)
             self._has_taken_profit = True
-            return self._sell_partial(sell_pct, "strong_profit", ml_proba)
+            return self._sell_partial(
+                sell_pct, "strong_profit", ml_proba, ml_action
+            )
 
-        # Weak pulse + profit → partial sell
+        # Weak pulse + profit → partial sell.
+        # BLOCKABLE by ML HOLD_HARD when entry was high-confidence and PnL
+        # is still salvageable. Explicit allowlist per codex E2 — no
+        # fall-through, no doc-based "trust me" safety.
         if (
-            pulse.buy_rate < self._cfg.pulse_weak_buy_rate
-            and pnl_pct > self._cfg.exit_weak_pulse_min_profit_pct
+            pulse.buy_rate < cfg.pulse_weak_buy_rate
+            and pnl_pct > cfg.exit_weak_pulse_min_profit_pct
         ):
-            sell_pct = min(self._cfg.exit_partial_on_weak_pulse_pct, available)
-            return self._sell_partial(sell_pct, "weak_pulse_profit", ml_proba)
+            reason = "weak_pulse_profit"
+            if (
+                getattr(cfg, "exit_ml_hold_hard_enabled", True)
+                and ml_action == "HOLD_HARD"
+                and reason in self._ml_advisor.HOLD_HARD_BLOCKABLE_REASONS
+            ):
+                self.ml_counters["ml_hold_hard_count"] += 1
+                return self._hold(
+                    ml_proba, ml_action, reason="ml_hold_hard_blocked_weak_pulse"
+                )
+            sell_pct = min(cfg.exit_partial_on_weak_pulse_pct, available)
+            return self._sell_partial(sell_pct, reason, ml_proba, ml_action)
 
-        return self._maybe_ml_escalate(pnl_pct, elapsed_sec, ml_proba)
+        return self._maybe_ml_escalate(pnl_pct, elapsed_sec, ml_proba, ml_action)
 
     def _maybe_ml_escalate(
         self,
         pnl_pct: float,
         elapsed_sec: float,
         ml_proba: float | None,
+        ml_action: str | None,
     ) -> ExitSignal:
-        """Escalate ``hold`` → ``sell_all`` when ML is highly confident.
+        """Apply E2/E5 ML escalation when rules land on ``hold``.
 
-        Only called at spots where the rule-based decision is ``hold`` —
-        i.e., no stronger rule fired. This is the ONLY path by which the
-        exit ML influences action (codex Q4 Phase B activation). The rule
-        set above remains the safety floor: creator_dump, hard_stop,
-        timeout, whale_exit, etc. always dominate.
+        * ``SELL_ALL`` → force full exit.
+        * ``SELL_PARTIAL`` → force sized partial (ladder by proba).
+        * ``HOLD_HARD``, ``RULES``, None → hold.
 
-        Protected by ``exit_ml_min_hold_seconds`` to prevent the model
-        from flipping us out of a fresh position on MEV noise.
+        Protected by ``exit_ml_min_hold_seconds`` so MEV bursts on the
+        very first tick can't flip us out prematurely. Never overrides
+        the rule cascade above (those already returned).
         """
         cfg = self._cfg
-        if (
-            getattr(cfg, "exit_ml_active", False)
-            and ml_proba is not None
-            and ml_proba >= getattr(cfg, "exit_ml_sell_threshold", 0.80)
-            and elapsed_sec >= getattr(cfg, "exit_ml_min_hold_seconds", 15.0)
-        ):
-            return self._sell_all("ml_exit_trigger", ml_proba)
-        return self._hold(ml_proba)
+        if not getattr(cfg, "exit_ml_active", False):
+            return self._hold(ml_proba, ml_action)
+        if elapsed_sec < getattr(cfg, "exit_ml_min_hold_seconds", 15.0):
+            return self._hold(ml_proba, ml_action)
+        if ml_action == "SELL_ALL" and ml_proba is not None:
+            self.ml_counters["ml_override_count"] += 1
+            return self._sell_all("ml_exit_trigger", ml_proba, ml_action)
+        if ml_action == "SELL_PARTIAL" and ml_proba is not None:
+            available = self._remaining_pct - cfg.exit_moonbag_pct
+            if available > 0.01:
+                frac = _sizing_from_proba(ml_proba)
+                sell_pct = min(frac, available)
+                self.ml_counters["ml_partial_count"] += 1
+                return self._sell_partial(
+                    sell_pct, "ml_partial_trigger", ml_proba, ml_action
+                )
+        return self._hold(ml_proba, ml_action)
 
-    def _sell_all(self, reason: str, ml_proba: float | None = None) -> ExitSignal:
+    def _sell_all(
+        self,
+        reason: str,
+        ml_proba: float | None = None,
+        ml_action: str | None = None,
+    ) -> ExitSignal:
         pct = self._remaining_pct
         self._remaining_pct = 0
         return ExitSignal(
@@ -186,6 +278,7 @@ class ExitManager:
             reason=reason,
             sell_pct=pct,
             ml_exit_proba=ml_proba,
+            ml_action=ml_action,
         )
 
     def _sell_partial(
@@ -193,6 +286,7 @@ class ExitManager:
         pct: float,
         reason: str,
         ml_proba: float | None = None,
+        ml_action: str | None = None,
     ) -> ExitSignal:
         self._remaining_pct -= pct
         self._partial_count += 1
@@ -201,12 +295,19 @@ class ExitManager:
             reason=reason,
             sell_pct=pct,
             ml_exit_proba=ml_proba,
+            ml_action=ml_action,
         )
 
-    def _hold(self, ml_proba: float | None = None) -> ExitSignal:
+    def _hold(
+        self,
+        ml_proba: float | None = None,
+        ml_action: str | None = None,
+        reason: str = "pulse_ok",
+    ) -> ExitSignal:
         return ExitSignal(
             action="hold",
-            reason="pulse_ok",
+            reason=reason,
             sell_pct=0.0,
             ml_exit_proba=ml_proba,
+            ml_action=ml_action,
         )

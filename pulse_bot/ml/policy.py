@@ -351,12 +351,29 @@ class EntryMLPolicy:
 
 
 class ExitMLPolicy:
-    """Exit advisor. Predicts P(should sell now).
+    """Exit advisor. Predicts P(should sell now) ∈ [0, 1].
 
-    Currently advisory-only: ExitManager attaches proba to ExitSignal
-    for later analysis but does NOT override rule-based decisions. Hard
-    floors (TP/SL/max_hold) stay immutable regardless of model output.
+    Live integration (2026-04-23 v2, codex-reviewed):
+    * ``predict_proba(state, pulse, entry_ml_proba)`` — single scalar.
+    * ``decide_with_confidence(...)`` — 4-way gated decision
+      (SELL_ALL / SELL_PARTIAL / RULES / HOLD_HARD).
+
+    Safety: HOLD_HARD can ONLY block ``weak_pulse_profit`` partial exits
+    (see ExitManager); all hard rules (creator_dump, hard_stop, timeout,
+    take_profit, trailing_stop, whale, near_graduation) stay immutable.
+    Entry model hash is persisted into exit meta.json; ``from_path``
+    refuses to load if the current entry hash diverges (prevents silent
+    cross-model feature skew during retrain windows).
     """
+
+    # Phase E2 gate defaults. HOLD_HARD threshold is HARDCODED per codex —
+    # val-tuning it on ~100 positives would double-dip the same val set
+    # already used for SELL_CEILING selection.
+    DEFAULT_SELL_CEILING = 0.80
+    DEFAULT_PARTIAL_FLOOR = 0.55
+    HOLD_HARD_THRESHOLD = 0.20  # hardcoded — codex E2
+    HOLD_HARD_MIN_PNL_PCT = -5.0  # guardrail — don't hold through dips
+    HOLD_HARD_BLOCKABLE_REASONS = frozenset({"weak_pulse_profit"})
 
     def __init__(
         self,
@@ -364,11 +381,22 @@ class ExitMLPolicy:
         model_hash: str,
         threshold: float = DEFAULT_EXIT_THRESHOLD,
         schema_version: str = EXIT_FEATURE_SCHEMA_VERSION,
+        sell_ceiling: float | None = None,
+        partial_floor: float | None = None,
+        entry_model_hash: str | None = None,
     ) -> None:
         self._model = model
         self.model_hash = model_hash
         self.threshold = float(threshold)
         self.schema_version = schema_version
+        self.sell_ceiling = (
+            float(sell_ceiling) if sell_ceiling is not None else self.DEFAULT_SELL_CEILING
+        )
+        self.partial_floor = (
+            float(partial_floor) if partial_floor is not None
+            else self.DEFAULT_PARTIAL_FLOOR
+        )
+        self.entry_model_hash = entry_model_hash
 
     @classmethod
     def from_path(
@@ -380,15 +408,59 @@ class ExitMLPolicy:
         if not p.exists():
             raise FileNotFoundError(f"Exit model not found: {p}")
         meta_path = p.with_suffix(".meta.json")
+        sell_ceiling = None
+        partial_floor = None
+        entry_model_hash: str | None = None
         if meta_path.exists():
             meta = json.loads(meta_path.read_text())
             meta_features = meta.get("features")
             if meta_features is not None and meta_features != EXIT_FEATURE_ORDER:
-                logger.warning(
-                    "Exit model %s trained with different feature order. "
-                    "Retrain before wiring into live decisions.",
-                    p,
+                detail = (
+                    f"Exit model {p} schema does not match current "
+                    f"EXIT_FEATURE_ORDER. First divergence: "
+                    f"{_first_mismatch(EXIT_FEATURE_ORDER, meta_features)}. "
+                    f"Retrain with `python -m pulse_bot.ml.train --dataset exit` "
+                    f"or set PULSE_ALLOW_STALE_MODEL=1 to force load (unsafe)."
                 )
+                if os.environ.get("PULSE_ALLOW_STALE_MODEL") == "1":
+                    logger.error(
+                        "Loading STALE-SCHEMA exit model "
+                        "(PULSE_ALLOW_STALE_MODEL=1): %s", detail,
+                    )
+                else:
+                    raise RuntimeError(detail)
+            # Cross-model hash gate (E1 codex #2): refuse if entry hash
+            # drifted since exit training.
+            saved_entry_hash = meta.get("entry_model_hash")
+            if saved_entry_hash:
+                current_entry = DEFAULT_ENTRY_MODEL_PATH
+                if current_entry.exists():
+                    try:
+                        now_hash = sha256_file(current_entry)
+                    except Exception as e:
+                        logger.warning("Could not hash current entry model: %s", e)
+                        now_hash = None
+                    if now_hash and now_hash != saved_entry_hash:
+                        detail = (
+                            f"Exit model was trained against entry_hash="
+                            f"{saved_entry_hash[:16]}, current entry_hash="
+                            f"{now_hash[:16]}. Cross-model feature "
+                            f"(entry_ml_proba) distribution may have "
+                            f"shifted. Retrain exit (`python -m "
+                            f"pulse_bot.ml.train --dataset exit`) or set "
+                            f"PULSE_ALLOW_STALE_MODEL=1 to force load."
+                        )
+                        if os.environ.get("PULSE_ALLOW_STALE_MODEL") == "1":
+                            logger.error(
+                                "Loading EXIT with mismatched entry hash "
+                                "(PULSE_ALLOW_STALE_MODEL=1): %s", detail,
+                            )
+                        else:
+                            raise RuntimeError(detail)
+            entry_model_hash = saved_entry_hash
+            # Val-tuned ceiling/floor if persisted
+            sell_ceiling = meta.get("sell_ceiling")
+            partial_floor = meta.get("partial_floor")
         model = xgb.XGBClassifier()
         model.load_model(p)
         return cls(
@@ -396,12 +468,55 @@ class ExitMLPolicy:
             sha256_file(p),
             threshold=threshold,
             schema_version=EXIT_FEATURE_SCHEMA_VERSION,
+            sell_ceiling=sell_ceiling,
+            partial_floor=partial_floor,
+            entry_model_hash=entry_model_hash,
         )
 
-    def predict_proba(self, state: Any, pulse: Any = None) -> float:
-        vec = extract_exit_vector(state, pulse)
+    def predict_proba(
+        self,
+        state: Any,
+        pulse: Any = None,
+        entry_ml_proba: float | None = None,
+    ) -> float:
+        vec = extract_exit_vector(state, pulse, entry_ml_proba=entry_ml_proba)
         arr = np.asarray([vec], dtype=float)
         return float(self._model.predict_proba(arr)[0, 1])
+
+    def decide_with_confidence(
+        self,
+        state: Any,
+        pulse: Any = None,
+        entry_ml_proba: float | None = None,
+        current_pnl_pct: float | None = None,
+    ) -> tuple[str, float]:
+        """4-way confidence-gated exit decision.
+
+        Returns ``(action, proba)`` where ``action`` is one of:
+            * ``"SELL_ALL"``     — force full exit (proba >= sell_ceiling)
+            * ``"SELL_PARTIAL"`` — force partial exit (partial_floor <= proba < sell_ceiling)
+            * ``"RULES"``        — defer to rule-based logic (grey zone)
+            * ``"HOLD_HARD"``    — block ``weak_pulse_profit`` partial only
+                                   (proba < HOLD_HARD_THRESHOLD AND
+                                   current_pnl_pct >= HOLD_HARD_MIN_PNL_PCT).
+                                   Never blocks hard rules (see caller).
+
+        ``HOLD_HARD`` fires only when the position is still salvageable
+        (PnL above ``HOLD_HARD_MIN_PNL_PCT``). If PnL is worse than that,
+        hard rules alone decide.
+        """
+        p = self.predict_proba(state, pulse, entry_ml_proba=entry_ml_proba)
+        if p >= self.sell_ceiling:
+            return ("SELL_ALL", p)
+        if p >= self.partial_floor:
+            return ("SELL_PARTIAL", p)
+        if (
+            p < self.HOLD_HARD_THRESHOLD
+            and (current_pnl_pct is None
+                 or current_pnl_pct >= self.HOLD_HARD_MIN_PNL_PCT)
+        ):
+            return ("HOLD_HARD", p)
+        return ("RULES", p)
 
 
 def load_exit_policy_if_available(

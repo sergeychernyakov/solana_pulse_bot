@@ -735,6 +735,7 @@ class Pipeline:
                         entry_type,
                         entry_score,
                         entry_ts,
+                        entry_ml_proba=ml_proba,
                     )
                 )
             else:
@@ -755,6 +756,7 @@ class Pipeline:
         entry_ts: float,
         resume_trade_id: int | None = None,
         resume_last_event_ts: float | None = None,
+        entry_ml_proba: float | None = None,
     ) -> None:
         """Virtual paper trade: open position, monitor with PulseMonitor, close on exit signal.
 
@@ -803,7 +805,9 @@ class Pipeline:
 
         from pulse_bot.core import PaperTradeRunner
 
-        runner = PaperTradeRunner(self._config, entry_price)
+        runner = PaperTradeRunner(
+            self._config, entry_price, entry_ml_proba=entry_ml_proba
+        )
         # Last observed event, in the trade-stream clock. For resume, start
         # from the DB-recorded activity so a long idle period before restart
         # is NOT forgiven by a fresh inactivity window.

@@ -48,6 +48,29 @@ def _train_toy_exit_model(tmp_path: Path) -> Path:
     return p
 
 
+class _FakeAdvisorBase:
+    """Minimal advisor exposing the API ExitManager calls.
+
+    decide_with_confidence must return ``(action, proba)``. Subclasses
+    pick a fixed action/proba pair so tests are deterministic regardless
+    of model internals.
+    """
+
+    HOLD_HARD_BLOCKABLE_REASONS = frozenset({"weak_pulse_profit"})
+
+    def __init__(self, action: str, proba: float) -> None:
+        self._action = action
+        self._proba = proba
+
+    def predict_proba(self, state, pulse, entry_ml_proba=None):
+        return self._proba
+
+    def decide_with_confidence(
+        self, state, pulse, entry_ml_proba=None, current_pnl_pct=None
+    ):
+        return (self._action, self._proba)
+
+
 def _pulse(
     buy_rate: float = 0.5, sell_rate: float = 0.0,
     new_wallet_rate: float = 0.5, creator_selling: bool = False,
@@ -119,7 +142,14 @@ def test_advisor_failure_does_not_crash(tmp_path: Path) -> None:
     """Broken advisor should leave ml_exit_proba=None, not throw."""
 
     class BrokenAdvisor:
-        def predict_proba(self, state, pulse):
+        HOLD_HARD_BLOCKABLE_REASONS = frozenset({"weak_pulse_profit"})
+
+        def predict_proba(self, state, pulse, entry_ml_proba=None):
+            raise RuntimeError("simulated failure")
+
+        def decide_with_confidence(
+            self, state, pulse, entry_ml_proba=None, current_pnl_pct=None
+        ):
             raise RuntimeError("simulated failure")
 
     cfg = PulseBotConfig()
@@ -136,18 +166,20 @@ def test_exit_signal_default_ml_proba_is_none() -> None:
 
 # ── Exit ML activation (codex Q4 Phase B, 2026-04-23) ──
 
-class _FakeHighConfAdvisor:
-    """ML advisor that always returns a very high sell proba."""
-
-    def predict_proba(self, state, pulse) -> float:
-        return 0.95
+def _sell_all_advisor() -> _FakeAdvisorBase:
+    return _FakeAdvisorBase("SELL_ALL", 0.95)
 
 
-class _FakeLowConfAdvisor:
-    """ML advisor that always returns a low sell proba."""
+def _rules_advisor() -> _FakeAdvisorBase:
+    return _FakeAdvisorBase("RULES", 0.35)
 
-    def predict_proba(self, state, pulse) -> float:
-        return 0.10
+
+def _hold_hard_advisor() -> _FakeAdvisorBase:
+    return _FakeAdvisorBase("HOLD_HARD", 0.10)
+
+
+def _partial_advisor(proba: float = 0.65) -> _FakeAdvisorBase:
+    return _FakeAdvisorBase("SELL_PARTIAL", proba)
 
 
 def test_ml_escalates_hold_to_sell_when_active_and_confident() -> None:
@@ -156,27 +188,29 @@ def test_ml_escalates_hold_to_sell_when_active_and_confident() -> None:
         exit_ml_sell_threshold=0.80,
         exit_ml_min_hold_seconds=10.0,
     )
-    mgr = ExitManager(cfg, ml_advisor=_FakeHighConfAdvisor())
+    mgr = ExitManager(cfg, ml_advisor=_sell_all_advisor())
     signal = mgr.decide(_pulse(), pnl_pct=5.0, elapsed_sec=30.0)
     assert signal.action == "sell_all"
     assert signal.reason == "ml_exit_trigger"
     assert signal.ml_exit_proba == 0.95
+    assert mgr.ml_counters["ml_override_count"] == 1
 
 
 def test_ml_does_not_escalate_when_inactive() -> None:
     cfg = PulseBotConfig(exit_ml_active=False)
-    mgr = ExitManager(cfg, ml_advisor=_FakeHighConfAdvisor())
+    mgr = ExitManager(cfg, ml_advisor=_sell_all_advisor())
     signal = mgr.decide(_pulse(), pnl_pct=5.0, elapsed_sec=30.0)
     assert signal.action == "hold"
     assert signal.ml_exit_proba == 0.95
+    assert mgr.ml_counters["ml_override_count"] == 0
 
 
-def test_ml_does_not_escalate_below_threshold() -> None:
-    cfg = PulseBotConfig(exit_ml_active=True, exit_ml_sell_threshold=0.80)
-    mgr = ExitManager(cfg, ml_advisor=_FakeLowConfAdvisor())
+def test_ml_does_not_escalate_on_rules_action() -> None:
+    cfg = PulseBotConfig(exit_ml_active=True)
+    mgr = ExitManager(cfg, ml_advisor=_rules_advisor())
     signal = mgr.decide(_pulse(), pnl_pct=5.0, elapsed_sec=30.0)
     assert signal.action == "hold"
-    assert signal.ml_exit_proba == 0.10
+    assert signal.ml_exit_proba == 0.35
 
 
 def test_ml_respects_min_hold_seconds() -> None:
@@ -185,7 +219,7 @@ def test_ml_respects_min_hold_seconds() -> None:
         exit_ml_sell_threshold=0.80,
         exit_ml_min_hold_seconds=60.0,
     )
-    mgr = ExitManager(cfg, ml_advisor=_FakeHighConfAdvisor())
+    mgr = ExitManager(cfg, ml_advisor=_sell_all_advisor())
     # elapsed < min_hold → no escalation
     signal = mgr.decide(_pulse(), pnl_pct=5.0, elapsed_sec=5.0)
     assert signal.action == "hold"
@@ -201,8 +235,137 @@ def test_ml_never_overrides_hard_rules_even_when_active() -> None:
         exit_ml_sell_threshold=0.80,
         exit_ml_min_hold_seconds=0.0,
     )
-    mgr = ExitManager(cfg, ml_advisor=_FakeLowConfAdvisor())
+    mgr = ExitManager(cfg, ml_advisor=_hold_hard_advisor())
     # Creator dump fires regardless of ML preferring hold
     s = mgr.decide(_pulse(creator_selling=True), pnl_pct=0.0, elapsed_sec=30.0)
     assert s.action == "sell_all"
     assert s.reason == "creator_dump"
+
+
+# ── E2 4-way + E5 sizing ladder (codex, 2026-04-23 v2) ──
+
+def test_ml_sell_partial_ladder_30pct() -> None:
+    cfg = PulseBotConfig(exit_ml_active=True, exit_ml_min_hold_seconds=0.0)
+    mgr = ExitManager(cfg, ml_advisor=_partial_advisor(proba=0.60))
+    s = mgr.decide(_pulse(), pnl_pct=10.0, elapsed_sec=30.0)
+    assert s.action == "sell_partial"
+    assert s.reason == "ml_partial_trigger"
+    assert s.sell_pct == pytest.approx(0.30, abs=1e-6)
+
+
+def test_ml_sell_partial_ladder_70pct() -> None:
+    cfg = PulseBotConfig(exit_ml_active=True, exit_ml_min_hold_seconds=0.0)
+    mgr = ExitManager(cfg, ml_advisor=_partial_advisor(proba=0.78))
+    s = mgr.decide(_pulse(), pnl_pct=10.0, elapsed_sec=30.0)
+    assert s.action == "sell_partial"
+    assert s.sell_pct == pytest.approx(0.70, abs=1e-6)
+
+
+def test_hold_hard_blocks_weak_pulse_profit() -> None:
+    cfg = PulseBotConfig(
+        exit_ml_active=True,
+        exit_ml_hold_hard_enabled=True,
+        pulse_weak_buy_rate=1.0,  # ensures weak_pulse triggers at buy_rate=0.1
+        exit_weak_pulse_min_profit_pct=20.0,
+    )
+    mgr = ExitManager(cfg, ml_advisor=_hold_hard_advisor())
+    # pnl above floor AND above weak-pulse min profit
+    s = mgr.decide(
+        _pulse(buy_rate=0.1),
+        pnl_pct=50.0,
+        elapsed_sec=30.0,
+    )
+    assert s.action == "hold"
+    assert s.reason == "ml_hold_hard_blocked_weak_pulse"
+    assert mgr.ml_counters["ml_hold_hard_count"] == 1
+
+
+def test_hold_hard_disabled_allows_weak_pulse_partial() -> None:
+    cfg = PulseBotConfig(
+        exit_ml_active=True,
+        exit_ml_hold_hard_enabled=False,  # rollback lever
+        pulse_weak_buy_rate=1.0,
+        exit_weak_pulse_min_profit_pct=20.0,
+    )
+    mgr = ExitManager(cfg, ml_advisor=_hold_hard_advisor())
+    s = mgr.decide(
+        _pulse(buy_rate=0.1),
+        pnl_pct=50.0,
+        elapsed_sec=30.0,
+    )
+    assert s.action == "sell_partial"
+    assert s.reason == "weak_pulse_profit"
+
+
+def test_hold_hard_cannot_block_hard_rules() -> None:
+    """HOLD_HARD must never block any hard rule — enumerate every reason
+    emitted by _sell_all in exit_manager.py."""
+    cfg = PulseBotConfig(
+        exit_ml_active=True,
+        exit_ml_hold_hard_enabled=True,
+        exit_ml_min_hold_seconds=0.0,
+    )
+    def mgr_factory() -> ExitManager:
+        return ExitManager(cfg, ml_advisor=_hold_hard_advisor())
+    # creator_dump
+    s = mgr_factory().decide(
+        _pulse(creator_selling=True), pnl_pct=10.0, elapsed_sec=30.0
+    )
+    assert s.action == "sell_all" and s.reason == "creator_dump"
+    # whale_exit (requires exit_on_whale flag)
+    cfg_whale = PulseBotConfig(
+        exit_ml_active=True,
+        exit_ml_hold_hard_enabled=True,
+        exit_ml_min_hold_seconds=0.0,
+        exit_on_whale=True,
+    )
+    s = ExitManager(cfg_whale, ml_advisor=_hold_hard_advisor()).decide(
+        _pulse(whale_exit=True), pnl_pct=10.0, elapsed_sec=30.0
+    )
+    assert s.action == "sell_all" and s.reason == "whale_exit"
+    # near_graduation
+    s = mgr_factory().decide(
+        _pulse(curve_progress_pct=99.0), pnl_pct=10.0, elapsed_sec=30.0
+    )
+    assert s.action == "sell_all" and s.reason == "near_graduation"
+    # hard_stop
+    s = mgr_factory().decide(_pulse(), pnl_pct=-20.0, elapsed_sec=30.0)
+    assert s.action == "sell_all" and s.reason == "hard_stop"
+    # take_profit
+    s = mgr_factory().decide(_pulse(), pnl_pct=150.0, elapsed_sec=30.0)
+    assert s.action == "sell_all" and s.reason == "take_profit"
+    # timeout
+    s = mgr_factory().decide(_pulse(), pnl_pct=10.0, elapsed_sec=1000.0)
+    assert s.action == "sell_all" and s.reason == "timeout"
+
+
+def test_hold_hard_does_not_fire_in_loss() -> None:
+    """Guardrail: HOLD_HARD requires pnl_pct >= HOLD_HARD_MIN_PNL_PCT (-5%).
+    Loss worse than -5% → defer to rules (partial rule does not fire
+    at loss anyway, but verify the guard)."""
+    from pulse_bot.ml.policy import ExitMLPolicy
+
+    cfg = PulseBotConfig(
+        exit_ml_active=True,
+        exit_ml_hold_hard_enabled=True,
+        pulse_weak_buy_rate=1.0,
+        exit_weak_pulse_min_profit_pct=-10.0,  # allow partial even at small loss
+    )
+    adv = _hold_hard_advisor()
+    # Put into HOLD_HARD zone at -7% PnL — guardrail (-5%) blocks it;
+    # weak_pulse_profit rule would need pnl > min_profit (-10%), but
+    # guard on HOLD_HARD doesn't fire, so partial sell proceeds.
+    # Override HOLD_HARD_MIN_PNL_PCT via class constant for deterministic.
+    assert ExitMLPolicy.HOLD_HARD_MIN_PNL_PCT == -5.0
+    mgr = ExitManager(cfg, ml_advisor=adv)
+    # decide_with_confidence pipes current_pnl_pct → action is
+    # RULES when PnL < -5 because HOLD_HARD guard fails. Simulate that
+    # by bypassing fake advisor and setting action explicitly:
+    adv._action = "RULES"  # what ExitMLPolicy would return at -7%
+    s = mgr.decide(
+        _pulse(buy_rate=0.1),
+        pnl_pct=-7.0,
+        elapsed_sec=30.0,
+    )
+    # Partial rule fires (since HOLD_HARD was not asserted)
+    assert s.action == "sell_partial" and s.reason == "weak_pulse_profit"

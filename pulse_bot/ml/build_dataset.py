@@ -312,6 +312,148 @@ EXIT_FEATURES = [
 ]
 
 
+def _precompute_entry_probas(
+    db_path: str, mints: list[str]
+) -> dict[str, float]:
+    """Compute P(profitable) from the entry model for every mint in ``mints``.
+
+    Re-uses the live inference path (``extract_entry_vector`` +
+    ``EntryMLPolicy.predict_score``) with the same as-of creator/holder
+    joins used in ``build_entry_dataset``. Training a cross-model feature
+    via a shortcut (e.g. raw SQL only on token_scores) would silently
+    reproduce the 2026-04-23 creator skew bug — train sees zero-filled
+    creator features, live sees real ones, distribution diverges.
+
+    Returns dict mint → proba. Mints not scored by live/backfill are
+    absent from the result; caller defaults missing values to 0.0 so the
+    label pipeline never drops rows for this reason.
+    """
+    from pulse_bot.ml.features import extract_entry_vector
+    from pulse_bot.ml.policy import load_entry_policy_if_available
+
+    policy = load_entry_policy_if_available()
+    if policy is None:
+        logger.warning(
+            "No entry model available — entry_ml_proba defaults to 0.0 "
+            "for every exit row. Retrain entry before exit for live parity."
+        )
+        return {}
+    conn = sqlite3.connect(db_path)
+    rows = pd.read_sql_query(
+        f"""
+        SELECT s.mint, s.scored_at, s.creator, s.hour_utc,
+               {", ".join("s." + f for f in ENTRY_FEATURES)}
+        FROM token_scores s
+        WHERE s.source IN ('live', 'backfill') AND s.scored_at IS NOT NULL
+        """,
+        conn,
+    )
+    if rows.empty:
+        conn.close()
+        return {}
+    rows = rows[rows["mint"].isin(mints)]
+    if rows.empty:
+        conn.close()
+        return {}
+    h30 = pd.read_sql_query(
+        """SELECT mint, top1_pct AS top1_30, top5_pct AS top5_30,
+                  holder_count AS hc_30
+           FROM token_holders_snapshots
+           WHERE capture_at_age_sec = 30.0 AND is_negative_row = 0
+             AND top1_pct IS NOT NULL""",
+        conn,
+    )
+    h120 = pd.read_sql_query(
+        """SELECT mint, top1_pct AS top1_120, top5_pct AS top5_120,
+                  holder_count AS hc_120
+           FROM token_holders_snapshots
+           WHERE capture_at_age_sec = 120.0 AND is_negative_row = 0
+             AND top1_pct IS NOT NULL""",
+        conn,
+    )
+    creator_snaps = pd.read_sql_query(
+        """SELECT creator, observed_at,
+                  creator_age_days,
+                  median_peak_mc_sol AS creator_median_peak_mc_sol,
+                  inter_token_interval_sec AS creator_inter_token_interval_sec,
+                  total_prior_tokens AS creator_total_prior_tokens,
+                  creator_balance_sol,
+                  rug_count AS creator_rug_count,
+                  graduated_count AS creator_graduated_count
+           FROM creator_snapshots""",
+        conn,
+    )
+    conn.close()
+
+    rows = rows.merge(h30, on="mint", how="left")
+    rows = rows.merge(h120, on="mint", how="left")
+    rows["top1_delta"] = rows["top1_120"] - rows["top1_30"]
+    rows["top5_delta"] = rows["top5_120"] - rows["top5_30"]
+    helius_cols = [
+        "top1_30", "top5_30", "hc_30",
+        "top1_120", "top5_120", "hc_120",
+        "top1_delta", "top5_delta",
+    ]
+    for c in helius_cols:
+        rows[c] = rows[c].fillna(0.0)
+    if not creator_snaps.empty:
+        creator_snaps = creator_snaps.sort_values("observed_at")
+        rows = rows.sort_values("scored_at")
+        rows = pd.merge_asof(
+            rows, creator_snaps,
+            left_on="scored_at", right_on="observed_at",
+            by="creator", direction="backward",
+        )
+        rows = rows.drop(columns=["observed_at"], errors="ignore")
+    creator_cols = [
+        "creator_age_days", "creator_median_peak_mc_sol",
+        "creator_inter_token_interval_sec", "creator_total_prior_tokens",
+        "creator_balance_sol", "creator_rug_count", "creator_graduated_count",
+    ]
+    for c in creator_cols:
+        if c in rows.columns:
+            rows[c] = rows[c].fillna(0.0)
+
+    out: dict[str, float] = {}
+    for _, r in rows.iterrows():
+        scorer_obj = r.to_dict()
+        # Pass dict only when there's actual signal — an all-zero dict
+        # is interpreted by the skew guard as a train/serve regression
+        # (the exact bug pattern we fixed 2026-04-23). None is the
+        # honest "no snapshot available" value.
+        holder_snap_dict = {k: float(r[k]) for k in helius_cols if k in r.index}
+        creator_snap_dict = {k: float(r[k]) for k in creator_cols if k in r.index}
+        holder_snap = (
+            holder_snap_dict if any(v != 0.0 for v in holder_snap_dict.values()) else None
+        )
+        creator_snap = (
+            creator_snap_dict if any(v != 0.0 for v in creator_snap_dict.values()) else None
+        )
+        try:
+            vec = extract_entry_vector(
+                scorer_obj,
+                holder_snap,
+                creator_snap,
+                hour_utc=r.get("hour_utc"),
+            )
+            import numpy as _np
+
+            arr = _np.asarray([vec], dtype=float)
+            if policy.objective == "reg:squarederror":
+                p = float(policy._model.predict(arr)[0])
+            else:
+                p = float(policy._model.predict_proba(arr)[0, 1])
+        except Exception as e:
+            logger.warning(
+                "entry_proba compute failed for %s: %s — defaulting to 0.0",
+                r["mint"], e,
+            )
+            p = 0.0
+        out[r["mint"]] = p
+    logger.info("Precomputed entry_ml_proba for %d mints", len(out))
+    return out
+
+
 def build_exit_dataset(
     db_path: str,
     lookahead_sec: float = 30.0,
@@ -342,6 +484,13 @@ def build_exit_dataset(
         conn,
     )
     logger.info("Exit candidate tokens: %d", len(candidates))
+
+    # 2026-04-23 v2: precompute entry_ml_proba for every candidate mint via
+    # the live-inference path, so every exit-training row gets the same
+    # proba that live would have seen at the BUY moment.
+    entry_proba_by_mint = _precompute_entry_probas(
+        db_path, candidates["mint"].tolist()
+    )
 
     rows: list[dict] = []
     for _, c in candidates.iterrows():
@@ -424,6 +573,7 @@ def build_exit_dataset(
                         if len(in_window) > 1
                         else 0.0
                     ),
+                    "entry_ml_proba": float(entry_proba_by_mint.get(mint, 0.0)),
                     "label": label,
                 }
             )

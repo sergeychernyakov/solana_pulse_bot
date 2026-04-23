@@ -175,19 +175,26 @@ class PaperTradeRunner:
     realized fills and the runner keeps monitoring the remaining position.
     """
 
-    def __init__(self, config: PulseBotConfig, entry_price: float) -> None:
+    def __init__(
+        self,
+        config: PulseBotConfig,
+        entry_price: float,
+        entry_ml_proba: float | None = None,
+    ) -> None:
         self._config = config
         self._entry_price = entry_price
         self._current_price = entry_price
         self._pulse = PulseMonitor(config)
-        # Load exit ML advisor (shadow). None if model missing — pipeline
-        # then runs rules-only unchanged. Never overrides rule decisions;
-        # proba is attached to ExitSignal for logging.
+        # Load exit ML advisor. None if model missing — pipeline then
+        # runs rules-only unchanged. ``entry_ml_proba`` carries the
+        # Entry model's verdict through the Position lifecycle (E1
+        # cross-model signal) and is injected into every exit call.
         from pulse_bot.ml.policy import load_exit_policy_if_available
 
         self._exit_mgr = ExitManager(
             config,
             ml_advisor=load_exit_policy_if_available(),
+            entry_ml_proba=entry_ml_proba,
         )
         self._total_buys = 0
         self._total_sells = 0

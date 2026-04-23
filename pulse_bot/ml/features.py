@@ -186,29 +186,42 @@ EXIT_FEATURE_ORDER: list[str] = [
     "unique_buyers_recent",
     "curve_progress_pct",
     "curve_velocity_recent",
+    # 2026-04-23 v2: cross-model signal. Entry ML's proba for this mint,
+    # carried through from the live BUY decision into the Position. At
+    # training time, build_exit_dataset computes it by re-running the
+    # live extractor against token_scores + creator_snapshots + holder
+    # snapshots and calling EntryMLPolicy.predict_score. Train/serve
+    # parity is enforced by test_entry_proba_train_serve_parity.
+    "entry_ml_proba",
 ]
 
-EXIT_FEATURE_SCHEMA_VERSION: str = "exit_v1_20260422"
+EXIT_FEATURE_SCHEMA_VERSION: str = "exit_v2_20260423"
 
 
 def extract_exit_features(
     state: Any,
     pulse: Any = None,
+    entry_ml_proba: float | None = None,
 ) -> dict[str, float]:
     """Extract the exit-model feature dict from a live or dict-shaped state.
 
     ``state`` must expose ``hold_seconds``, ``current_pnl_pct``,
     ``peak_pnl_pct``, ``drawdown_from_peak``. ``pulse`` (optional) exposes
     ``buy_rate``, ``sell_rate``, ``new_wallet_rate``, ``curve_progress_pct``.
-    Any missing field → 0.0 (same NaN policy v1 as entry)."""
+    Any missing field → 0.0 (same NaN policy v1 as entry).
+
+    ``entry_ml_proba`` (2026-04-23 v2) is the P(profitable) that the entry
+    model assigned when BUY was decided. Carried through Position state.
+    Defaults to 0.0 when missing (e.g., bot entered via rules-only path
+    or pre-v2 position). Codex: a sensible default because the model
+    interprets 0 as "no confidence signal" which maps to conservative
+    exit behavior.
+    """
     feats: dict[str, float] = {}
     feats["hold_seconds"] = _get(state, "hold_seconds")
     feats["current_pnl_pct"] = _get(state, "current_pnl_pct")
     feats["peak_pnl_pct"] = _get(state, "peak_pnl_pct")
     feats["drawdown_from_peak"] = _get(state, "drawdown_from_peak")
-    # Pulse snapshot fields — attribute names match PulseSnapshot class.
-    # Training uses 10-second trade window; pulse uses event-window (20).
-    # Minor distribution drift acknowledged — exit model is advisory only.
     feats["buy_rate_recent"] = _get(pulse, "buy_rate")
     feats["sell_rate_recent"] = _get(pulse, "sell_rate")
     feats["unique_buyers_recent"] = _get(pulse, "unique_buyers_recent") or _get(
@@ -218,11 +231,18 @@ def extract_exit_features(
     feats["curve_velocity_recent"] = _get(pulse, "curve_velocity") or _get(
         pulse, "curve_velocity_recent"
     )
+    if entry_ml_proba is None:
+        entry_ml_proba = _get(state, "entry_ml_proba")
+    feats["entry_ml_proba"] = float(entry_ml_proba or 0.0)
     return feats
 
 
-def extract_exit_vector(state: Any, pulse: Any = None) -> list[float]:
-    feats = extract_exit_features(state, pulse)
+def extract_exit_vector(
+    state: Any,
+    pulse: Any = None,
+    entry_ml_proba: float | None = None,
+) -> list[float]:
+    feats = extract_exit_features(state, pulse, entry_ml_proba=entry_ml_proba)
     return [feats[k] for k in EXIT_FEATURE_ORDER]
 
 

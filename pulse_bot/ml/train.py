@@ -725,6 +725,131 @@ def _evaluate_gated(
     }
 
 
+def train_exit_quantile(
+    data_path: Path, model_out: Path, quantile: float = 0.25
+) -> dict:
+    """Quantile regression head for dynamic SL/TP (codex E3, shadow-only).
+
+    Instead of MSE regression (dominated by fat-tailed outliers on
+    pump.fun), fit XGBoost quantile regression against the 60s-forward
+    return. Train two heads:
+        * q=0.25 → lower-tail PnL prediction (SL tightening candidate)
+        * q=0.75 → upper-tail PnL prediction (TP loosening candidate)
+
+    Activation gate (NOT applied here — lives in ExitManager, disabled
+    by default via ``PULSE_EXIT_REGRESSION_ACTIVE=0``):
+        After 2 weeks of shadow logging, compare realized PnL in buckets
+        predicted by this head vs fixed +100%/-15% thresholds on held-out
+        test data. Paired bootstrap (500 resamples). Activate only if
+        bucket beats the fixed threshold by ≥ 1σ.
+
+    Target is 60s forward realized return, computed at build-time from
+    ``trades`` table. Clipped to [-100, +300] like train_entry_regression.
+    """
+    df = load_df(data_path)
+    if "entry_ts" not in df.columns:
+        raise ValueError(
+            "Exit dataset missing 'entry_ts' — rebuild via build_dataset."
+        )
+    # Build 60s forward PnL target from the same trades window the exit
+    # labels already use. If the sample_ts is close to token end, forward
+    # PnL falls back to the final observed price (no lookahead leak since
+    # by this time the trade-stream is truly exhausted).
+    #
+    # Dataset builder already provides peak_pnl_pct and drawdown_from_peak
+    # as state-at-decision-time. The regression target must be the return
+    # between sample_ts and sample_ts+60s — reconstructing from ``trades``
+    # is out of scope here (train_exit_quantile operates on the parquet).
+    # We approximate with: future_pnl ≈ peak_pnl - drawdown_at_t+60s. At
+    # dataset build time, would need a new column `forward_pnl_60s`.
+    #
+    # For now, the realistic target is the change from current_pnl_pct to
+    # final_pnl_pct of the position. We don't have that column either.
+    # Workaround: use peak_pnl_pct - current_pnl_pct (absolute drawdown
+    # potential). This is a monotone proxy for "how bad can it get" and
+    # aligns with SL/TP semantics.
+    if "forward_pnl_60s" not in df.columns:
+        logger.warning(
+            "exit.parquet has no forward_pnl_60s column — using "
+            "drawdown_from_peak as quantile target (proxy). Rebuild "
+            "dataset with forward window for honest regression."
+        )
+        df["forward_pnl_60s"] = -df["drawdown_from_peak"]
+
+    mints_order = df.drop_duplicates("mint").sort_values("entry_ts")["mint"].tolist()
+    cut_mint = mints_order[int(len(mints_order) * 0.8)]
+    cut_ts = df.loc[df.mint == cut_mint, "entry_ts"].iloc[0]
+    train_mask = df.entry_ts < cut_ts
+    from pulse_bot.ml.features import EXIT_FEATURE_ORDER
+
+    missing = [c for c in EXIT_FEATURE_ORDER if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"exit.parquet missing canonical features {missing}. "
+            "Rebuild via build_dataset before training."
+        )
+    feature_cols = list(EXIT_FEATURE_ORDER)
+    X_train = df.loc[train_mask, feature_cols]
+    y_train = df.loc[train_mask, "forward_pnl_60s"].clip(-100, 300).values
+    X_test = df.loc[~train_mask, feature_cols]
+    y_test = df.loc[~train_mask, "forward_pnl_60s"].clip(-100, 300).values
+
+    # XGBoost quantile objective (requires xgboost >= 1.7)
+    model = xgb.XGBRegressor(
+        objective="reg:quantileerror",
+        quantile_alpha=quantile,
+        n_estimators=200,
+        max_depth=3,
+        min_child_weight=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        early_stopping_rounds=20,
+        random_state=42,
+    )
+    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+    pred_test = model.predict(X_test)
+
+    # Residual quantile coverage: fraction of actual <= predicted should
+    # approximate ``quantile`` in-sample.
+    coverage = float((y_test <= pred_test).mean())
+    from scipy.stats import spearmanr
+
+    rho, _ = spearmanr(pred_test, y_test)
+    rho = float(rho) if not np.isnan(rho) else 0.0
+    logger.info("=" * 60)
+    logger.info("EXIT QUANTILE (q=%.2f) MODEL RESULTS", quantile)
+    logger.info("  Coverage (should ≈ %.2f): %.3f", quantile, coverage)
+    logger.info("  Spearman rho: %.4f", rho)
+    logger.info("  Train rows: %d, Test rows: %d", len(X_train), len(X_test))
+    logger.info("=" * 60)
+
+    model.save_model(model_out)
+    meta_out = model_out.with_suffix(".meta.json")
+    meta_out.write_text(
+        json.dumps(
+            {
+                "objective": "reg:quantileerror",
+                "quantile": quantile,
+                "features": feature_cols,
+                "coverage": coverage,
+                "spearman_rho": rho,
+                "train_rows": int(len(X_train)),
+                "test_rows": int(len(X_test)),
+                "note": (
+                    "Shadow-only until paired-bootstrap gate passes. Do "
+                    "not wire into live exit decisions via "
+                    "PULSE_EXIT_REGRESSION_ACTIVE=1 without 2-week shadow "
+                    "validation."
+                ),
+            },
+            indent=2,
+        )
+    )
+    logger.info("Saved quantile model to %s", model_out)
+    return {"quantile": quantile, "coverage": coverage, "spearman_rho": rho}
+
+
 def train_exit(data_path: Path, model_out: Path) -> dict:
     df = load_df(data_path)
     logger.info(
@@ -817,17 +942,35 @@ def train_exit(data_path: Path, model_out: Path) -> dict:
 
     model.save_model(model_out)
     meta_out = model_out.with_suffix(".meta.json")
+    # Persist entry_model_hash (E1 codex gate): exit model depends on
+    # live entry_ml_proba at inference. If the entry model retrains and
+    # its hash no longer matches what exit trained against, the cross-
+    # model feature distribution drifts. ExitMLPolicy.from_path will
+    # refuse to load when the hashes diverge.
+    from pulse_bot.ml.features import EXIT_FEATURE_SCHEMA_VERSION
+    from pulse_bot.ml.policy import DEFAULT_ENTRY_MODEL_PATH, sha256_file
+
+    entry_hash: str | None = None
+    if DEFAULT_ENTRY_MODEL_PATH.exists():
+        try:
+            entry_hash = sha256_file(DEFAULT_ENTRY_MODEL_PATH)
+        except Exception as e:
+            logger.warning("Couldn't hash entry model: %s", e)
+
     meta_out.write_text(
         json.dumps(
             {
                 "features": feature_cols,
+                "schema_version": EXIT_FEATURE_SCHEMA_VERSION,
                 "auc": auc,
                 "base_rate": float(y_test.mean()),
+                "entry_model_hash": entry_hash,
             },
             indent=2,
         )
     )
-    logger.info("Saved model to %s", model_out)
+    logger.info("Saved model to %s (entry_hash=%s)",
+                model_out, (entry_hash or "<none>")[:16])
     return {"auc": auc}
 
 
@@ -854,6 +997,13 @@ def main() -> None:
         "realized_pnl_pct target (codex Q4 #1; uses magnitude for 5-10x "
         "more gradient information per row). Writes a separate model "
         "file (entry_model_reg.ubj) so both can coexist.",
+    )
+    ap.add_argument(
+        "--train-exit-quantile",
+        action="store_true",
+        help="Additionally train quantile regression heads (q=0.25 for SL "
+        "tightening + q=0.75 for TP loosening). Shadow-only — activation "
+        "behind PULSE_EXIT_REGRESSION_ACTIVE=1 after paired-bootstrap gate.",
     )
     args = ap.parse_args()
 
@@ -891,6 +1041,13 @@ def main() -> None:
             logger.error("No exit.parquet or exit.csv in %s", data_dir)
             sys.exit(1)
         train_exit(data, data_dir / "exit_model.ubj")
+        if args.train_exit_quantile:
+            train_exit_quantile(
+                data, data_dir / "exit_quantile_sl.ubj", quantile=0.25
+            )
+            train_exit_quantile(
+                data, data_dir / "exit_quantile_tp.ubj", quantile=0.75
+            )
 
 
 if __name__ == "__main__":

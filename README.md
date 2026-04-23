@@ -177,10 +177,42 @@ streamlit run pulse_bot/dashboard.py --server.port 8501
 
 | Модель | Главная метрика | Текущее | **Цель** |
 |---|---|---|---|
-| **Entry** (binary XGBoost) | **Precision@top-10%** — из топ-10% предсказаний сколько реально winners | **50%** | **>60%** (чтобы покрыть fees+slippage) |
-| **Exit** (binary advisory) | **Recall on decline events** — сколько реальных dump'ов модель поймала заранее | TBD | **>80%** |
+| **Entry** (binary XGBoost + regression head) | **Precision@top-10%** — из топ-10% предсказаний сколько реально winners | **54.5% (binary) / 60% (regression)** | **>60%** (чтобы покрыть fees+slippage) |
+| **Exit** (binary XGBoost + quantile heads shadow) | **AUC on exit-now signal** + realized override PnL | AUC 0.72, entry_ml_proba #1 feature | AUC>0.75, net PnL uplift vs rules-only |
 
-Base rate (winner без модели) = **14%** — модель уже в 3.5× лучше случайного, но до прибыли ещё 10-20% рост precision нужен.
+Base rate (winner без модели) = **14%** — regression head уже в 4× лучше случайного.
+
+### Exit ML architecture (v2, 2026-04-23, codex-reviewed)
+
+Exit делает 4-way gated decision через `ExitMLPolicy.decide_with_confidence`:
+
+| Условие | Action | Что делает |
+|---|---|---|
+| `proba ≥ 0.80` (`sell_ceiling`) | **SELL_ALL** | Форсит полный выход (escalates hold) |
+| `0.55 ≤ proba < 0.80` | **SELL_PARTIAL** | Частичный выход, размер по proba |
+| `0.20 ≤ proba < 0.55` | **RULES** | Defer to rule-based cascade |
+| `proba < 0.20` AND `pnl ≥ -5%` | **HOLD_HARD** | Блок **только** `weak_pulse_profit` |
+
+**Sizing ladder** (hardcoded priors, codex E5 — не val-tune на том же N=1686):
+- `0.55-0.65` → 30%
+- `0.65-0.75` → 50%
+- `0.75-0.80` → 70%
+- `≥ 0.80` → 100% (SELL_ALL path)
+
+**Invariants (safety floor — immutable, always checked first):**
+
+`creator_dump`, `pulse_dead`, `trend_dying`, `sell_pressure`, `buy_rate_drop`, `no_new_blood`, `whale_exit`, `near_graduation`, `hard_stop (-15%)`, `take_profit (+100%)`, `trailing_stop (+50%/-50%)`, `timeout (90s)` — эти hard rules проверяются до ML gating. `HOLD_HARD` **не может** их блокировать. `strong_profit` partial (>+200%) тоже immutable.
+
+**Cross-model coupling:** exit model видит `entry_ml_proba` как feature (#1 по gain в последнем retrain). Live pipeline пропихивает entry confidence через `Position → PaperTradeRunner → ExitManager`. При training `build_exit_dataset` вызывает тот же `extract_entry_vector` + `EntryMLPolicy.predict_score` что и live, чтобы train/serve parity выдерживалась. `exit_model.meta.json` хранит `entry_model_hash`; `ExitMLPolicy.from_path` **отказывается грузить** если текущий entry hash дрифтанул (защита от cross-model feature skew).
+
+**Quantile regression heads** (E3, shadow only, `PULSE_EXIT_REGRESSION_ACTIVE=0` по умолчанию): `exit_quantile_sl.ubj` (q=0.25) для SL-tightening и `exit_quantile_tp.ubj` (q=0.75) для TP-loosening. Активация требует 2 недели shadow + paired bootstrap 500 resamples показывает что bucket бьёт фиксированный порог на ≥1σ.
+
+**Env var rollback (3-layer disable):**
+- `PULSE_EXIT_ML_ACTIVE=0` — полностью откл. ML exit override
+- `PULSE_EXIT_ML_HOLD_HARD=0` — откл. только HOLD_HARD блок
+- `PULSE_EXIT_REGRESSION_ACTIVE=0` — откл. dynamic SL/TP (default)
+
+**Observability:** `ExitManager.ml_counters` отслеживает `ml_override_count`, `ml_partial_count`, `ml_hold_hard_count`. Каждый ML-driven exit пишет reason `ml_exit_trigger` / `ml_partial_trigger` / `ml_hold_hard_blocked_weak_pulse` в `paper_trades`.
 
 ### Active features (31 — use by model)
 
