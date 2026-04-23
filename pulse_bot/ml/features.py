@@ -210,13 +210,16 @@ def extract_exit_features(
     ``buy_rate``, ``sell_rate``, ``new_wallet_rate``, ``curve_progress_pct``.
     Any missing field → 0.0 (same NaN policy v1 as entry).
 
-    ``entry_ml_proba`` (2026-04-23 v2) is the P(profitable) that the entry
-    model assigned when BUY was decided. Carried through Position state.
-    Defaults to 0.0 when missing (e.g., bot entered via rules-only path
-    or pre-v2 position). Codex: a sensible default because the model
-    interprets 0 as "no confidence signal" which maps to conservative
-    exit behavior.
+    ``entry_ml_proba`` (2026-04-23 v2) is the P(profitable) that the
+    entry model assigned when BUY was decided. Carried through Position
+    state. When entry was uncertain (grey zone for classifier, ±3% band
+    for regression) OR the bot entered via rules-only path, the value
+    is ``NaN`` so XGBoost's native missing-value handling can learn a
+    separate split path for "no entry signal" — distinct from a low
+    proba ("entry predicted loss") or 0% regression PnL.
     """
+    import math
+
     feats: dict[str, float] = {}
     feats["hold_seconds"] = _get(state, "hold_seconds")
     feats["current_pnl_pct"] = _get(state, "current_pnl_pct")
@@ -232,8 +235,22 @@ def extract_exit_features(
         pulse, "curve_velocity_recent"
     )
     if entry_ml_proba is None:
-        entry_ml_proba = _get(state, "entry_ml_proba")
-    feats["entry_ml_proba"] = float(entry_ml_proba or 0.0)
+        # Try to read it off state; preserve None for "uncertain".
+        if isinstance(state, Mapping):
+            v = state.get("entry_ml_proba")
+        elif state is not None:
+            v = getattr(state, "entry_ml_proba", None)
+        else:
+            v = None
+        entry_ml_proba = v
+    if entry_ml_proba is None:
+        feats["entry_ml_proba"] = float("nan")
+    else:
+        try:
+            fv = float(entry_ml_proba)
+            feats["entry_ml_proba"] = fv if not math.isnan(fv) else float("nan")
+        except (TypeError, ValueError):
+            feats["entry_ml_proba"] = float("nan")
     return feats
 
 

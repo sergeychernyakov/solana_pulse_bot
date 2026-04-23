@@ -457,8 +457,10 @@ def _precompute_entry_probas(
             p = 0.0
         # Confidence gate — only keep the proba when entry was decisive.
         # For regression entry, "uncertain" = predicted PnL within
-        # ±REG_UNCERTAIN_BAND% of zero (no directional call). Same
-        # collapse-to-0.0 treatment as classifier grey zone.
+        # ±REG_UNCERTAIN_BAND% of zero. Uncertain ⇒ NaN (not 0.0) so
+        # XGBoost treats it as a genuine missing value and learns a
+        # separate split path for "no entry signal" rather than
+        # conflating it with "entry predicted 0% PnL / zero proba".
         REG_UNCERTAIN_BAND = 3.0
         is_grey = False
         if policy.objective == "reg:squarederror":
@@ -468,7 +470,7 @@ def _precompute_entry_probas(
             is_grey = True
         if is_grey:
             grey_zeroed += 1
-            p = 0.0
+            p = float("nan")
         else:
             confident_kept += 1
         out[r["mint"]] = p

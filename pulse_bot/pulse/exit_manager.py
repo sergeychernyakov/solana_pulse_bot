@@ -124,14 +124,7 @@ class ExitManager:
         cfg = self._cfg
         if self._ml_advisor is not None:
             try:
-                drawdown = max(self._peak_pnl_pct - pnl_pct, 0.0)
-                state = {
-                    "hold_seconds": elapsed_sec,
-                    "current_pnl_pct": pnl_pct,
-                    "peak_pnl_pct": self._peak_pnl_pct,
-                    "drawdown_from_peak": drawdown,
-                    "entry_ml_proba": self._entry_ml_proba or 0.0,
-                }
+                state = self._build_state_for_ml(pulse, pnl_pct, elapsed_sec)
                 ml_action, ml_proba = self._ml_advisor.decide_with_confidence(
                     state,
                     pulse,
@@ -281,7 +274,9 @@ class ExitManager:
             "current_pnl_pct": pnl_pct,
             "peak_pnl_pct": self._peak_pnl_pct,
             "drawdown_from_peak": drawdown,
-            "entry_ml_proba": self._entry_ml_proba or 0.0,
+            # None = "entry was uncertain"; extract_exit_features maps
+            # None → NaN so XGBoost treats it as missing, not as 0.
+            "entry_ml_proba": self._entry_ml_proba,
         }
 
     def _should_sl_tighten(self, ml_action: str | None, pnl_pct: float) -> bool:
