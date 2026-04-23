@@ -56,7 +56,10 @@ class _FakeAdvisorBase:
     of model internals.
     """
 
-    HOLD_HARD_BLOCKABLE_REASONS = frozenset({"weak_pulse_profit"})
+    HOLD_HARD_BLOCKABLE_REASONS = frozenset({"weak_pulse_profit", "take_profit"})
+    TP_HOLD_HARD_STRICT_THRESHOLD = 0.15
+    TP_HOLD_HARD_MAX_PEAK_PCT = 300.0
+    TP_HOLD_HARD_MAX_CURRENT_PCT = 500.0
 
     def __init__(self, action: str, proba: float) -> None:
         self._action = action
@@ -142,7 +145,10 @@ def test_advisor_failure_does_not_crash(tmp_path: Path) -> None:
     """Broken advisor should leave ml_exit_proba=None, not throw."""
 
     class BrokenAdvisor:
-        HOLD_HARD_BLOCKABLE_REASONS = frozenset({"weak_pulse_profit"})
+        HOLD_HARD_BLOCKABLE_REASONS = frozenset({"weak_pulse_profit", "take_profit"})
+        TP_HOLD_HARD_STRICT_THRESHOLD = 0.15
+        TP_HOLD_HARD_MAX_PEAK_PCT = 300.0
+        TP_HOLD_HARD_MAX_CURRENT_PCT = 500.0
 
         def predict_proba(self, state, pulse, entry_ml_proba=None):
             raise RuntimeError("simulated failure")
@@ -331,12 +337,68 @@ def test_hold_hard_cannot_block_hard_rules() -> None:
     # hard_stop
     s = mgr_factory().decide(_pulse(), pnl_pct=-20.0, elapsed_sec=30.0)
     assert s.action == "sell_all" and s.reason == "hard_stop"
-    # take_profit
-    s = mgr_factory().decide(_pulse(), pnl_pct=150.0, elapsed_sec=30.0)
+    # take_profit — NOTE: take_profit is now blockable by HOLD_HARD
+    # when advisor proba < 0.15 AND peak < 300 AND pnl < 500 (user
+    # directive 2026-04-23). Use a NON-strict HOLD_HARD advisor here
+    # (proba 0.10 < 0.15 would block; 0.18 ≥ 0.15 does not block).
+    # Verified in test_hold_hard_does_not_block_take_profit_above_strict_threshold.
+    adv_nonstrict = _FakeAdvisorBase("HOLD_HARD", 0.18)
+    s = ExitManager(cfg, ml_advisor=adv_nonstrict).decide(
+        _pulse(), pnl_pct=150.0, elapsed_sec=30.0
+    )
     assert s.action == "sell_all" and s.reason == "take_profit"
     # timeout
     s = mgr_factory().decide(_pulse(), pnl_pct=10.0, elapsed_sec=1000.0)
     assert s.action == "sell_all" and s.reason == "timeout"
+
+
+def test_hold_hard_blocks_take_profit_when_strict_confident() -> None:
+    """TP override: HOLD_HARD with proba < 0.15 AND peak < 300 AND pnl <
+    500 blocks take_profit. Keeps position alive for trailing_stop /
+    timeout / hard_stop to govern."""
+    cfg = PulseBotConfig(
+        exit_ml_active=True,
+        exit_ml_hold_hard_enabled=True,
+        exit_take_profit_enabled=True,
+        exit_take_profit_pct=100.0,
+    )
+    adv = _FakeAdvisorBase("HOLD_HARD", 0.10)  # < 0.15 strict
+    mgr = ExitManager(cfg, ml_advisor=adv)
+    s = mgr.decide(_pulse(), pnl_pct=120.0, elapsed_sec=30.0)
+    assert s.action == "hold"
+    assert s.reason == "ml_hold_hard_blocked_take_profit"
+    assert mgr.ml_counters["ml_hold_hard_count"] == 1
+
+
+def test_hold_hard_does_not_block_take_profit_above_strict_threshold() -> None:
+    """Proba ≥ 0.15 must NOT block take_profit — only very-confident."""
+    cfg = PulseBotConfig(
+        exit_ml_active=True,
+        exit_ml_hold_hard_enabled=True,
+        exit_take_profit_enabled=True,
+        exit_take_profit_pct=100.0,
+    )
+    adv = _FakeAdvisorBase("HOLD_HARD", 0.18)  # ≥ 0.15
+    mgr = ExitManager(cfg, ml_advisor=adv)
+    s = mgr.decide(_pulse(), pnl_pct=120.0, elapsed_sec=30.0)
+    assert s.action == "sell_all"
+    assert s.reason == "take_profit"
+
+
+def test_hold_hard_blocks_tp_disabled_when_rollback() -> None:
+    """PULSE_EXIT_ML_HOLD_HARD=0 (exit_ml_hold_hard_enabled=False)
+    disables TP override too."""
+    cfg = PulseBotConfig(
+        exit_ml_active=True,
+        exit_ml_hold_hard_enabled=False,
+        exit_take_profit_enabled=True,
+        exit_take_profit_pct=100.0,
+    )
+    adv = _FakeAdvisorBase("HOLD_HARD", 0.10)
+    mgr = ExitManager(cfg, ml_advisor=adv)
+    s = mgr.decide(_pulse(), pnl_pct=120.0, elapsed_sec=30.0)
+    assert s.action == "sell_all"
+    assert s.reason == "take_profit"
 
 
 def test_hold_hard_does_not_fire_in_loss() -> None:

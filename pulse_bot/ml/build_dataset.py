@@ -415,12 +415,18 @@ def _precompute_entry_probas(
             rows[c] = rows[c].fillna(0.0)
 
     out: dict[str, float] = {}
+    confident_kept = 0
+    grey_zeroed = 0
+    # User directive (2026-04-23): pass entry_ml_proba to the exit
+    # training pipeline ONLY when the entry model was directionally
+    # confident on that mint. Grey-zone probas (between floor and
+    # ceiling) are collapsed to 0.0 so the exit model never learns from
+    # noisy/uncertain entry calls. This matches how entry itself routes
+    # RULES-bucket decisions back to rule logic in live.
+    floor = getattr(policy, "proba_floor", 0.30)
+    ceiling = getattr(policy, "proba_ceiling", 0.40)
     for _, r in rows.iterrows():
         scorer_obj = r.to_dict()
-        # Pass dict only when there's actual signal — an all-zero dict
-        # is interpreted by the skew guard as a train/serve regression
-        # (the exact bug pattern we fixed 2026-04-23). None is the
-        # honest "no snapshot available" value.
         holder_snap_dict = {k: float(r[k]) for k in helius_cols if k in r.index}
         creator_snap_dict = {k: float(r[k]) for k in creator_cols if k in r.index}
         holder_snap = (
@@ -449,8 +455,18 @@ def _precompute_entry_probas(
                 r["mint"], e,
             )
             p = 0.0
+        # Confidence gate — only keep the proba when entry was decisive.
+        if policy.objective != "reg:squarederror" and floor <= p < ceiling:
+            grey_zeroed += 1
+            p = 0.0
+        else:
+            confident_kept += 1
         out[r["mint"]] = p
-    logger.info("Precomputed entry_ml_proba for %d mints", len(out))
+    logger.info(
+        "Precomputed entry_ml_proba for %d mints (confident=%d, "
+        "grey-zone→0=%d)",
+        len(out), confident_kept, grey_zeroed,
+    )
     return out
 
 
@@ -547,6 +563,21 @@ def build_exit_dataset(
 
             buys = in_window[in_window.tx_type == "buy"]
             sells = in_window[in_window.tx_type == "sell"]
+            # Forward 60s PnL (E3): real regression target for quantile
+            # heads. Uses the actual mid-future window, not drawdown
+            # proxy. Looks 60 seconds ahead; if the trade stream is
+            # exhausted sooner, use the final available price (no
+            # lookahead leak since by then the trade stream has ended).
+            fwd_window = trades[
+                (trades.timestamp > t) & (trades.timestamp <= t + 60.0)
+            ]
+            if fwd_window.empty:
+                # fall back to the final price if nothing in 60s window
+                fwd_price = trades.price.iloc[-1]
+            else:
+                fwd_price = fwd_window.price.iloc[-1]
+            forward_pnl_60s = (fwd_price - current_price) / current_price * 100
+
             rows.append(
                 {
                     "mint": mint,
@@ -574,6 +605,7 @@ def build_exit_dataset(
                         else 0.0
                     ),
                     "entry_ml_proba": float(entry_proba_by_mint.get(mint, 0.0)),
+                    "forward_pnl_60s": float(forward_pnl_60s),
                     "label": label,
                 }
             )

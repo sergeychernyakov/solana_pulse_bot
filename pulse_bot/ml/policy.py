@@ -373,7 +373,15 @@ class ExitMLPolicy:
     DEFAULT_PARTIAL_FLOOR = 0.55
     HOLD_HARD_THRESHOLD = 0.20  # hardcoded — codex E2
     HOLD_HARD_MIN_PNL_PCT = -5.0  # guardrail — don't hold through dips
-    HOLD_HARD_BLOCKABLE_REASONS = frozenset({"weak_pulse_profit"})
+    # TP-loosen guardrails (2026-04-23, user directive): HOLD_HARD can
+    # block take_profit ONLY when model is very-confident hold (proba <
+    # TP_HOLD_HARD_STRICT_THRESHOLD) AND position is still within safe
+    # runway (peak PnL not yet exhausted, current PnL not in moonshot
+    # territory where regression-to-mean is overwhelming).
+    TP_HOLD_HARD_STRICT_THRESHOLD = 0.15
+    TP_HOLD_HARD_MAX_PEAK_PCT = 300.0
+    TP_HOLD_HARD_MAX_CURRENT_PCT = 500.0
+    HOLD_HARD_BLOCKABLE_REASONS = frozenset({"weak_pulse_profit", "take_profit"})
 
     def __init__(
         self,
@@ -531,6 +539,78 @@ def load_exit_policy_if_available(
         return ExitMLPolicy.from_path(p, threshold=threshold)
     except Exception as e:
         logger.exception("Failed to load exit model: %s", e)
+        return None
+
+
+class ExitQuantilePolicy:
+    """XGBoost quantile regressor for forward-PnL SL tightening (E3).
+
+    Loaded separately from the binary ExitMLPolicy. ``predict`` returns
+    the predicted quantile of forward 60s PnL %. Used by ExitManager
+    to preempt hard_stop when the model is directionally confident.
+
+    TP loosening head (q=0.75) is NOT wired into live at the moment:
+    at N=1686 the test-set spearman is slightly negative, i.e. the
+    prediction is anti-correlated with realized return. Re-evaluate
+    after N_exit ≥ 3000.
+    """
+
+    def __init__(
+        self,
+        model: "xgb.XGBRegressor",
+        model_hash: str,
+        quantile: float,
+        spearman_rho: float,
+        coverage: float,
+    ) -> None:
+        self._model = model
+        self.model_hash = model_hash
+        self.quantile = quantile
+        self.spearman_rho = spearman_rho
+        self.coverage = coverage
+
+    @classmethod
+    def from_path(cls, path: Path | str) -> "ExitQuantilePolicy":
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"Quantile model not found: {p}")
+        meta = json.loads(p.with_suffix(".meta.json").read_text())
+        model = xgb.XGBRegressor()
+        model.load_model(p)
+        return cls(
+            model,
+            sha256_file(p),
+            quantile=float(meta.get("quantile", 0.5)),
+            spearman_rho=float(meta.get("spearman_rho", 0.0)),
+            coverage=float(meta.get("coverage", 0.0)),
+        )
+
+    def predict(
+        self,
+        state: Any,
+        pulse: Any = None,
+        entry_ml_proba: float | None = None,
+    ) -> float:
+        """Predicted forward-60s PnL at the requested quantile."""
+        vec = extract_exit_vector(state, pulse, entry_ml_proba=entry_ml_proba)
+        arr = np.asarray([vec], dtype=float)
+        return float(self._model.predict(arr)[0])
+
+
+def load_exit_quantile_if_available(
+    path: Path | str,
+) -> "ExitQuantilePolicy | None":
+    """Return None when the quantile model is missing or meta is bad."""
+    p = Path(path)
+    if not p.exists():
+        logger.info(
+            "No quantile model at %s — dynamic SL override disabled.", p
+        )
+        return None
+    try:
+        return ExitQuantilePolicy.from_path(p)
+    except Exception as e:
+        logger.exception("Failed to load quantile model %s: %s", p, e)
         return None
 
 

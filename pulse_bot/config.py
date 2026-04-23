@@ -239,11 +239,14 @@ class PulseBotConfig:
     # via PULSE_EXIT_ML_HOLD_HARD=0 to disable without touching other
     # exit behavior.
     exit_ml_hold_hard_enabled: bool = True
-    # Regression head for SL/TP (shadow-only until gate passes — codex E3).
-    # Activation requires paired-bootstrap test that the SL-tightened /
-    # TP-loosened buckets outperform fixed thresholds by ≥ 1σ on 500
-    # resamples; min 2 weeks shadow data. Disabled by default.
-    exit_regression_active: bool = False
+    # Regression head for SL tightening (E3). q=0.25 quantile head
+    # forecasts forward-60s PnL; when binary ML is directionally
+    # confident SELL AND forecast < -5% AND current PnL in the mid-red
+    # zone (-15% < pnl ≤ -5%), escalate to sell_all pre-emptively.
+    # TP-loosening head NOT wired — current q=0.75 spearman is -0.07
+    # (anti-signal); reconsider once N_exit ≥ 3000.
+    # User directive 2026-04-23: activated by default in paper-trading.
+    exit_regression_active: bool = True
 
     # ── BACKTEST ───────────────────────────────────────────
     # Source DB for `main.py backtest` replay; defaults to live DB.

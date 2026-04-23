@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from pulse_bot.config import PulseBotConfig
-    from pulse_bot.ml.policy import ExitMLPolicy
+    from pulse_bot.ml.policy import ExitMLPolicy, ExitQuantilePolicy
     from pulse_bot.pulse.monitor import PulseSnapshot
 
 
@@ -82,6 +82,7 @@ class ExitManager:
         config: PulseBotConfig,
         ml_advisor: "ExitMLPolicy | None" = None,
         entry_ml_proba: float | None = None,
+        quantile_sl_policy: "ExitQuantilePolicy | None" = None,
     ) -> None:
         self._cfg = config
         self._remaining_pct: float = 1.0
@@ -89,17 +90,20 @@ class ExitManager:
         self._has_taken_profit: bool = False
         self._peak_pnl_pct: float = 0.0  # for trailing stop
         self._ml_advisor = ml_advisor
+        # E3: SL-tightening quantile advisor. Activated only when
+        # ``exit_regression_active=True`` and binary ML is directionally
+        # confident — see _maybe_ml_sl_tighten for the full gate.
+        self._quantile_sl = quantile_sl_policy
         # E1: entry ML's proba at BUY time. Carried through Position
         # lifecycle so every exit evaluation sees the same value.
         self._entry_ml_proba = (
             float(entry_ml_proba) if entry_ml_proba is not None else None
         )
-        # E6 counters — per-position. Aggregate across positions happens
-        # in caller.
         self.ml_counters: dict[str, int] = {
             "ml_override_count": 0,
             "ml_partial_count": 0,
             "ml_hold_hard_count": 0,
+            "ml_sl_tightened_count": 0,
         }
 
     @property
@@ -174,10 +178,49 @@ class ExitManager:
         if pulse.curve_progress_pct > cfg.exit_near_graduation_pct:
             return self._sell_all("near_graduation", ml_proba, ml_action)
 
+        # E3: SL-preempt. Only fires when the binary classifier is
+        # directionally leaning SELL (SELL_ALL or SELL_PARTIAL action)
+        # AND q=0.25 forward-PnL head predicts <-5% AND current PnL is
+        # already in the red ([-hard_stop, -5%) range). Still a sell
+        # escalation — cannot soften existing hard_stop. Fires BEFORE
+        # hard_stop check so it can tighten, not widen, the SL. Logged
+        # as ml_sl_tightened for post-hoc tracking.
+        if self._should_sl_tighten(ml_action, pnl_pct):
+            state = self._build_state_for_ml(pulse, pnl_pct, elapsed_sec)
+            try:
+                q25 = self._quantile_sl.predict(
+                    state, pulse, entry_ml_proba=self._entry_ml_proba
+                )
+            except Exception:
+                q25 = 0.0
+            if q25 < -5.0:
+                self.ml_counters["ml_sl_tightened_count"] += 1
+                return self._sell_all("ml_sl_tightened", ml_proba, ml_action)
+
         if pnl_pct < -cfg.exit_hard_stop_loss_pct:
             return self._sell_all("hard_stop", ml_proba, ml_action)
 
         if cfg.exit_take_profit_enabled and pnl_pct >= cfg.exit_take_profit_pct:
+            # TP override (user directive 2026-04-23): if ML is very-
+            # confident hold (proba < strict threshold) AND position is
+            # still within safe runway (peak < 300%, current < 500%) —
+            # block the TP sell and keep holding. Safety: trailing_stop
+            # + timeout + hard_stop all remain immutable; moonbag cap
+            # prevents unbounded hold.
+            if (
+                getattr(cfg, "exit_ml_hold_hard_enabled", True)
+                and ml_action == "HOLD_HARD"
+                and ml_proba is not None
+                and ml_proba < self._ml_advisor.TP_HOLD_HARD_STRICT_THRESHOLD
+                and self._peak_pnl_pct < self._ml_advisor.TP_HOLD_HARD_MAX_PEAK_PCT
+                and pnl_pct < self._ml_advisor.TP_HOLD_HARD_MAX_CURRENT_PCT
+                and "take_profit" in self._ml_advisor.HOLD_HARD_BLOCKABLE_REASONS
+            ):
+                self.ml_counters["ml_hold_hard_count"] += 1
+                return self._hold(
+                    ml_proba, ml_action,
+                    reason="ml_hold_hard_blocked_take_profit",
+                )
             return self._sell_all("take_profit", ml_proba, ml_action)
 
         if cfg.exit_trailing_stop_enabled:
@@ -228,6 +271,38 @@ class ExitManager:
             return self._sell_partial(sell_pct, reason, ml_proba, ml_action)
 
         return self._maybe_ml_escalate(pnl_pct, elapsed_sec, ml_proba, ml_action)
+
+    def _build_state_for_ml(
+        self, pulse: PulseSnapshot, pnl_pct: float, elapsed_sec: float
+    ) -> dict:
+        drawdown = max(self._peak_pnl_pct - pnl_pct, 0.0)
+        return {
+            "hold_seconds": elapsed_sec,
+            "current_pnl_pct": pnl_pct,
+            "peak_pnl_pct": self._peak_pnl_pct,
+            "drawdown_from_peak": drawdown,
+            "entry_ml_proba": self._entry_ml_proba or 0.0,
+        }
+
+    def _should_sl_tighten(self, ml_action: str | None, pnl_pct: float) -> bool:
+        """Gate for SL tightening — per user directive: only when model is
+        confident in the SELL direction AND current position is already
+        in loss territory. Paper-safe by construction: can only sell
+        earlier than hard_stop would, never later."""
+        cfg = self._cfg
+        if not getattr(cfg, "exit_regression_active", False):
+            return False
+        if self._quantile_sl is None:
+            return False
+        if ml_action not in ("SELL_ALL", "SELL_PARTIAL"):
+            return False
+        # PnL must already be in the mid-red zone: between hard_stop and
+        # the guard floor. Above the floor the ML's "sell soon" view
+        # doesn't justify tripping the hard path.
+        hard_stop_floor = -getattr(cfg, "exit_hard_stop_loss_pct", 15.0)
+        if not (hard_stop_floor < pnl_pct <= -5.0):
+            return False
+        return True
 
     def _maybe_ml_escalate(
         self,

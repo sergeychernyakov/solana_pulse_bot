@@ -726,6 +726,16 @@ class Pipeline:
                     entry_ts = token.created_at + self._config.observe_seconds
                 else:
                     entry_ts = time.time()
+                # Train/serve parity for exit model's entry_ml_proba
+                # feature: build_dataset collapses grey-zone probas
+                # (RULES action, 0.30 ≤ p < 0.40 for classification) to
+                # 0.0 so the exit model only trains on confident-entry
+                # cases. Mirror that here — if entry was RULES (grey
+                # zone), pass 0.0 through to the exit advisor. Keeps
+                # live and training distributions aligned.
+                entry_proba_for_exit = ml_proba
+                if ml_action == "RULES":
+                    entry_proba_for_exit = 0.0
                 asyncio.create_task(
                     self._paper_trade(
                         token,
@@ -735,7 +745,7 @@ class Pipeline:
                         entry_type,
                         entry_score,
                         entry_ts,
-                        entry_ml_proba=ml_proba,
+                        entry_ml_proba=entry_proba_for_exit,
                     )
                 )
             else:

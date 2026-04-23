@@ -11,6 +11,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from pathlib import Path
+
 from pulse_bot.config import PUMPFUN_FEE_PCT, PUMPFUN_PRIORITY_FEE
 from pulse_bot.pulse.exit_manager import ExitManager
 from pulse_bot.pulse.monitor import PulseMonitor
@@ -185,16 +187,24 @@ class PaperTradeRunner:
         self._entry_price = entry_price
         self._current_price = entry_price
         self._pulse = PulseMonitor(config)
-        # Load exit ML advisor. None if model missing — pipeline then
-        # runs rules-only unchanged. ``entry_ml_proba`` carries the
-        # Entry model's verdict through the Position lifecycle (E1
-        # cross-model signal) and is injected into every exit call.
-        from pulse_bot.ml.policy import load_exit_policy_if_available
+        # Exit ML stack: binary classifier (always loaded when model
+        # file present) + quantile SL head (loaded only when
+        # exit_regression_active=True). ``entry_ml_proba`` carries the
+        # Entry model's verdict through the Position lifecycle.
+        from pulse_bot.ml.policy import (load_exit_policy_if_available,
+                                         load_exit_quantile_if_available)
+
+        quantile_sl = None
+        if getattr(config, "exit_regression_active", False):
+            quantile_sl = load_exit_quantile_if_available(
+                Path("data/ml/exit_quantile_sl.ubj")
+            )
 
         self._exit_mgr = ExitManager(
             config,
             ml_advisor=load_exit_policy_if_available(),
             entry_ml_proba=entry_ml_proba,
+            quantile_sl_policy=quantile_sl,
         )
         self._total_buys = 0
         self._total_sells = 0
