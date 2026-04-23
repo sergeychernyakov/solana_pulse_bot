@@ -186,16 +186,21 @@ EXIT_FEATURE_ORDER: list[str] = [
     "unique_buyers_recent",
     "curve_progress_pct",
     "curve_velocity_recent",
-    # 2026-04-23 v2: cross-model signal. Entry ML's proba for this mint,
-    # carried through from the live BUY decision into the Position. At
-    # training time, build_exit_dataset computes it by re-running the
-    # live extractor against token_scores + creator_snapshots + holder
-    # snapshots and calling EntryMLPolicy.predict_score. Train/serve
-    # parity is enforced by test_entry_proba_train_serve_parity.
-    "entry_ml_proba",
+    # TODO(reintroduce cross-model signal): entry_ml_proba was feature
+    # #10 in exit_v2 (2026-04-23) but removed in v3. Rationale: at
+    # N_entry=661 the regression entry head had spearman 0.28 — too
+    # noisy as an exit input (exit AUC collapsed 0.62 → 0.48 when it
+    # was included with regression entry). Re-add it when either
+    #   (a) N_entry ≥ 2000 AND regression spearman ≥ 0.45, OR
+    #   (b) the signal is carried via NaN+binary classifier only (no
+    #       regression path until regression stabilises).
+    # When re-adding: bump schema version, restore _precompute_entry_probas
+    # in build_dataset, restore the param in extract_exit_features,
+    # restore cross-model hash gate in ExitMLPolicy.from_path, and add
+    # test_entry_proba_train_serve_parity.
 ]
 
-EXIT_FEATURE_SCHEMA_VERSION: str = "exit_v2_20260423"
+EXIT_FEATURE_SCHEMA_VERSION: str = "exit_v3_20260423"
 
 
 def extract_exit_features(

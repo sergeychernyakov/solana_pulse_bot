@@ -203,7 +203,22 @@ Exit делает 4-way gated decision через `ExitMLPolicy.decide_with_conf
 
 `creator_dump`, `pulse_dead`, `trend_dying`, `sell_pressure`, `buy_rate_drop`, `no_new_blood`, `whale_exit`, `near_graduation`, `hard_stop (-15%)`, `take_profit (+100%)`, `trailing_stop (+50%/-50%)`, `timeout (90s)` — эти hard rules проверяются до ML gating. `HOLD_HARD` **не может** их блокировать. `strong_profit` partial (>+200%) тоже immutable.
 
-**Cross-model coupling:** exit model видит `entry_ml_proba` как feature (#1 по gain в последнем retrain). Live pipeline пропихивает entry confidence через `Position → PaperTradeRunner → ExitManager`. При training `build_exit_dataset` вызывает тот же `extract_entry_vector` + `EntryMLPolicy.predict_score` что и live, чтобы train/serve parity выдерживалась. `exit_model.meta.json` хранит `entry_model_hash`; `ExitMLPolicy.from_path` **отказывается грузить** если текущий entry hash дрифтанул (защита от cross-model feature skew).
+**Cross-model coupling — ВРЕМЕННО ОТКЛЮЧЕНО (exit_v3, 2026-04-23):**
+
+`entry_ml_proba` был включён как фича в exit model (v2, 2026-04-23) и давал #1 gain. Но при попытке активировать regression entry:
+- Classifier + NaN: exit AUC 0.6227 ✅
+- Regression + NaN: exit AUC 0.48 ❌ (regression predictions с spearman 0.28 на N=661 — слишком шумные для coupling)
+
+Принято решение убрать cross-feature **до** стабилизации regression. Live сейчас работает:
+- Entry: **regression** (precision@top10% 60%, Avg PnL@top10% +8.92%)
+- Exit: AUC 0.5472 — независимая модель, без cross-feature (−7pp от v2, но decoupled от regression noise)
+- Tandem: entry precision +5.5pp перевешивает exit AUC −7pp (exit всё равно имеет safety floor на immutable rules)
+
+**TODO — восстановить cross-feature когда:**
+- N_entry ≥ 2000 AND regression spearman_rho ≥ 0.45, ИЛИ
+- Выбрать путь classifier-only для cross-feature (regression entry активна, но в exit передаётся proba от classifier)
+
+При restore — вернуть `entry_ml_proba` в `EXIT_FEATURE_ORDER`, схема bump → v4, reinstate `_precompute_entry_probas` в build_dataset, cross-model hash gate в `ExitMLPolicy.from_path`, и `test_entry_proba_train_serve_parity`.
 
 **Quantile regression heads** (E3, shadow only, `PULSE_EXIT_REGRESSION_ACTIVE=0` по умолчанию): `exit_quantile_sl.ubj` (q=0.25) для SL-tightening и `exit_quantile_tp.ubj` (q=0.75) для TP-loosening. Активация требует 2 недели shadow + paired bootstrap 500 resamples показывает что bucket бьёт фиксированный порог на ≥1σ.
 

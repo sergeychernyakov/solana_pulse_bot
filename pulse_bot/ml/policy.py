@@ -437,37 +437,11 @@ class ExitMLPolicy:
                     )
                 else:
                     raise RuntimeError(detail)
-            # Cross-model hash gate (E1 codex #2): refuse if entry hash
-            # drifted since exit training. Uses _resolve_entry_model_path
-            # so the gate follows PULSE_ML_OBJECTIVE — same resolution
-            # used at training time.
-            saved_entry_hash = meta.get("entry_model_hash")
-            if saved_entry_hash:
-                current_entry = _resolve_entry_model_path()
-                if current_entry.exists():
-                    try:
-                        now_hash = sha256_file(current_entry)
-                    except Exception as e:
-                        logger.warning("Could not hash current entry model: %s", e)
-                        now_hash = None
-                    if now_hash and now_hash != saved_entry_hash:
-                        detail = (
-                            f"Exit model was trained against entry_hash="
-                            f"{saved_entry_hash[:16]}, current entry_hash="
-                            f"{now_hash[:16]}. Cross-model feature "
-                            f"(entry_ml_proba) distribution may have "
-                            f"shifted. Retrain exit (`python -m "
-                            f"pulse_bot.ml.train --dataset exit`) or set "
-                            f"PULSE_ALLOW_STALE_MODEL=1 to force load."
-                        )
-                        if os.environ.get("PULSE_ALLOW_STALE_MODEL") == "1":
-                            logger.error(
-                                "Loading EXIT with mismatched entry hash "
-                                "(PULSE_ALLOW_STALE_MODEL=1): %s", detail,
-                            )
-                        else:
-                            raise RuntimeError(detail)
-            entry_model_hash = saved_entry_hash
+            # TODO(cross-model gate): removed in exit_v3 alongside the
+            # entry_ml_proba feature. When the feature is restored,
+            # reinstate the hash gate here so a retrained entry doesn't
+            # silently shift the exit feature distribution.
+            entry_model_hash = meta.get("entry_model_hash")
             # Val-tuned ceiling/floor if persisted
             sell_ceiling = meta.get("sell_ceiling")
             partial_floor = meta.get("partial_floor")

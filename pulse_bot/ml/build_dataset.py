@@ -513,12 +513,11 @@ def build_exit_dataset(
     )
     logger.info("Exit candidate tokens: %d", len(candidates))
 
-    # 2026-04-23 v2: precompute entry_ml_proba for every candidate mint via
-    # the live-inference path, so every exit-training row gets the same
-    # proba that live would have seen at the BUY moment.
-    entry_proba_by_mint = _precompute_entry_probas(
-        db_path, candidates["mint"].tolist()
-    )
+    # TODO(cross-model signal): entry_ml_proba was wired here in exit_v2
+    # but removed in exit_v3 — see EXIT_FEATURE_ORDER comment for the
+    # re-add conditions. _precompute_entry_probas is still defined
+    # above for reference and future re-use.
+    # entry_proba_by_mint = _precompute_entry_probas(db_path, candidates["mint"].tolist())
 
     rows: list[dict] = []
     for _, c in candidates.iterrows():
@@ -616,7 +615,6 @@ def build_exit_dataset(
                         if len(in_window) > 1
                         else 0.0
                     ),
-                    "entry_ml_proba": float(entry_proba_by_mint.get(mint, 0.0)),
                     "forward_pnl_60s": float(forward_pnl_60s),
                     "label": label,
                 }
