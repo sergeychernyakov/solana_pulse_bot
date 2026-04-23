@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 # is −1.5% AUC, well inside bootstrap SE 0.039. Drop was approved.
 SCORER_FEATURES: list[str] = [
     "unique_buyers",
+    "unique_sellers",  # Phase A1 2026-04-24 add
     "buy_count",
     "sell_count",
     "buy_volume_sol",
@@ -91,6 +92,17 @@ SCORER_FEATURES: list[str] = [
     "gap_create_to_first_trade",
     "market_cap_sol",
     "sol_to_graduation",
+    # Phase A1 2026-04-24: SOL market regime. 56% coverage on the
+    # current dataset (captured since 2026-04-22). Missing values → NaN
+    # so XGBoost learns a "no regime data" split path separately from
+    # "SOL was at $X".
+    "sol_price_usd",
+    # TODO(Phase A2): market-context features (pumpfun_tokens_per_min,
+    # graduated_last_hour, creator_active_tokens_now,
+    # days_since_creator_last_token). Require scorer.py changes to
+    # compute at live scoring time — otherwise train/serve skew
+    # (trained on aggregated SQL values, live sees 0/NaN). Park until
+    # scorer.py has market-snapshot plumbing.
 ]
 
 # Derived from ``hour_utc`` (cyclical encoding — see codex v9 P2 fix).
@@ -124,6 +136,16 @@ HELIUS_FEATURES: list[str] = [
     "top1_120",
     "top5_120",
     "hc_120",
+    # Phase A1 2026-04-24: broader concentration. top10 is already
+    # captured by the Helius snapshotter (100% coverage on
+    # token_holders_snapshots). Trees can split on "top10 vs top1"
+    # jointly to detect "broad retail" vs "narrow whale" patterns.
+    "top10_30",
+    "top10_120",
+    "top10_delta",
+    # Holder-count velocity. Positive = healthy growth between T+30 and
+    # T+120. Negative = exit. Zero = stagnant.
+    "hc_velocity",
 ]
 
 # Creator snapshot features — PROVISIONAL (codex 2026-04-22).
@@ -166,7 +188,7 @@ ENTRY_FEATURE_ORDER: list[str] = [
 
 # Bumped on any schema change. Prediction path refuses to load models
 # whose meta.json reports a different version.
-FEATURE_SCHEMA_VERSION: str = "entry_v10_20260423"
+FEATURE_SCHEMA_VERSION: str = "entry_v11_20260424"
 
 
 # ── Exit classifier ────────────────────────────────────────────────

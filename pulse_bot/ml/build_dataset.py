@@ -101,6 +101,7 @@ def build_entry_dataset(
         SELECT mint,
                top1_pct AS top1_30,
                top5_pct AS top5_30,
+               top10_pct AS top10_30,
                holder_count AS hc_30
         FROM token_holders_snapshots
         WHERE capture_at_age_sec = 30.0
@@ -114,6 +115,7 @@ def build_entry_dataset(
         SELECT mint,
                top1_pct AS top1_120,
                top5_pct AS top5_120,
+               top10_pct AS top10_120,
                holder_count AS hc_120
         FROM token_holders_snapshots
         WHERE capture_at_age_sec = 120.0
@@ -126,6 +128,14 @@ def build_entry_dataset(
     base = base.merge(h120, on="mint", how="left")
     base["top1_delta"] = base["top1_120"] - base["top1_30"]
     base["top5_delta"] = base["top5_120"] - base["top5_30"]
+    base["top10_delta"] = base["top10_120"] - base["top10_30"]
+    # hc_velocity = holders added per second between T+30 and T+120
+    # (90-second window). Positive = growing, negative = exiting.
+    base["hc_velocity"] = (base["hc_120"] - base["hc_30"]) / 90.0
+
+    # TODO(Phase A2): market-context features. Implement when scorer.py
+    # grows a MarketSnapshot helper that captures same values at live
+    # scoring time — otherwise train/serve skew.
     # Per codex 2026-04-22: explicit completeness indicator distinguishes
     # "fetched and concentration is 0" from "fetch failed". Must match
     # live extractor logic in pulse_bot.ml.features.extract_entry_features.
@@ -176,12 +186,16 @@ def build_entry_dataset(
         helius_cols = [
             "top1_30",
             "top5_30",
+            "top10_30",
             "hc_30",
             "top1_120",
             "top5_120",
+            "top10_120",
             "hc_120",
             "top1_delta",
             "top5_delta",
+            "top10_delta",
+            "hc_velocity",
         ]
         for c in helius_cols:
             if c in base.columns:
