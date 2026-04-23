@@ -3,7 +3,15 @@
 
 import asyncio
 import logging
+import os
 import sys
+
+# Load .env so HELIUS_API_KEY (holder collector, creator enrichment) is visible.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 from pulse_bot.backtest import BacktestEngine
 from pulse_bot.config import get_config
@@ -59,6 +67,10 @@ def _run_monitor() -> None:
     """Start the async monitoring pipeline."""
     config = get_config()
 
+    for arg in sys.argv[2:]:
+        if arg.startswith("--db="):
+            config.db_path = arg.split("=", 1)[1]
+
     # Setup logging
     logging.basicConfig(
         level=getattr(logging, config.log_level.upper(), logging.INFO),
@@ -69,10 +81,49 @@ def _run_monitor() -> None:
     db = Database(config.db_path)
     db.init_schema()
 
+    from pulse_bot.helius_creator import (
+        CreatorSnapshotService,
+        HeliusSnapshotSource,
+        LocalSnapshotSource,
+    )
+
+    local_source = LocalSnapshotSource(config.db_path)
+    helius_key = os.environ.get("HELIUS_API_KEY", "")
+    snapshot_source = (
+        HeliusSnapshotSource(local_source, helius_key)
+        if helius_key
+        else local_source
+    )
+    creator_snap_service = CreatorSnapshotService(db, snapshot_source)
+
+    # Holder concentration collector (Helius getTokenLargestAccounts).
+    # Collection-first: save snapshots for every BUY candidate so we can
+    # later validate if top1/top5 pct predicts forward returns.
+    holder_client = None
+    onchain_client = None
+    if helius_key:
+        from pulse_bot.helius_holders import HeliusHolderClient
+        from pulse_bot.helius_onchain import HeliusOnchainClient
+
+        holder_client = HeliusHolderClient(helius_key)
+        # On-chain mint/freeze authority capture. Writes to tokens table
+        # only — features not yet in ENTRY_FEATURE_ORDER (pump.fun has
+        # ~zero variance; kept for future-launchpad / edge-case readiness).
+        onchain_client = HeliusOnchainClient(helius_key)
+
     launchpad = PumpFunLaunchpad(config)
     scorer = Scorer(config, db)
     fast_filter = FastFilter(config)
-    pipeline = Pipeline(config, db, launchpad, scorer, fast_filter)
+    pipeline = Pipeline(
+        config,
+        db,
+        launchpad,
+        scorer,
+        fast_filter,
+        creator_snap_service=creator_snap_service,
+        holder_client=holder_client,
+        onchain_client=onchain_client,
+    )
 
     try:
         asyncio.run(pipeline.run())
@@ -164,6 +215,11 @@ def _run_verify() -> None:
     log = logging.getLogger(__name__)
 
     config = get_config()
+
+    for arg in sys.argv[2:]:
+        if arg.startswith("--db="):
+            config.db_path = arg.split("=", 1)[1]
+
     db = Database(config.db_path)
     db.init_schema()
 
@@ -282,7 +338,7 @@ def _run_qa() -> None:
 
 def _run_optimize() -> None:
     """Run grid search optimizer."""
-    from pulse_bot.optimizer import Optimizer
+    from pulse_bot.optimizer import DEFAULT_MAX_COMBOS, Optimizer
 
     config = get_config()
 
@@ -292,21 +348,48 @@ def _run_optimize() -> None:
         datefmt="%H:%M:%S",
     )
 
-    db = Database(config.backtest_db_path)
+    db = Database(config.optimizer_db_path)
     db.init_schema()
 
     optimizer = Optimizer(config, db)
 
-    # Parse custom grid from CLI args
+    # Parse custom grid and control flags.
+    # `--full-grid` and `--max-combos=N` are flags; everything else with
+    # `--key=val1,val2` is treated as a grid axis.
+    reserved = {"full-grid", "max-combos", "workers", "train-pct"}
     custom_grid: dict[str, list] = {}
+    full_grid = False
+    max_combos: int | None = None
+    workers: int = 1
+    train_pct: float = 1.0
     for arg in sys.argv[2:]:
+        if arg == "--full-grid":
+            full_grid = True
+            continue
+        if arg.startswith("--max-combos="):
+            max_combos = int(arg.split("=")[1])
+            continue
+        if arg.startswith("--workers="):
+            val = arg.split("=")[1]
+            workers = os.cpu_count() or 1 if val == "auto" else int(val)
+            continue
+        if arg.startswith("--train-pct="):
+            train_pct = float(arg.split("=")[1])
+            if not 0.0 < train_pct <= 1.0:
+                raise SystemExit("--train-pct must be in (0.0, 1.0]")
+            continue
         if "=" in arg and arg.startswith("--"):
-            key = arg.split("=")[0].lstrip("-").replace("-", "_")
+            key = arg.split("=")[0].lstrip("-")
+            if key in reserved:
+                continue
+            key = key.replace("-", "_")
             values_str = arg.split("=")[1]
-            # Parse comma-separated values
-            values = []
+            values: list = []
             for v in values_str.split(","):
                 v = v.strip()
+                if v in ("True", "False"):
+                    values.append(v == "True")
+                    continue
                 try:
                     if "." in v:
                         values.append(float(v))
@@ -322,15 +405,25 @@ def _run_optimize() -> None:
     else:
         optimizer.use_default_grid()
 
+    if full_grid:
+        resolved_max = 0
+    elif max_combos is not None:
+        resolved_max = max_combos
+    else:
+        resolved_max = DEFAULT_MAX_COMBOS
+
     logging.getLogger(__name__).info(
-        "Starting optimizer: %d combinations, session=%s",
-        optimizer.estimate_runs(), optimizer.session_id,
+        "Starting optimizer: grid=%d (pre-filter), max_combos=%s, workers=%d, session=%s",
+        optimizer.estimate_runs(),
+        "full" if resolved_max == 0 else resolved_max,
+        workers,
+        optimizer.session_id,
     )
     logging.getLogger(__name__).info(
         "View results: streamlit run pulse_bot/backtest_dashboard.py --server.port 8502",
     )
 
-    optimizer.run()
+    optimizer.run(max_combos=resolved_max, workers=workers, train_pct=train_pct)
 
 
 if __name__ == "__main__":

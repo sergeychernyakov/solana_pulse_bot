@@ -41,7 +41,9 @@ class Launchpad(ABC):
         ...
 
     @abstractmethod
-    def stream_trades(self, mint: str, duration_seconds: float) -> AsyncIterator[Trade]:
+    def stream_trades(
+        self, mint: str, duration_seconds: float, inactivity_timeout: float = 0
+    ) -> AsyncIterator[Trade]:
         """Yield trades for a mint during the observation window."""
         ...
 

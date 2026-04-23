@@ -36,8 +36,23 @@ from pulse_bot.sources.replay import ReplayLaunchpad
 
 @pytest.fixture()
 def config() -> PulseBotConfig:
-    """Return a default PulseBotConfig for tests."""
-    return PulseBotConfig()
+    """Return a default PulseBotConfig for tests. Disables data-driven entry
+    gates so synthetic fixtures still reach creator-scoring branches."""
+    return PulseBotConfig(
+        entry_min_curve_velocity=0.0,
+        entry_min_curve_acceleration=-1e9,
+        entry_max_curve_acceleration=1e9,
+        entry_max_top3_buyer_pct=100.0,
+        entry_max_fast_score=10_000,
+        creator_max_tokens_today=10_000,
+        min_entry_buyer_number=1,
+        entry_min_sol_volume_hard=0.0,
+        entry_min_unique_buyers_hard=0,
+        fast_hard_min_volume_sol=0.0,
+        fast_hard_min_unique_buyers=0,
+        creator_min_graduation_rate=0.0,
+        creator_min_age_days=0.0,
+    )
 
 
 @pytest.fixture()
@@ -406,27 +421,28 @@ class TestScorerCreatorSnapshot:
         assert isinstance(result, ScoringResult)
         assert result.decision in ("BUY", "SKIP", "BORDERLINE")
 
-    def test_scorer_falls_back_to_db_without_snapshot(
+    def test_scorer_without_snapshot_does_not_query_cumulative_db(
         self,
         config: PulseBotConfig,
         mock_db: MagicMock,
         sample_token: Token,
         sample_trades: list[Trade],
     ) -> None:
-        """Without creator_snapshot, the scorer queries the DB for creator stats."""
-        # Arrange
-        mock_db.get_creator_stats_sync.return_value = CreatorStats(
-            wallet=sample_token.creator,
-            total_tokens_created=1,
-            times_seen=1,
-        )
+        """Without a creator_snapshot, the scorer MUST NOT fall back to
+        ``get_creator_stats_sync`` — that path reads the cumulative
+        ``creators`` table, which leaks future creator upserts into
+        replay/backtest scoring and desynchronises live vs replay
+        (the verify300 invariant). Fallback was removed as part of
+        the ROWID-based as-of refactor; the scorer now simply scores
+        without a creator-based adjustment when no snapshot is supplied.
+        """
         scorer = Scorer(config, mock_db)
 
-        # Act
-        scorer.score(sample_token, sample_trades, creator_snapshot=None)
+        result = scorer.score(sample_token, sample_trades, creator_snapshot=None)
 
-        # Assert -- DB was queried
-        mock_db.get_creator_stats_sync.assert_called_once_with(sample_token.creator)
+        mock_db.get_creator_stats_sync.assert_not_called()
+        assert isinstance(result, ScoringResult)
+        assert result.decision in ("BUY", "SKIP", "BORDERLINE")
 
 
 # ---------------------------------------------------------------------------
@@ -525,39 +541,33 @@ class TestPipelineSourceBacktest:
 
 
 class TestReplayStreamTradesUsesIds:
-    """ReplayLaunchpad must yield only trades whose DB IDs match live scoring."""
+    """ReplayLaunchpad must split trades by time window anchored on created_at."""
 
     async def test_replay_stream_trades_uses_ids(
         self,
         sample_token: Token,
         sample_trades: list[Trade],
     ) -> None:
-        """When live scores specify trade IDs, replay yields exactly those trades."""
-        # Arrange -- create a temp DB with 6 trades (IDs 1..6)
-        # Live scoring recorded fast_ids={1,2,3}, full_ids={1,2,3,4,5,6}
-        fast_ids = [1, 2, 3]
-        full_ids = [1, 2, 3, 4, 5, 6]
-        db_path = _make_replay_db(
-            sample_token,
-            sample_trades,
-            fast_trade_ids=fast_ids,
-            full_trade_ids=full_ids,
-        )
+        """Phase 0 yields trades in (created_at, created_at+fast]; phase 1 in the next window."""
+        # Arrange -- sample_trades timestamps are created_at+1 through created_at+5
+        db_path = _make_replay_db(sample_token, sample_trades)
 
         replay = ReplayLaunchpad(db_path, speed=0.0)
         replay._running = True
+        replay._token_created_at[sample_token.mint] = sample_token.created_at
+        replay._token_creators[sample_token.mint] = sample_token.creator
 
-        # Act -- subscribe loads trades + live counts
+        # Act
         await replay.subscribe_trades(sample_token.mint)
 
-        # First call = fast phase
+        # Fast window: created_at..created_at+2.5 → trades at +1, +2 (IDs 1,2)
         fast_collected: list[Trade] = []
         async for trade in replay.stream_trades(
-            sample_token.mint, duration_seconds=5.0
+            sample_token.mint, duration_seconds=2.5
         ):
             fast_collected.append(trade)
 
-        # Second call = full phase (remaining trades)
+        # Full window: +2.5..+42.5 → trades at +3, +3.5, +4, +5 (IDs 3,4,5,6)
         full_extra_collected: list[Trade] = []
         async for trade in replay.stream_trades(
             sample_token.mint, duration_seconds=40.0
@@ -568,10 +578,10 @@ class TestReplayStreamTradesUsesIds:
         fast_db_ids = {getattr(t, "_db_id", None) for t in fast_collected}
         full_extra_db_ids = {getattr(t, "_db_id", None) for t in full_extra_collected}
 
-        assert fast_db_ids == set(fast_ids)
-        assert full_extra_db_ids == set(full_ids) - set(fast_ids)
-        assert len(fast_collected) == 3
-        assert len(full_extra_collected) == 3
+        assert fast_db_ids == {1, 2}
+        assert full_extra_db_ids == {3, 4, 5, 6}
+        assert len(fast_collected) == 2
+        assert len(full_extra_collected) == 4
 
         await replay.disconnect()
 
@@ -582,33 +592,28 @@ class TestReplayStreamTradesUsesIds:
 
 
 class TestReplayFastZeroTrades:
-    """ReplayLaunchpad must yield zero trades in fast phase when live recorded zero."""
+    """ReplayLaunchpad yields zero trades when the fast window ends before any trade."""
 
     async def test_replay_fast_zero_trades(
         self,
         sample_token: Token,
         sample_trades: list[Trade],
     ) -> None:
-        """When live fast_trade_ids is empty, fast phase yields nothing."""
-        # Arrange -- live had 0 fast trades, all trades in full phase
-        fast_ids: list[int] = []
-        full_ids = [1, 2, 3, 4, 5, 6]
-        db_path = _make_replay_db(
-            sample_token,
-            sample_trades,
-            fast_trade_ids=fast_ids,
-            full_trade_ids=full_ids,
-        )
+        """Fast window shorter than the first trade's delay yields nothing, full picks up all 6."""
+        # Arrange -- first trade arrives at created_at+1.0; fast=0.5 cuts before it.
+        db_path = _make_replay_db(sample_token, sample_trades)
 
         replay = ReplayLaunchpad(db_path, speed=0.0)
         replay._running = True
+        replay._token_created_at[sample_token.mint] = sample_token.created_at
+        replay._token_creators[sample_token.mint] = sample_token.creator
 
         # Act
         await replay.subscribe_trades(sample_token.mint)
 
         fast_collected: list[Trade] = []
         async for trade in replay.stream_trades(
-            sample_token.mint, duration_seconds=5.0
+            sample_token.mint, duration_seconds=0.5
         ):
             fast_collected.append(trade)
 

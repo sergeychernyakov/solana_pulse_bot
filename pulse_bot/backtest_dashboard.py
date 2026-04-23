@@ -22,10 +22,14 @@ st.markdown(
 <style>
     .block-container { padding-top: 0.5rem; padding-left: 0.5rem; padding-right: 0.5rem; }
     .stats-bar { display: flex; gap: 8px; flex-wrap: wrap; margin: 4px 0 8px 0; font-size: 13px; }
-    .stats-bar .stat { background: #1e1e1e; padding: 4px 10px; border-radius: 6px; white-space: nowrap; }
-    .stats-bar .stat b { color: #ccc; }
-    .pos b { color: #4ade80 !important; }
-    .neg b { color: #f87171 !important; }
+    .stats-bar .stat { background: #e8e8e8; color: #1a1a1a; padding: 4px 10px; border-radius: 6px; white-space: nowrap; }
+    .stats-bar .stat b { color: #1a1a1a; }
+    .pos b { color: #16a34a !important; }
+    .neg b { color: #dc2626 !important; }
+    [data-theme="dark"] .stats-bar .stat { background: #1e1e1e; color: #e0e0e0; }
+    [data-theme="dark"] .stats-bar .stat b { color: #e0e0e0; }
+    [data-theme="dark"] .pos b { color: #4ade80 !important; }
+    [data-theme="dark"] .neg b { color: #f87171 !important; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -35,7 +39,7 @@ st.markdown(
 def main() -> None:
     """Backtest dashboard entry point."""
     config = get_config()
-    db = Database(config.db_path)
+    db = Database(config.optimizer_db_path)
     db.init_schema()
 
     st.markdown("### Backtest Results")
@@ -145,9 +149,9 @@ def render_runs_table(runs: list[dict]) -> None:
     def color_row(row: pd.Series) -> list[str]:
         pnl = float(row.get("PnL SOL", "0").replace("+", ""))
         if pnl > 0:
-            return ["background-color: #1a3a1a; color: #4ade80"] * len(row)
+            return ["background-color: rgba(34,197,94,0.15); color: #166534"] * len(row)
         if pnl < -0.01:
-            return ["background-color: #3a1a1a; color: #f87171"] * len(row)
+            return ["background-color: rgba(239,68,68,0.15); color: #991b1b"] * len(row)
         return [""] * len(row)
 
     styled = df.style.apply(color_row, axis=1)
@@ -231,9 +235,13 @@ def render_run_detail(run: dict, db: Database) -> None:
             except (ValueError, AttributeError):
                 val = 0
             if val > 0:
-                return ["background-color: #1a3a1a; color: #4ade80"] * len(row)
+                return ["background-color: rgba(34,197,94,0.15); color: #166534"] * len(
+                    row
+                )
             if val < -10:
-                return ["background-color: #3a1a1a; color: #f87171"] * len(row)
+                return ["background-color: rgba(239,68,68,0.15); color: #991b1b"] * len(
+                    row
+                )
             return [""] * len(row)
 
         styled = show_df.style.apply(color_trade, axis=1)

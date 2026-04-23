@@ -116,6 +116,20 @@ class ScoringResult:
     first_buy_sol: float = 0.0
     buy_velocity_trend: float = 0.0
     buy_size_trend: float = 0.0
+    # Raw halves (codex 2026-04-22) — exposed so ML doesn't depend on
+    # the capped-denominator ratios above.
+    first_half_buy_rate: float = 0.0
+    second_half_buy_rate: float = 0.0
+    avg_first_half_buy_sol: float = 0.0
+    avg_second_half_buy_sol: float = 0.0
+    # 2026-04-23 additions
+    time_gap_median_first20: float = 0.0
+    buy_volume_first10s: float = 0.0
+    unique_buyers_first30s: int = 0
+    unique_buyers_last30s: int = 0
+    curve_progress_at_t30: float = 0.0
+    curve_progress_at_t60: float = 0.0
+    curve_progress_at_t90: float = 0.0
     time_to_first_buy: float = 0.0
     buys_per_unique: float = 0.0
 
@@ -166,7 +180,13 @@ class ScoringResult:
 
 @dataclass
 class CreatorStats:
-    """Cached statistics about a token creator."""
+    """Cached statistics about a token creator.
+
+    Fields after ``blacklisted`` are populated from the leak-free
+    ``creator_snapshots`` table (#48/#49) when a snapshot exists at or
+    before the as-of timestamp. Default 0.0 means "no data" and scoring
+    rules must treat that as neutral (never reject on missing data).
+    """
 
     wallet: str
     total_tokens_created: int = 0
@@ -175,3 +195,17 @@ class CreatorStats:
     first_seen_at: float = 0.0
     last_seen_at: float = 0.0
     blacklisted: bool = False
+    # Enriched snapshot fields (all optional — 0 means unavailable):
+    rug_rate: float = 0.0  # prior tokens rugged / total
+    graduation_rate: float = 0.0  # prior tokens graduated / total
+    median_peak_mc_sol: float = 0.0  # median peak MC across prior tokens
+    creator_age_days: float = 0.0  # days since earliest prior token
+    inter_token_interval_sec: float = 0.0  # mean gap between creations
+    creator_balance_sol: float = (
+        0.0  # wallet balance at snapshot time (Helius-only; 0 when unavailable)
+    )
+    rug_count: int = 0  # raw prior rugs (v9 add — unsmeared by divide-by-N)
+    graduated_count: int = 0  # raw prior graduations (v9 add)
+    snapshot_prior_tokens: int = (
+        0  # n in snapshot (may differ from total_tokens_created)
+    )

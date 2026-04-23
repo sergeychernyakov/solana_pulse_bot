@@ -3,6 +3,14 @@
 
 This allows the pipeline to process backtest data using EXACTLY the same code
 as live trading. The only difference is the source of events.
+
+Time-based windows, anchored on token.created_at:
+  Scoring phases yield trades with timestamp in (cursor, cursor + duration].
+  Monitor phase yields all remaining trades, honoring inactivity_timeout.
+
+No coupling to live-stored fast/full trade IDs: the window is derived purely
+from created_at and config, so live, replay, provider-data backtest, and the
+optimizer all see the same trade set for a given token.
 """
 
 from __future__ import annotations
@@ -19,46 +27,26 @@ logger = logging.getLogger(__name__)
 
 
 class ReplayLaunchpad(Launchpad):
-    """Replays tokens and trades from SQLite as if they came from WebSocket.
-
-    Implements the same Launchpad interface as PumpFunLaunchpad.
-    Pipeline doesn't know the difference — uses same code for both.
-    """
+    """Replays tokens and trades from SQLite as if they came from WebSocket."""
 
     name = "replay"
     ws_url = "sqlite"
 
     def __init__(self, db_path: str, speed: float = 0.0) -> None:
-        """
-        Args:
-            db_path: Path to SQLite DB with tokens and trades.
-            speed: Replay speed. 0 = instant (backtest), 1.0 = real-time, 0.1 = 10x faster.
-        """
         self._db_path = db_path
         self._speed = speed
         self._trade_queues: dict[str, asyncio.Queue[Trade]] = {}
         self._token_creators: dict[str, str] = {}
-        self._live_counts: dict[str, dict] = (
-            {}
-        )  # mint → {fast_trade_count, full_trade_count}
-        self._stream_phase: dict[str, int] = {}  # mint → 0=fast, 1=full
+        self._token_created_at: dict[str, float] = {}
+        self._stream_cursor: dict[str, float] = {}
         self._running = False
-        self._feeder_task: asyncio.Task | None = None
 
     async def connect(self) -> None:
-        """Start the replay feeder that pushes trades into queues."""
         self._running = True
-        self._feeder_task = asyncio.create_task(self._feed_trades())
         logger.info("ReplayLaunchpad connected (speed=%.1f)", self._speed)
 
     async def disconnect(self) -> None:
         self._running = False
-        if self._feeder_task and not self._feeder_task.done():
-            self._feeder_task.cancel()
-            try:
-                await self._feeder_task
-            except asyncio.CancelledError:
-                pass
         self._trade_queues.clear()
 
     async def stream_new_tokens(self) -> AsyncIterator[Token]:
@@ -81,8 +69,8 @@ class ReplayLaunchpad(Launchpad):
                     launchpad="pumpfun",
                 )
                 self._token_creators[token.mint] = token.creator
+                self._token_created_at[token.mint] = token.created_at
 
-                # Simulate time delay between tokens
                 if self._speed > 0 and prev_ts > 0:
                     delay = (token.created_at - prev_ts) * self._speed
                     if delay > 0:
@@ -90,138 +78,116 @@ class ReplayLaunchpad(Launchpad):
                 prev_ts = token.created_at
 
                 yield token
-                # Let feeder and pipeline process before next token
                 await asyncio.sleep(0)
         finally:
             conn.close()
 
     async def subscribe_trades(self, mint: str) -> None:
-        """Create a queue for this mint and immediately load historical trades."""
+        """Create a queue for this mint and load all historical trades."""
         if mint not in self._trade_queues:
             self._trade_queues[mint] = asyncio.Queue()
-            await self._preload_trades(mint)
-            # Load live trade counts for exact replay
-            self._load_live_counts(mint)
+            await self._preload_all_trades(mint)
+            self._stream_cursor[mint] = self._token_created_at.get(mint, 0.0)
 
-    def _load_live_counts(self, mint: str) -> None:
-        """Load exact trade IDs from live scoring for exact replay."""
+    async def _preload_all_trades(self, mint: str) -> None:
+        """Load every trade for this mint, in timestamp order, into the queue."""
         conn = sqlite3.connect(self._db_path)
         conn.row_factory = sqlite3.Row
         try:
-            row = conn.execute(
-                "SELECT fast_trade_count, full_trade_count, fast_trade_ids, full_trade_ids FROM token_scores WHERE mint = ? AND source = 'live'",
+            cur = conn.execute(
+                "SELECT * FROM trades WHERE mint = ? ORDER BY timestamp ASC, id ASC",
                 (mint,),
-            ).fetchone()
-            if row is not None:
-                fast_ids_str = row["fast_trade_ids"] or ""
-                full_ids_str = row["full_trade_ids"] or ""
-                self._live_counts[mint] = {
-                    "fast": row["fast_trade_count"] or 0,
-                    "full": row["full_trade_count"] or 0,
-                    "fast_ids": set(int(x) for x in fast_ids_str.split(",") if x),
-                    "full_ids": set(int(x) for x in full_ids_str.split(",") if x),
-                }
-        finally:
-            conn.close()
-
-    async def _preload_trades(self, mint: str) -> None:
-        """Load trades from DB. If live IDs available, load only those trades."""
-        conn = sqlite3.connect(self._db_path)
-        conn.row_factory = sqlite3.Row
-        try:
-            counts = self._live_counts.get(mint)
-            if counts and "full_ids" in counts and counts["full_ids"]:
-                # Exact replay: load only the trades that live pipeline saw
-                full_ids = counts["full_ids"]
-                id_list = ",".join(str(int(i)) for i in sorted(full_ids))
-                cur = conn.execute(  # nosec B608
-                    f"SELECT * FROM trades WHERE id IN ({id_list}) ORDER BY id ASC"
-                )
-            else:
-                # No live data: load all trades for this mint
-                cur = conn.execute(
-                    "SELECT * FROM trades WHERE mint = ? ORDER BY timestamp ASC, id ASC",
-                    (mint,),
-                )
-
+            )
             creator = self._token_creators.get(mint, "")
+            queue = self._trade_queues.get(mint)
+            if queue is None:
+                return
             for row in cur:
-                trade = Trade(
-                    mint=mint,
-                    wallet=row["wallet"],
-                    tx_type=row["tx_type"],
-                    sol_amount=row["sol_amount"] or 0.0,
-                    token_amount=(
-                        row["token_amount"] if "token_amount" in row.keys() else 0.0
-                    ),
-                    new_token_balance=0.0,
-                    bonding_curve_key="",
-                    v_sol_in_bonding_curve=row["v_sol_in_bonding_curve"] or 0.0,
-                    v_tokens_in_bonding_curve=0.0,
-                    market_cap_sol=row["market_cap_sol"] or 0.0,
-                    timestamp=row["timestamp"],
-                    is_creator=(row["wallet"] == creator),
-                )
-                trade._db_id = row["id"]  # type: ignore[attr-defined]
-                queue = self._trade_queues.get(mint)
-                if queue:
-                    await queue.put(trade)
+                trade = self._row_to_trade(row, mint, creator)
+                await queue.put(trade)
         finally:
             conn.close()
 
     async def unsubscribe_trades(self, mint: str) -> None:
         self._trade_queues.pop(mint, None)
         self._token_creators.pop(mint, None)
+        self._token_created_at.pop(mint, None)
+        self._stream_cursor.pop(mint, None)
 
     async def stream_trades(
-        self, mint: str, duration_seconds: float
+        self,
+        mint: str,
+        duration_seconds: float,
+        inactivity_timeout: float = 0,
     ) -> AsyncIterator[Trade]:
-        """Yield exactly the same trades that live pipeline collected.
+        """Yield trades for a scoring window, or the monitor stream.
 
-        Uses ID-based filtering from live scores for 100% exact match.
-        First call = fast trades, second call = remaining full trades.
+        inactivity_timeout > 0  → monitor phase: yield all remaining trades
+        inactivity_timeout == 0 → scoring phase: yield (cursor, cursor+duration]
         """
         queue = self._trade_queues.get(mint)
         if not queue:
             return
 
-        counts = self._live_counts.get(mint)
-        phase = self._stream_phase.get(mint, 0)
+        if inactivity_timeout > 0:
+            async for trade in self._drain_all(queue, inactivity_timeout):
+                yield trade
+            return
 
-        if counts and "full_ids" in counts:
-            fast_ids = counts.get("fast_ids", set())
-            full_ids = counts["full_ids"]
+        cursor = self._stream_cursor.get(mint, self._token_created_at.get(mint, 0.0))
+        until_ts = cursor + duration_seconds
+        async for trade in self._drain_until(queue, until_ts):
+            yield trade
+        self._stream_cursor[mint] = until_ts
 
-            if phase == 0:
-                # Fast phase
-                self._stream_phase[mint] = 1  # next call = full phase
-                if not fast_ids:
-                    return  # live saw 0 trades in fast → replay sees 0
-                target_ids = fast_ids
-            else:
-                # Full phase: yield trades in full_ids but not in fast_ids
-                target_ids = full_ids - fast_ids
-        else:
-            # No live data — yield all
-            target_ids = None
-            self._stream_phase[mint] = 1
-
-        temp_buffer = []
+    async def _drain_until(
+        self, queue: asyncio.Queue[Trade], until_ts: float
+    ) -> AsyncIterator[Trade]:
+        """Yield trades with timestamp <= until_ts. Keep rest in queue."""
+        temp_buffer: list[Trade] = []
         while not queue.empty():
             try:
                 trade = queue.get_nowait()
-                db_id: int | None = getattr(trade, "_db_id", None)  # type: ignore[assignment]
-
-                if target_ids is not None:
-                    if db_id in target_ids:
-                        yield trade
-                    else:
-                        temp_buffer.append(trade)
-                else:
-                    yield trade
             except asyncio.QueueEmpty:
                 break
+            if trade.timestamp <= until_ts:
+                yield trade
+            else:
+                temp_buffer.append(trade)
+                break
+        for t in temp_buffer:
+            await queue.put(t)
 
+    async def _drain_all(
+        self, queue: asyncio.Queue[Trade], inactivity_timeout: float = 0
+    ) -> AsyncIterator[Trade]:
+        """Yield trades while the inter-trade gap stays within inactivity_timeout.
+
+        Mirrors live stream semantics: after a silence longer than the timeout
+        the consumer treats the token as dead. Remaining trades are put back
+        into the queue so they can be drained by a later call if needed.
+        """
+        last_ts: float | None = None
+        temp_buffer: list[Trade] = []
+        while not queue.empty():
+            try:
+                trade = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if (
+                inactivity_timeout > 0
+                and last_ts is not None
+                and trade.timestamp - last_ts > inactivity_timeout
+            ):
+                temp_buffer.append(trade)
+                while not queue.empty():
+                    try:
+                        temp_buffer.append(queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+                break
+            last_ts = trade.timestamp
+            yield trade
         for t in temp_buffer:
             await queue.put(t)
 
@@ -234,53 +200,21 @@ class ReplayLaunchpad(Launchpad):
     def compute_curve_progress(self, v_sol_in_bonding_curve: float) -> float:
         return min((v_sol_in_bonding_curve / 85.0) * 100.0, 100.0)
 
-    async def _feed_trades(self) -> None:
-        """Background task: read all trades from DB and push to subscriber queues."""
-        conn = sqlite3.connect(self._db_path)
-        conn.row_factory = sqlite3.Row
-        try:
-            cur = conn.execute("SELECT * FROM trades ORDER BY timestamp ASC, id ASC")
-            prev_ts = 0.0
-            for row in cur:
-                if not self._running:
-                    break
-
-                mint = row["mint"]
-                queue = self._trade_queues.get(mint)
-                if queue is None:
-                    continue
-
-                creator = self._token_creators.get(mint, "")
-                trade = Trade(
-                    mint=mint,
-                    wallet=row["wallet"],
-                    tx_type=row["tx_type"],
-                    sol_amount=row["sol_amount"] or 0.0,
-                    token_amount=(
-                        row["token_amount"] if "token_amount" in row.keys() else 0.0
-                    ),
-                    new_token_balance=0.0,
-                    bonding_curve_key="",
-                    v_sol_in_bonding_curve=row["v_sol_in_bonding_curve"] or 0.0,
-                    v_tokens_in_bonding_curve=0.0,
-                    market_cap_sol=row["market_cap_sol"] or 0.0,
-                    timestamp=row["timestamp"],
-                    is_creator=(row["wallet"] == creator),
-                )
-
-                # Simulate time passing
-                if self._speed > 0 and prev_ts > 0:
-                    delay = (trade.timestamp - prev_ts) * self._speed
-                    if delay > 0:
-                        await asyncio.sleep(min(delay, 0.1))
-                prev_ts = trade.timestamp
-
-                await queue.put(trade)
-
-                # Yield control to let pipeline process
-                await asyncio.sleep(0)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            conn.close()
-            logger.info("ReplayLaunchpad feeder done")
+    def _row_to_trade(self, row: sqlite3.Row, mint: str, creator: str) -> Trade:
+        """Convert a DB row to a Trade object."""
+        trade = Trade(
+            mint=mint,
+            wallet=row["wallet"],
+            tx_type=row["tx_type"],
+            sol_amount=row["sol_amount"] or 0.0,
+            token_amount=(row["token_amount"] if "token_amount" in row.keys() else 0.0),
+            new_token_balance=0.0,
+            bonding_curve_key="",
+            v_sol_in_bonding_curve=row["v_sol_in_bonding_curve"] or 0.0,
+            v_tokens_in_bonding_curve=0.0,
+            market_cap_sol=row["market_cap_sol"] or 0.0,
+            timestamp=row["timestamp"],
+            is_creator=(row["wallet"] == creator),
+        )
+        trade._db_id = row["id"]  # type: ignore[attr-defined]
+        return trade

@@ -46,9 +46,31 @@ class PumpFunLaunchpad(Launchpad):
     # ── Lifecycle ──────────────────────────────────────────────
 
     async def connect(self) -> None:
-        """Connect to WS, subscribe to new tokens, start background reader."""
+        """Connect to WS, subscribe to new tokens, start background reader.
+
+        Retries the initial handshake up to 5× with exponential backoff so
+        a transient pump.fun API blip (or local CPU starvation from a
+        concurrent sweep) doesn't kill the bot on startup. Once connected,
+        ``_ws_reader_loop`` handles its own mid-session reconnects.
+        """
         self._running = True
-        await self._establish_connection()
+        attempts = 0
+        while attempts < 5:
+            try:
+                await self._establish_connection()
+                break
+            except Exception as exc:
+                attempts += 1
+                delay = min(2.0 * (2 ** (attempts - 1)), 30.0)
+                logger.warning(
+                    "PumpFun WS connect attempt %d/5 failed (%s); " "retrying in %.1fs",
+                    attempts,
+                    type(exc).__name__,
+                    delay,
+                )
+                if attempts >= 5:
+                    raise
+                await asyncio.sleep(delay)
         self._reader_task = asyncio.create_task(self._ws_reader_loop())
         logger.info("PumpFun WS connected and reader started")
 
@@ -104,7 +126,10 @@ class PumpFunLaunchpad(Launchpad):
         self._token_creators.pop(mint, None)
 
     async def stream_trades(
-        self, mint: str, duration_seconds: float
+        self,
+        mint: str,
+        duration_seconds: float,
+        inactivity_timeout: float = 0,
     ) -> AsyncIterator[Trade]:
         """Yield trades for a mint during the observation window."""
         queue = self._trade_queues.get(mint)
@@ -113,14 +138,21 @@ class PumpFunLaunchpad(Launchpad):
 
         deadline = time.time() + duration_seconds
         creator = self._token_creators.get(mint, "")
+        last_trade_time = time.time()
 
         while time.time() < deadline:
             remaining = deadline - time.time()
             if remaining <= 0:
                 break
+            # Check inactivity
+            if inactivity_timeout > 0:
+                idle = time.time() - last_trade_time
+                if idle >= inactivity_timeout:
+                    break
             try:
                 raw = await asyncio.wait_for(queue.get(), timeout=min(remaining, 2.0))
                 trade = self.parse_trade_event(raw, creator)
+                last_trade_time = time.time()
                 yield trade
             except asyncio.TimeoutError:
                 continue
@@ -128,7 +160,20 @@ class PumpFunLaunchpad(Launchpad):
     # ── Parsing ────────────────────────────────────────────────
 
     def parse_create_event(self, raw: dict) -> Token:
-        """Parse a raw WS create message into a Token."""
+        """Parse a raw WS create message into a Token.
+
+        PumpPortal's WebSocket multiplexes multiple launchpads (pump.fun,
+        letsbonk.fun, PumpSwap, etc.) on one feed, distinguished by the
+        ``pool`` field. Preserve it so downstream datasets can slice by
+        launchpad — previously everything was mislabelled "pumpfun".
+        """
+        pool = raw.get("pool") or "pumpfun"
+        # Canonical internal names: "pumpfun", "letsbonk", or the raw pool
+        # string for any other (rarer) launchpad.
+        launchpad_name = {
+            "pump": "pumpfun",
+            "bonk": "letsbonk",
+        }.get(pool, pool)
         return Token(
             mint=raw.get("mint", ""),
             name=raw.get("name", ""),
@@ -136,7 +181,7 @@ class PumpFunLaunchpad(Launchpad):
             creator=raw.get("traderPublicKey", ""),
             created_at=raw.get("timestamp", time.time()),
             uri=raw.get("uri", ""),
-            launchpad="pumpfun",
+            launchpad=launchpad_name,
         )
 
     def parse_trade_event(self, raw: dict, creator: str) -> Trade:

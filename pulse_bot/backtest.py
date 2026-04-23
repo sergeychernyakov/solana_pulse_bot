@@ -65,7 +65,7 @@ class BacktestEngine:
         self._clock = SimulatedClock()
         self._source = BacktestSource(config.backtest_db_path, self._clock)
         self._fast_filter = FastFilter(config)
-        self._scorer = Scorer(config, db)
+        self._scorer = Scorer(config, None)
         self._execution = SimulatedExecution(config)
         self._portfolio = Portfolio(config)
         self._metrics_calc = MetricsCalculator(graduation_sol=PUMPFUN_GRADUATION_SOL)
@@ -150,7 +150,14 @@ class BacktestEngine:
             token.created_at,
             self._cfg.observe_seconds,
         )
-        full_result = self._scorer.score(token, full_trades) if full_trades else None
+        creator_snapshot = self._db.get_creator_stats_as_of_sync(
+            token.creator, token.mint
+        )
+        full_result = (
+            self._scorer.score(token, full_trades, creator_snapshot=creator_snapshot)
+            if full_trades
+            else None
+        )
 
         # Write to token_scores with source='backtest' (same table as live)
         if full_result:
@@ -169,23 +176,33 @@ class BacktestEngine:
             )
             self._save_score_sync(full_result)
 
-        # Entry decision
+        # Entry decision — check buyer number bounds
         if (
             self._cfg.entry_mode in ("fast", "both")
             and fast_result.decision == "FAST_BUY"
         ):
-            fill = self._execution.simulate_buy(fast_trades)
-            entry_time = token.created_at + self._cfg.fast_observe_seconds
-            return EntryCandidate(token, entry_time, "fast", fill)
+            buyer_num = fast_result.buy_count + 1
+            if (
+                buyer_num >= self._cfg.min_entry_buyer_number
+                and buyer_num <= self._cfg.max_entry_buyer_number
+            ):
+                fill = self._execution.simulate_buy(fast_trades)
+                entry_time = token.created_at + self._cfg.fast_observe_seconds
+                return EntryCandidate(token, entry_time, "fast", fill)
 
         if (
             self._cfg.entry_mode in ("full", "both")
             and full_result
             and full_result.decision == "BUY"
         ):
-            fill = self._execution.simulate_buy(full_trades)
-            entry_time = token.created_at + self._cfg.observe_seconds
-            return EntryCandidate(token, entry_time, "full", fill)
+            buyer_num = full_result.buy_count + 1
+            if (
+                buyer_num >= self._cfg.min_entry_buyer_number
+                and buyer_num <= self._cfg.max_entry_buyer_number
+            ):
+                fill = self._execution.simulate_buy(full_trades)
+                entry_time = token.created_at + self._cfg.observe_seconds
+                return EntryCandidate(token, entry_time, "full", fill)
 
         return None
 
@@ -327,18 +344,37 @@ class BacktestEngine:
         now_ts: float,
         monitors: dict[str, PositionMonitor],
     ) -> None:
-        """Close positions whose max hold time elapsed before the next event."""
+        """Close positions whose max hold time or inactivity timeout elapsed."""
         for mint, pos in list(self._portfolio.positions.items()):
-            if now_ts - pos.entry_time <= self._cfg.exit_max_hold_seconds:
-                continue
             monitor = monitors.get(mint)
             recent = monitor.recent_trades if monitor else []
-            tokens_left = pos.tokens_held * pos.remaining_pct
-            fill = self._execution.simulate_sell(recent, tokens_left)
-            self._portfolio.close_position(
-                mint, fill, pos.entry_time + self._cfg.exit_max_hold_seconds, "timeout"
-            )
-            monitors.pop(mint, None)
+
+            # Max hold timeout
+            if now_ts - pos.entry_time > self._cfg.exit_max_hold_seconds:
+                tokens_left = pos.tokens_held * pos.remaining_pct
+                fill = self._execution.simulate_sell(recent, tokens_left)
+                self._portfolio.close_position(
+                    mint,
+                    fill,
+                    pos.entry_time + self._cfg.exit_max_hold_seconds,
+                    "timeout",
+                )
+                monitors.pop(mint, None)
+                continue
+
+            # Inactivity timeout
+            if self._cfg.exit_inactivity_seconds > 0 and recent:
+                last_trade_ts = recent[-1].timestamp
+                if now_ts - last_trade_ts > self._cfg.exit_inactivity_seconds:
+                    tokens_left = pos.tokens_held * pos.remaining_pct
+                    fill = self._execution.simulate_sell(recent, tokens_left)
+                    self._portfolio.close_position(
+                        mint,
+                        fill,
+                        last_trade_ts + self._cfg.exit_inactivity_seconds,
+                        "dead_token",
+                    )
+                    monitors.pop(mint, None)
 
     def _close_remaining_positions(self) -> None:
         """Force close all open positions at last available price."""

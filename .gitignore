@@ -173,3 +173,8 @@ pulse_bot.db-wal
 *.db-shm
 *.db-wal
 .ruff_cache/
+
+# Session-local + generated artifacts
+data/
+artifacts/
+.claude/scheduled_tasks.lock

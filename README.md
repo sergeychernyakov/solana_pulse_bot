@@ -171,6 +171,121 @@ python main.py monitor
 streamlit run pulse_bot/dashboard.py --server.port 8501
 ```
 
+## ML Models — Цели и параметры
+
+### Главные цели
+
+| Модель | Главная метрика | Текущее | **Цель** |
+|---|---|---|---|
+| **Entry** (binary XGBoost) | **Precision@top-10%** — из топ-10% предсказаний сколько реально winners | **50%** | **>60%** (чтобы покрыть fees+slippage) |
+| **Exit** (binary advisory) | **Recall on decline events** — сколько реальных dump'ов модель поймала заранее | TBD | **>80%** |
+
+Base rate (winner без модели) = **14%** — модель уже в 3.5× лучше случайного, но до прибыли ещё 10-20% рост precision нужен.
+
+### Active features (31 — use by model)
+
+Отсортировано по **gain importance** (сколько деревья их реально используют).
+
+| Feature | Смысл | Gain | Статус |
+|---|---|---|---|
+| `avg_buy_sol` | Средний размер покупки | 43.1 | ✅ Top |
+| `buy_volume_sol` | Общий объём SOL вложено | 42.4 | ✅ Top |
+| `fast_volume_sol` | Объём первые 5 сек | 24.4 | ✅ Top |
+| `top3_buyer_pct` | % у топ-3 покупателей | 24.2 | ✅ Top |
+| `max_buy_sol` | Самая крупная покупка | 21.6 | ✅ Top |
+| `unique_buyers` | Уникальных покупателей | 20.3 | ✅ Top |
+| `creator_median_peak_mc_sol` | Средний пик MC у прошлых токенов creator'а | 20.2 | ✅ Top |
+| `top1_30` | % у #1 холдера на T+30s (Helius) | 18.9 | ✅ Top |
+| `fast_sell_ratio` | Доля продаж в первые 5 сек | 18.7 | ✅ Top |
+| `top1_delta` | Изменение концентрации T+30→T+120 | 18.2 | ✅ Top |
+| `sell_pressure` | sell_count / buy_count | ~17 | ✅ Medium |
+| `total_score` | Hand-tuned scorer output | ~15 | ⚠️ Circular (output rules we replace) |
+| `fast_score` | Hand-tuned fast scorer output | ~14 | ⚠️ Circular |
+| `curve_velocity` | SOL/сек в bonding curve | ~13 | ✅ Medium |
+| `curve_acceleration` | Ускорение curve | ~13 | ✅ Medium |
+| `first_buy_sol` | Размер первой покупки | ~12 | ✅ Medium |
+| `repeat_buyer_count` | Сколько кошельков купили >1 раз | ~12 | ✅ Medium |
+| `buy_size_trend` | Ratio avg 2-й половины / 1-й | ~12 | ✅ Medium |
+| `buy_velocity_trend` | Ratio rate 2-й половины / 1-й | ~12 | ✅ Medium |
+| `time_to_first_buy` | Сек от создания до 1-й покупки | 11.9 | 🔻 Low |
+| `pnl_at_fast_entry_pct` | PnL% если бы вошли на T+5s | 10.4 | 🔻 Low |
+| `creator_age_days` | Возраст кошелька creator'а | 9.7 | 🔻 Low |
+| `buy_diversity` | Сколько разных размеров покупок | 8.7 | 🔻 Low |
+| `hc_30` | Количество холдеров T+30s | 8.4 | 🔻 Low |
+| `concurrent_observations` | Tokens параллельно бот смотрит | 6.8 | 🔻 Low |
+| `top5_30` | % у топ-5 холдеров T+30s | 5.6 | 🔻 Low |
+| `tokens_last_5min` | Активность рынка | ~5 | 🔻 Low |
+| `top1_120`, `top5_120`, `top5_delta` | Helius T+120 snapshots | 3-5 | 🔻 Low |
+| `buy_count` | Число покупок | 2.9 | 🔻 Low |
+| `sell_count` | Число продаж | 2.8 | 🔻 Low |
+
+### Dead features (23 — в schema но не используется ни одним деревом)
+
+**Gain = 0**, безопасно удалить без потери качества. Duplicate-сигналы которые модель игнорирует в пользу других.
+
+| Feature | Смысл | Почему dead |
+|---|---|---|
+| `hour_sin` / `hour_cos` | Час UTC (cyclical encoding) | Время дня не даёт signal |
+| `has_uri` | Есть ли metadata URI | ~100% токенов имеют → 0 variance |
+| `helius_snapshot_complete` | 1 если Helius snapshot получен | Duplicate с hc_30 |
+| `fast_buy_count` | Покупок в первые 5 сек | Duplicate с buy_count |
+| `fast_unique_buyers` | Уникальных в 5 сек | Duplicate с unique_buyers |
+| `median_buy_sol` | Медианная покупка | Duplicate с avg_buy_sol |
+| `sell_volume_sol` | Объём продаж | Модель выбрала buy_volume |
+| `first_half_buy_rate`, `second_half_buy_rate` | Rate по половинам | Raw halves уже в buy_velocity_trend |
+| `avg_first_half_buy_sol`, `avg_second_half_buy_sol` | Средний чек по половинам | Duplicate |
+| `creator_tokens_today` | Сколько токенов dev сегодня | 90% имеют 1-5 → слабый variance |
+| `creator_inter_token_interval_sec` | Интервал между запусками | Duplicate с age |
+| `creator_total_prior_tokens` | Всего токенов у dev'а | Correlated с age |
+| `curve_progress_at_t30/t60/t90` (3) | Форма curve в разных точках | Добавлены 2026-04-23, signal не дали |
+| `time_gap_median_first20` | Интервалы между первыми 20 trades | Добавлена 2026-04-23, signal не дала |
+| `buy_volume_first10s` | Объём SOL в первые 10 сек | Duplicate с buy_volume_sol |
+| `unique_buyers_first30s`, `unique_buyers_last30s` | Уникальные в окнах | Duplicate с unique_buyers |
+| `full_trade_count` | Общее число trades | Duplicate (buy_count+sell_count) |
+
+### Candidate features (не добавлены — wait for data или нужна инфра)
+
+| Feature | Почему не добавили | Effort | Condition для активации |
+|---|---|---|---|
+| `launchpad` (pumpfun / letsbonk / other) | 99.6% pumpfun → 0 variance | 30 мин | Летsbonk накопит ~500+ labeled |
+| `sol_price_usd` | Capture с 2026-04-22, мало данных | 1ч | 5-7 дней накопления |
+| `sol_price_1h_change_pct` | Нужен SOL price history | 2ч | После sol_price accumulation |
+| `mint_authority_revoked` | 30/30 pump.fun auto-revoke → 0 variance | 0 (ready) | При non-pumpfun launchpad |
+| `freeze_authority_revoked` | То же | 0 (ready) | При non-pumpfun launchpad |
+| `buyers_new_wallet_pct` | Helius wallet age per buyer | 4-6ч | При N ≥ 2000 |
+| `buyers_avg_sol_balance` | Helius balance fetch | 4ч | При N ≥ 2000 |
+| `top_buyer_prior_pnl_sum` | Wallet-level PnL индексация | 40-80ч | Долгосрочно |
+| `bundled_buy_fraction` | Tx signature parsing (coord-bot) | 15-25ч | Codex flagged as fragile |
+| `pumpfun_tokens_per_minute_now` | Market heat indicator | 1ч | Future |
+| `tokens_graduated_last_hour` | Graduation heat | 2ч | Future |
+| `creator_active_tokens_now` | Co-trading context (multi-token dev) | 4ч | Future |
+
+### Removed features (пробовали, убрали)
+
+| Feature | Why removed |
+|---|---|
+| `name_length`, `symbol_length`, `is_all_caps`, `has_numbers` | H7 name patterns — 0 signal, removed 2026-04-23 |
+
+### История iteration'ов
+
+| Дата | AUC | Precision@top-10% | Комментарий |
+|---|---|---|---|
+| Initial binary | 0.735 | — | 38 features baseline |
+| +label v2 (fees в labels) | 0.822 | 43% | **Big win** — honest label |
+| +has_uri, market context | 0.740 | 43% | Marginal |
+| Remove circular fast/total_score | 0.724 | — | Codex ablation check |
+| Retroactive backfill (+19 labeled) | 0.777 | 43% | More data, slight lift |
+| +pnl_at_fast_entry_pct + trade_counts | **0.818** | **50%** | **Big lift** — trade partition matters |
+| +7 cheap features (curve/time gaps) | 0.801 | **36%** | ❌ **Overfit at N=661** — все 7 dead |
+
+### Правила feature management
+
+1. **N rows / feature ≥ 20** — нарушили когда добавили 7 cheap features (8 rows/feature) → overfit
+2. **Добавлять по 1-2 за раз** и мерить до/после
+3. **Ablation test** обязателен если features > 30 при N < 1500
+4. **Dead features удаляем** — нет смысла в schema overhead
+5. **Candidate при 0 variance** держать в infrastructure, не добавлять в `ENTRY_FEATURE_ORDER` пока variance не появится
+
 ## Документация
 
 - [Техническая спецификация](./docs/SOLANA_PULSE_BOT_SPEC.md)

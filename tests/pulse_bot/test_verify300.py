@@ -107,18 +107,40 @@ class TestVerifyInfrastructure:
 
         assert "paper_trades" in tables
 
-    def test_max_entry_buyer_number_in_config(self) -> None:
-        """max_entry_buyer_number must be in config."""
+    def test_entry_buyer_number_in_config(self) -> None:
+        """min/max entry buyer number knobs must exist."""
         cfg = PulseBotConfig()
-        assert hasattr(cfg, "max_entry_buyer_number")
+        # min=1 and max=20 per per-trade marginal CI analysis (v4 sweep).
+        # Earlier values (5/50) were based on confounded per-combo averages.
+        assert cfg.min_entry_buyer_number == 1
         assert cfg.max_entry_buyer_number == 20
 
     def test_trailing_stop_in_config(self) -> None:
-        """Trailing stop params must be in config."""
+        """Trailing stop params must be in config; default = enabled."""
         cfg = PulseBotConfig()
         assert cfg.exit_trailing_stop_enabled is True
+        # combo4680 (v10 ROBUST combo — 3/5 folds profitable): act=50, dist=50.
         assert cfg.exit_trailing_stop_activation_pct == 50.0
-        assert cfg.exit_trailing_stop_distance_pct == 30.0
+        assert cfg.exit_trailing_stop_distance_pct == 50.0
+
+    def test_strict_combo_defaults(self) -> None:
+        """Pin numeric defaults. Updated 2026-04-22 after volume-cliff
+        optimizer sweep showed marginal-best axis values reduce
+        per-trade loss from −0.73%% to −0.21%% (still net-negative on
+        pump.fun, but asymptotically closer to zero).
+        """
+        cfg = PulseBotConfig()
+        # Strict combo from 2026-04-22 sweep: score_buy=50, vol≥10 SOL,
+        # unique_buyers≥5, top1 gate disabled, tight SL=15, max_hold=90.
+        assert cfg.score_threshold_buy == 50
+        assert cfg.entry_mode == "both"
+        assert cfg.entry_min_sol_volume_hard == 10.0
+        assert cfg.entry_min_unique_buyers_hard == 5
+        assert cfg.entry_max_top1_holder_pct == 100.0
+        assert cfg.exit_hard_stop_loss_pct == 15.0
+        assert cfg.exit_max_hold_seconds == 90.0
+        assert cfg.exit_take_profit_pct == 100.0
+        assert cfg.exit_inactivity_seconds == 120.0
 
     def test_hard_entry_filters_in_config(self) -> None:
         """Hard entry filters must be in config."""

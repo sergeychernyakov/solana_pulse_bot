@@ -1,31 +1,45 @@
 #!/usr/bin/env bash
 # verify300 — collect 300+ tokens live, verify backtest 100% match, verify provider data
+#
+# Non-destructive: uses a scratch DB (verify300_scratch.db). Never touches
+# the production pulse_bot.db. Safe to run in parallel with the live bot —
+# pump.fun WS supports multiple subscribers.
 set -e
 cd "$(dirname "$0")"
 source .venv/bin/activate
 
+SCRATCH_DB="verify300_scratch.db"
 MIN_TOKENS=300
 COLLECT_SECONDS=1500  # 25 minutes
+KEEP_DB="${KEEP_DB:-0}"  # set KEEP_DB=1 to inspect scratch DB after run
+
+cleanup() {
+    if [ "$KEEP_DB" != "1" ]; then
+        rm -f "$SCRATCH_DB" "${SCRATCH_DB}-shm" "${SCRATCH_DB}-wal"
+    fi
+}
+trap cleanup EXIT
 
 echo "════════════════════════════════════════════════════════════"
 echo "  VERIFY 300: Live → Backtest → Provider Match Test"
+echo "  Scratch DB: $SCRATCH_DB (production pulse_bot.db untouched)"
 echo "════════════════════════════════════════════════════════════"
 
-# Step 1: Fresh DB
+# Step 1: Fresh scratch DB (never touches pulse_bot.db)
 echo ""
-echo "── Step 1: Fresh DB ──"
-rm -f pulse_bot.db
-python -c "from pulse_bot.db import Database; Database('pulse_bot.db').init_schema()"
-echo "  ✓ DB created"
+echo "── Step 1: Fresh scratch DB ──"
+rm -f "$SCRATCH_DB" "${SCRATCH_DB}-shm" "${SCRATCH_DB}-wal"
+python -c "from pulse_bot.db import Database; Database('$SCRATCH_DB').init_schema()"
+echo "  ✓ Scratch DB created: $SCRATCH_DB"
 
-# Step 2: Collect live data
+# Step 2: Collect live data into scratch DB
 echo ""
-echo "── Step 2: Collecting live data (${COLLECT_SECONDS}s)... ──"
-timeout $COLLECT_SECONDS python main.py monitor 2>&1 | tail -3
+echo "── Step 2: Collecting live data (${COLLECT_SECONDS}s) → $SCRATCH_DB ──"
+timeout $COLLECT_SECONDS python main.py monitor --db="$SCRATCH_DB" 2>&1 | tail -3 || true
 
 LIVE_COUNT=$(python -c "
 from pulse_bot.db import Database
-db = Database('pulse_bot.db')
+db = Database('$SCRATCH_DB')
 print(len(db.get_recent_scores(limit=99999, source='live')))
 ")
 echo "  Live tokens scored: $LIVE_COUNT"
@@ -34,10 +48,10 @@ if [ "$LIVE_COUNT" -lt "$MIN_TOKENS" ]; then
     echo "  ⚠ Warning: $LIVE_COUNT < $MIN_TOKENS tokens (market slow). Continuing anyway."
 fi
 
-# Step 3: Verify replay (backtest = live)
+# Step 3: Verify replay (backtest = live) on scratch DB
 echo ""
 echo "── Step 3: Replay verify (backtest = live) ──"
-python main.py verify 2>&1 | tee /tmp/verify300_replay.txt
+python main.py verify --db="$SCRATCH_DB" 2>&1 | tee /tmp/verify300_replay.txt
 
 REPLAY_PERFECT=$(grep -c "100%% PERFECT MATCH" /tmp/verify300_replay.txt || true)
 if [ "$REPLAY_PERFECT" -eq 0 ]; then
@@ -75,42 +89,39 @@ from pulse_bot.filters.scorer import Scorer
 from pulse_bot.pipeline import Pipeline
 from pulse_bot.sources.replay import ReplayLaunchpad
 
+SCRATCH = '$SCRATCH_DB'
+
 async def run():
-    db = Database('pulse_bot.db')
+    db = Database(SCRATCH)
     collector = HeliusCollector()
 
-    # Get mints that live scored with trades
-    conn = sqlite3.connect('pulse_bot.db')
+    conn = sqlite3.connect(SCRATCH)
     conn.row_factory = sqlite3.Row
     mints = [r['mint'] for r in conn.execute(
         'SELECT DISTINCT mint FROM token_scores WHERE source=\"live\" AND buy_count > 0 ORDER BY scored_at DESC LIMIT 50'
     ).fetchall()]
     conn.close()
 
-    # Step 4a: Download trades from Helius into same DB
     log.info('Downloading trades for %d mints from Helius...', len(mints))
-    total = await collector.download_trades_for_mints(mints, 'pulse_bot.db')
+    total = await collector.download_trades_for_mints(mints, SCRATCH)
     log.info('Downloaded %d trades from Helius', total)
 
-    # Step 4b: Clear provider scores, run Pipeline on same DB with source='provider'
-    conn = sqlite3.connect('pulse_bot.db')
+    conn = sqlite3.connect(SCRATCH)
     conn.execute(\"DELETE FROM token_scores WHERE source = 'provider'\")
     conn.commit()
     conn.close()
 
     config = get_config()
-    launchpad = ReplayLaunchpad(config.db_path, speed=0.0)
+    config.db_path = SCRATCH
+    config.backtest_db_path = SCRATCH
+    launchpad = ReplayLaunchpad(SCRATCH, speed=0.0)
     scorer = Scorer(config, db)
     fast_filter = FastFilter(config)
     pipeline = Pipeline(config, db, launchpad, scorer, fast_filter)
     await pipeline.run()
 
-    # Step 4c: Relabel backtest scores as provider (replay wrote source='backtest')
-    conn = sqlite3.connect('pulse_bot.db')
-    # The replay just wrote source='backtest' — rename to 'provider' for these
-    # Actually we need a separate run. Let's compare backtest (which used Helius-enriched trades) with live
+    conn = sqlite3.connect(SCRATCH)
     conn.row_factory = sqlite3.Row
-
     live_rows = {r['mint']: dict(r) for r in conn.execute('SELECT * FROM token_scores WHERE source=\"live\"').fetchall()}
     bt_rows = {r['mint']: dict(r) for r in conn.execute('SELECT * FROM token_scores WHERE source=\"backtest\"').fetchall()}
 

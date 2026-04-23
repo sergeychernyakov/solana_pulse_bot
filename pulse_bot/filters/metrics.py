@@ -35,6 +35,22 @@ class TokenMetrics:
     first_buy_sol: float = 0.0  # first buy amount (large = sniper)
     buy_velocity_trend: float = 0.0  # >1 = accelerating, <1 = decelerating
     buy_size_trend: float = 0.0  # >1 = buys getting larger, <1 = smaller
+    # Raw halves — per codex 2026-04-22: ratio fields above have
+    # denom-floor non-monotonic cliffs; also expose the pre-division
+    # components so the tree can split on them directly.
+    first_half_buy_rate: float = 0.0  # buys/sec in first half of window
+    second_half_buy_rate: float = 0.0  # buys/sec in second half
+    avg_first_half_buy_sol: float = 0.0
+    avg_second_half_buy_sol: float = 0.0
+    # 2026-04-23 feature additions — expose specific patterns the raw
+    # aggregates don't capture. All derivable from the trade stream.
+    time_gap_median_first20: float = 0.0  # low var = bot signature
+    buy_volume_first10s: float = 0.0  # early momentum
+    unique_buyers_first30s: int = 0  # attention window 1
+    unique_buyers_last30s: int = 0  # attention window 2 (end of full obs)
+    curve_progress_at_t30: float = 0.0  # curve shape @ T+30s
+    curve_progress_at_t60: float = 0.0
+    curve_progress_at_t90: float = 0.0
     time_to_first_buy: float = 0.0  # seconds from create to first buy
     buys_per_unique: float = 0.0  # buy_count / unique_buyers (>1.5 = wash)
 
@@ -89,6 +105,12 @@ class MetricsCalculator:
         """Compute all metrics from token data and trade list."""
         m = TokenMetrics()
 
+        # Defensive sort — codex 2026-04-22: ``first_buy_sol``, velocity
+        # trend and curve velocity all implicitly assume chronological
+        # order. Callers usually provide sorted input, but an unsorted
+        # list silently corrupts those features.
+        trades = sorted(trades, key=lambda t: t.timestamp)
+
         buys = [t for t in trades if t.tx_type == "buy"]
         sells = [t for t in trades if t.tx_type == "sell"]
         buy_amounts = [t.sol_amount for t in buys]
@@ -120,12 +142,18 @@ class MetricsCalculator:
             m.first_buy_sol = buy_amounts[0]
 
         # ── Top 3 concentration ────────────────────────────
-        if buys and m.total_buy_volume_sol > 0:
+        # Codex 2026-04-22: return -1.0 sentinel when unique_buyers < 3
+        # to distinguish "concentrated" from "tiny sample" (trivially
+        # 100% if only 2 buyers). Tree splits can learn that -1 means
+        # insufficient data.
+        if buys and m.total_buy_volume_sol > 0 and m.unique_buyers >= 3:
             wallet_volume: dict[str, float] = {}
             for t in buys:
                 wallet_volume[t.wallet] = wallet_volume.get(t.wallet, 0) + t.sol_amount
             top3_vol = sum(sorted(wallet_volume.values(), reverse=True)[:3])
             m.top3_buyer_pct = (top3_vol / m.total_buy_volume_sol) * 100.0
+        elif buys:
+            m.top3_buyer_pct = -1.0
 
         # ── Repeat buyers ──────────────────────────────────
         if buyer_wallets:
@@ -138,7 +166,10 @@ class MetricsCalculator:
         if m.unique_buyers > 0:
             m.buys_per_unique = m.buy_count / m.unique_buyers
 
-        # ── Velocity trend (first half vs second half buy rate) ─
+        # ── Velocity + size half-splits ────────────────────
+        # Keep the ratio fields for backward compat (scorer still reads
+        # them for display), but also expose raw halves so ML doesn't
+        # depend on the capped division. Codex 2026-04-22.
         if len(buys) >= 4:
             mid = len(buys) // 2
             first_half = buys[:mid]
@@ -155,13 +186,16 @@ class MetricsCalculator:
             )
             rate1 = len(first_half) / max(t1, 0.1)
             rate2 = len(second_half) / max(t2, 0.1)
+            m.first_half_buy_rate = rate1
+            m.second_half_buy_rate = rate2
             m.buy_velocity_trend = rate2 / max(rate1, 0.01)
 
-        # ── Buy size trend (avg first half vs avg second half) ─
         if len(buy_amounts) >= 4:
             mid = len(buy_amounts) // 2
             avg_first = statistics.mean(buy_amounts[:mid])
             avg_second = statistics.mean(buy_amounts[mid:])
+            m.avg_first_half_buy_sol = avg_first
+            m.avg_second_half_buy_sol = avg_second
             m.buy_size_trend = avg_second / max(avg_first, 0.000001)
 
         # ── Time to first buy ──────────────────────────────
@@ -233,5 +267,55 @@ class MetricsCalculator:
         # ── Observation timing ─────────────────────────────
         if trades:
             m.observation_seconds = trades[-1].timestamp - trades[0].timestamp
+
+        # ── New features (2026-04-23) ──────────────────────
+        # time_gap_median_first20: bot signature — coordinated bots
+        # fire trades at near-uniform intervals, organic activity is
+        # bursty. Computed on first 20 trades, not all, to catch the
+        # early coordination window.
+        if len(trades) >= 21:
+            first20 = trades[:20]
+            gaps = [
+                first20[i + 1].timestamp - first20[i].timestamp
+                for i in range(len(first20) - 1)
+            ]
+            if gaps:
+                m.time_gap_median_first20 = statistics.median(gaps)
+
+        # buy_volume_first10s: how much SOL went in the first 10 sec.
+        # Captures initial momentum independent of total window size.
+        first10s_end = token.created_at + 10.0
+        m.buy_volume_first10s = sum(
+            t.sol_amount for t in buys if t.timestamp <= first10s_end
+        )
+
+        # unique_buyers_first30s vs last30s: attention trend. If last
+        # window has fewer unique buyers than first, attention fading.
+        first30s_end = token.created_at + 30.0
+        last30s_start = (trades[-1].timestamp - 30.0) if trades else token.created_at
+        m.unique_buyers_first30s = len(
+            {t.wallet for t in buys if t.timestamp <= first30s_end}
+        )
+        m.unique_buyers_last30s = len(
+            {t.wallet for t in buys if t.timestamp >= last30s_start}
+        )
+
+        # curve_progress_at_t30/60/90: snapshot bonding-curve progress
+        # at three fixed ages — captures trajectory shape (fast-ramp
+        # vs slow-start vs late-surge) independent of final progress.
+        def _curve_pct_at(age_sec: float) -> float:
+            target_ts = token.created_at + age_sec
+            # Find last trade at or before target
+            prior = [t for t in trades if t.timestamp <= target_ts]
+            if not prior:
+                return 0.0
+            v_sol = prior[-1].v_sol_in_bonding_curve
+            if v_sol <= 0 or self._graduation_sol <= 0:
+                return 0.0
+            return min((v_sol / self._graduation_sol) * 100.0, 100.0)
+
+        m.curve_progress_at_t30 = _curve_pct_at(30.0)
+        m.curve_progress_at_t60 = _curve_pct_at(60.0)
+        m.curve_progress_at_t90 = _curve_pct_at(90.0)
 
         return m

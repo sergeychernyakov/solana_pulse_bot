@@ -79,12 +79,18 @@ class FastFilter:
         )
 
         # ── Hard rejects ───────────────────────────────────
+        # Shared entry filters (same thresholds as Scorer._apply_rules): mirror
+        # hard rejects here so fast-mode entries respect min_market_cap_sol /
+        # max_sell_pressure_for_entry / min_curve_for_entry. Without this the
+        # fast path bypasses user-configured entry safety limits.
+        mcap_sol = trades[-1].market_cap_sol if trades else 0.0
+        cfg = self._cfg
 
-        if self._cfg.fast_creator_sold_reject and creator_sold:
+        def _reject(reason: str) -> FastResult:
             return FastResult(
                 decision="WAIT",
                 score=0,
-                reasons="creator_sold_fast",
+                reasons=reason,
                 buy_count=buy_count,
                 sell_count=sell_count,
                 unique_buyers=unique_buyers,
@@ -94,6 +100,19 @@ class FastFilter:
                 curve_pct=curve_pct,
                 elapsed=elapsed,
             )
+
+        if cfg.min_market_cap_sol > 0 and mcap_sol < cfg.min_market_cap_sol:
+            return _reject(f"mcap_too_low_{mcap_sol:.0f}")
+        if (
+            cfg.max_sell_pressure_for_entry < 999
+            and sell_ratio > cfg.max_sell_pressure_for_entry
+        ):
+            return _reject(f"sell_pressure_reject_{sell_ratio:.1f}")
+        if cfg.min_curve_for_entry > 0 and curve_pct < cfg.min_curve_for_entry:
+            return _reject(f"curve_too_low_{curve_pct:.0f}%")
+
+        if self._cfg.fast_creator_sold_reject and creator_sold:
+            return _reject("creator_sold_fast")
 
         # ── Scoring ────────────────────────────────────────
 
@@ -139,10 +158,23 @@ class FastFilter:
         else:
             reasons.append(f"curve_high_{curve_pct:.1f}%")
 
-        # Decision
-        decision = (
-            "FAST_BUY" if total_score >= self._cfg.fast_score_threshold else "WAIT"
+        # HARD reject gates (April 2026): reject dead-on-arrival tokens even
+        # if scoring threshold met. 92% of fast=BUY historically went to
+        # full=SKIP (noise); these gates kill most of that tail.
+        fast_hard_min_vol = getattr(self._cfg, "fast_hard_min_volume_sol", 0.0)
+        fast_hard_min_buyers = getattr(self._cfg, "fast_hard_min_unique_buyers", 0)
+        hard_reject = (
+            total_volume < fast_hard_min_vol or unique_buyers < fast_hard_min_buyers
         )
+
+        # Decision
+        if hard_reject:
+            decision = "WAIT"
+            reasons.append(f"hard_reject_vol{total_volume:.2f}_buyers{unique_buyers}")
+        else:
+            decision = (
+                "FAST_BUY" if total_score >= self._cfg.fast_score_threshold else "WAIT"
+            )
 
         return FastResult(
             decision=decision,

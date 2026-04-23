@@ -27,13 +27,21 @@ st.markdown(
 <style>
     .block-container { padding-top: 0.5rem; padding-bottom: 0rem; padding-left: 0.5rem; padding-right: 0.5rem; }
     [data-testid="stMetric"], [data-testid="stMetricValue"], [data-testid="stMetricLabel"] { display: none; }
-    h1, h2, h3 { display: none !important; }
+    h1 { display: none !important; }
+    h3 { font-size: 14px !important; margin: 8px 0 4px 0 !important; padding: 0 !important; }
     .stRadio > div { gap: 0.3rem; }
     .stats-bar { display: flex; gap: 8px; flex-wrap: wrap; margin: 4px 0 8px 0; font-size: 13px; }
-    .stats-bar .stat { background: #1e1e1e; padding: 4px 10px; border-radius: 6px; white-space: nowrap; }
-    .stats-bar .stat b { color: #ccc; }
-    .stat-buy b { color: #4ade80 !important; }
-    .stat-skip b { color: #888 !important; }
+    .stats-bar .stat { background: #e8e8e8; color: #1a1a1a; padding: 4px 10px; border-radius: 6px; white-space: nowrap; }
+    .stats-bar .stat b { color: #1a1a1a; }
+    .stat-buy b { color: #16a34a !important; }
+    .stat-skip b { color: #666 !important; }
+    [data-testid="stAppViewContainer"][data-theme="dark"] .stats-bar .stat,
+    .stApp[data-theme="dark"] .stats-bar .stat,
+    [data-theme="dark"] .stats-bar .stat { background: #1e1e1e; color: #e0e0e0; }
+    [data-testid="stAppViewContainer"][data-theme="dark"] .stats-bar .stat b,
+    .stApp[data-theme="dark"] .stats-bar .stat b,
+    [data-theme="dark"] .stats-bar .stat b { color: #e0e0e0; }
+    [data-theme="dark"] .stat-buy b { color: #4ade80 !important; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -76,6 +84,7 @@ def main() -> None:
 
     # ── P&L summary for BUY tokens ────────────────────────
     if rows:
+        st.subheader("P&L Summary")
         render_pnl_summary(rows)
 
     # ── Charts ─────────────────────────────────────────────
@@ -84,13 +93,15 @@ def main() -> None:
 
     # ── Paper trades ───────────────────────────────────────
     if mode == "Live":
+        st.subheader("Paper Trading")
         render_paper_trades(db)
 
     # ── Token table ────────────────────────────────────────
     if not rows:
         st.info("Waiting for data...")
     else:
-        render_token_table(rows)
+        st.subheader("All Tokens")
+        render_token_table(rows, db)
 
     # ── Auto-refresh ───────────────────────────────────────
     if mode == "Live":
@@ -125,7 +136,7 @@ def render_stats_bar(stats: dict) -> None:
 
 
 def render_pnl_summary(rows: list[dict]) -> None:
-    """Show P&L summary for BUY tokens: sum positive, sum negative, net."""
+    """Show P&L summary for BUY tokens as a compact table."""
     buy_rows = [r for r in rows if r.get("decision") == "BUY"]
     if not buy_rows:
         return
@@ -138,27 +149,35 @@ def render_pnl_summary(rows: list[dict]) -> None:
         ("~100", "pnl_100th_pct"),
     ]
 
-    parts = []
+    pnl_rows = []
     for label, col in labels:
         vals = [r.get(col, 0) or 0 for r in buy_rows if r.get(col, 0)]
         if not vals:
-            parts.append(f'<div class="stat">{label} <b>—</b></div>')
+            pnl_rows.append(
+                {"Entry": label, "Win": 0, "Lose": 0, "W%": "—", "Net%": "—"}
+            )
             continue
+        n_win = sum(1 for v in vals if v > 0)
+        n_lose = sum(1 for v in vals if v < 0)
         pos = sum(v for v in vals if v > 0)
         neg = sum(v for v in vals if v < 0)
         net = pos + neg
-        n_win = sum(1 for v in vals if v > 0)
-        n_lose = sum(1 for v in vals if v < 0)
-        net_cls = "pos" if net >= 0 else "neg"
-        parts.append(
-            f'<div class="stat {net_cls}">{label} '
-            f'<b style="color:#4ade80">+{pos:.0f}%</b>({n_win}) '
-            f'<b style="color:#f87171">{neg:.0f}%</b>({n_lose}) '
-            f"= <b>{net:+.0f}%</b></div>"
+        wr = f"{n_win / len(vals) * 100:.0f}%" if vals else "—"
+        pnl_rows.append(
+            {
+                "Entry": label,
+                "Win": n_win,
+                "Lose": n_lose,
+                "W%": wr,
+                "+Sum%": f"+{pos:.0f}%",
+                "-Sum%": f"{neg:.0f}%",
+                "Net%": f"{net:+.0f}%",
+            }
         )
 
-    st.markdown(
-        f'<div class="stats-bar">{"".join(parts)}</div>', unsafe_allow_html=True
+    pnl_df = pd.DataFrame(pnl_rows)
+    st.dataframe(
+        pnl_df, use_container_width=True, height=38 + 35 * len(pnl_df), hide_index=True
     )
 
 
@@ -210,70 +229,181 @@ def render_charts(rows: list[dict]) -> None:
 
 
 def render_paper_trades(db: Database) -> None:
-    """Show open and recently closed paper trades."""
+    """Show balance summary, open positions, and closed trades tables."""
     open_trades = db.get_paper_trades(status="open")
     closed_trades = db.get_paper_trades(status="closed")
 
     if not open_trades and not closed_trades:
         return
 
-    # Open positions
+    config = get_config()
+
+    # ── Balance summary bar ───────────────────────────────
+    initial_sol = config.portfolio_initial_sol
+    closed_pnl_sol = sum(t.get("pnl_sol", 0) or 0 for t in closed_trades)
+    open_invested = sum(t.get("buy_amount_sol", 0) or 0 for t in open_trades)
+    current_sol = initial_sol + closed_pnl_sol - open_invested
+    total_pnl_sol = closed_pnl_sol
+    total_pnl_pct = (total_pnl_sol / initial_sol * 100) if initial_sol > 0 else 0
+
+    wins = sum(1 for t in closed_trades if (t.get("pnl_pct", 0) or 0) > 0)
+    wr = (wins / len(closed_trades) * 100) if closed_trades else 0
+    pnl_color = "#16a34a" if total_pnl_sol >= 0 else "#dc2626"
+
+    st.markdown(
+        f"""<div class="stats-bar">
+        <div class="stat">Start <b>{initial_sol:.3f} SOL</b></div>
+        <div class="stat">Balance <b>{current_sol:.4f} SOL</b></div>
+        <div class="stat">P&L <b style="color:{pnl_color}">{total_pnl_sol:+.4f} SOL ({total_pnl_pct:+.1f}%)</b></div>
+        <div class="stat">Trades <b>{len(closed_trades)}</b> WR <b>{wr:.0f}%</b> ({wins}/{len(closed_trades)})</div>
+        <div class="stat">Open <b>{len(open_trades)}</b></div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    # Load scoring data for all paper trade mints
+    all_mints = [t["mint"] for t in open_trades + closed_trades if t.get("mint")]
+    scores_by_mint = _load_scores_for_mints(db, all_mints)
+
+    # ── Open positions table ──────────────────────────────
     if open_trades:
-        parts = []
-        total_pnl = sum(t.get("current_pnl_pct", 0) or 0 for t in open_trades)
-        pnl_cls = "pos" if total_pnl >= 0 else "neg"
-        parts.append(f'<div class="stat">Open <b>{len(open_trades)}</b></div>')
-        parts.append(f'<div class="stat {pnl_cls}">P&L <b>{total_pnl:+.0f}%</b></div>')
-        for t in open_trades[:5]:
+        st.caption(f"Open Positions ({len(open_trades)})")
+        now = time.time()
+        open_rows = []
+        for t in open_trades:
             pnl = t.get("current_pnl_pct", 0) or 0
-            cls = "pos" if pnl >= 0 else "neg"
-            hold = time.time() - (t.get("entry_time", 0) or 0)
-            st_entry = f"#{t.get('entry_buyer_number', '?')}"
-            st_buys = f"B:{t.get('total_buys', 0)} S:{t.get('total_sells', 0)}"
-            parts.append(
-                f'<div class="stat {cls}">'
-                f'{t.get("symbol", "?")} {st_entry} '
-                f"<b>{pnl:+.0f}%</b> {fmt_age(hold)} {st_buys}"
-                f"</div>"
+            hold = now - (t.get("entry_time", 0) or 0)
+            sc = scores_by_mint.get(t.get("mint", ""), {})
+            open_rows.append(
+                {
+                    "Sym": t.get("symbol", "?"),
+                    "Type": t.get("entry_type", "?"),
+                    "Score": t.get("entry_score", 0),
+                    "Fast": sc.get("fast_decision", "—"),
+                    "Full": sc.get("decision", "—"),
+                    "Uniq": sc.get("unique_buyers", 0),
+                    "Vol": f"{sc.get('buy_volume_sol', 0) or 0:.1f}",
+                    "Entry$": fmt_price(t.get("entry_price", 0) or 0),
+                    "Buyer#": t.get("entry_buyer_number", 0),
+                    "Now$": fmt_price(t.get("current_price", 0) or 0),
+                    "P&L%": f"{pnl:+.1f}%",
+                    "Hold": fmt_age(hold),
+                    "B/S": f"{t.get('total_buys', 0)}/{t.get('total_sells', 0)}",
+                    "SOL": f"{t.get('buy_amount_sol', 0):.3f}",
+                }
             )
-        st.markdown(
-            f'<div class="stats-bar">{"".join(parts)}</div>', unsafe_allow_html=True
+        open_df = pd.DataFrame(open_rows)
+
+        def _color_open(row: pd.Series) -> list[str]:
+            pnl_val = float(row["P&L%"].replace("%", "").replace("+", ""))
+            if pnl_val > 0:
+                i = min(pnl_val / 100, 1.0)
+                return [
+                    f"background-color: rgba(34,197,94,{0.08 + 0.22 * i}); color: #166534"
+                ] * len(row)
+            if pnl_val < 0:
+                i = min(abs(pnl_val) / 100, 1.0)
+                return [
+                    f"background-color: rgba(239,68,68,{0.08 + 0.22 * i}); color: #991b1b"
+                ] * len(row)
+            return [""] * len(row)
+
+        st.dataframe(
+            open_df.style.apply(_color_open, axis=1),
+            use_container_width=True,
+            height=min(len(open_df) * 35 + 38, 300),
+            hide_index=True,
         )
 
-    # Closed trades
+    # ── Closed trades table ───────────────────────────────
     if closed_trades:
-        recent = closed_trades[:10]
-        parts = []
-        wins = sum(1 for t in closed_trades if (t.get("pnl_pct", 0) or 0) > 0)
-        total_pnl = sum(t.get("pnl_pct", 0) or 0 for t in closed_trades)
-        total_sol = sum(t.get("pnl_sol", 0) or 0 for t in closed_trades)
-        pnl_cls = "pos" if total_pnl >= 0 else "neg"
-        parts.append(
-            f'<div class="stat">Closed <b>{len(closed_trades)}</b> WR <b>{wins}/{len(closed_trades)}</b></div>'
-        )
-        parts.append(
-            f'<div class="stat {pnl_cls}">Net <b>{total_pnl:+.0f}%</b> <b>{total_sol:+.4f} SOL</b></div>'
-        )
-        for t in recent:
+        st.caption(f"Closed Trades ({len(closed_trades)})")
+        closed_rows = []
+        for t in closed_trades[:50]:
             pnl = t.get("pnl_pct", 0) or 0
-            cls = "pos" if pnl >= 0 else "neg"
+            pnl_s = t.get("pnl_sol", 0) or 0
             hold = t.get("hold_seconds", 0) or 0
-            reason = t.get("exit_reason", "?")
-            entry_n = t.get("entry_buyer_number", "?")
-            exit_n = t.get("exit_buyer_number", "?")
-            parts.append(
-                f'<div class="stat {cls}">'
-                f'{t.get("symbol", "?")} #{entry_n}→{exit_n} '
-                f"<b>{pnl:+.0f}%</b> {fmt_age(hold)} {reason}"
-                f"</div>"
+            sc = scores_by_mint.get(t.get("mint", ""), {})
+            closed_rows.append(
+                {
+                    "Sym": t.get("symbol", "?"),
+                    "Type": t.get("entry_type", "?"),
+                    "Score": t.get("entry_score", 0),
+                    "Fast": sc.get("fast_decision", "—"),
+                    "Full": sc.get("decision", "—"),
+                    "Uniq": sc.get("unique_buyers", 0),
+                    "Vol": f"{sc.get('buy_volume_sol', 0) or 0:.1f}",
+                    "Entry$": fmt_price(t.get("entry_price", 0) or 0),
+                    "In#": t.get("entry_buyer_number", 0),
+                    "Exit$": fmt_price(t.get("exit_price", 0) or 0),
+                    "Out#": t.get("exit_buyer_number", 0),
+                    "Reason": t.get("exit_reason", "?"),
+                    "P&L%": f"{pnl:+.1f}%",
+                    "P&L SOL": f"{pnl_s:+.5f}",
+                    "Hold": fmt_age(hold),
+                }
             )
-        st.markdown(
-            f'<div class="stats-bar">{"".join(parts)}</div>', unsafe_allow_html=True
+        closed_df = pd.DataFrame(closed_rows)
+
+        def _color_closed(row: pd.Series) -> list[str]:
+            pnl_val = float(row["P&L%"].replace("%", "").replace("+", ""))
+            if pnl_val > 0:
+                i = min(pnl_val / 100, 1.0)
+                return [
+                    f"background-color: rgba(34,197,94,{0.08 + 0.22 * i}); color: #166534"
+                ] * len(row)
+            if pnl_val < 0:
+                i = min(abs(pnl_val) / 100, 1.0)
+                return [
+                    f"background-color: rgba(239,68,68,{0.08 + 0.22 * i}); color: #991b1b"
+                ] * len(row)
+            return [""] * len(row)
+
+        st.dataframe(
+            closed_df.style.apply(_color_closed, axis=1),
+            use_container_width=True,
+            height=min(len(closed_df) * 35 + 38, 500),
+            hide_index=True,
         )
 
 
-def render_token_table(rows: list[dict]) -> None:
-    """Render scored tokens as a colored dataframe."""
+def render_token_table(rows: list[dict], db: Database | None = None) -> None:
+    """Render scored tokens as a colored dataframe with filter + pagination."""
+    total_rows = len(rows)
+    rows = sorted(rows, key=lambda r: r.get("scored_at", 0) or 0, reverse=True)
+
+    f_col, p_col, info_col = st.columns([2, 1, 2])
+    with f_col:
+        decision_filter = st.selectbox(
+            "Decision",
+            ["All", "BUY", "BORDERLINE", "SKIP"],
+            index=0,
+            label_visibility="collapsed",
+        )
+    with p_col:
+        page_size_label = st.selectbox(
+            "Page",
+            ["50", "200", "500", "2000", "All"],
+            index=1,
+            label_visibility="collapsed",
+        )
+
+    if decision_filter != "All":
+        rows = [r for r in rows if r.get("decision") == decision_filter]
+
+    filtered_count = len(rows)
+    page_size = filtered_count if page_size_label == "All" else int(page_size_label)
+    rows = rows[:page_size]
+
+    with info_col:
+        st.caption(
+            f"Showing {len(rows)} of {filtered_count} filtered ({total_rows} total)"
+        )
+
+    if not rows:
+        st.info("No tokens match the current filter.")
+        return
+
     df = pd.DataFrame(rows)
 
     # Computed columns
@@ -325,6 +455,13 @@ def render_token_table(rows: list[dict]) -> None:
     df["pnl20"] = df.get("pnl_20th_pct", z).apply(fmt_pnl)
     df["score_f"] = df["total_score"].apply(lambda s: f"{s:+d}")
 
+    # Paper trade status per mint
+    traded_mints: dict[str, str] = {}
+    if db is not None:
+        for t in db.get_paper_trades():
+            traded_mints[t["mint"]] = t.get("status", "?")
+    df["traded"] = df["mint"].apply(lambda m: traded_mints.get(m, "—"))
+
     # Select and rename
     display_df = df[
         [
@@ -349,6 +486,7 @@ def render_token_table(rows: list[dict]) -> None:
             "pnl5",
             "pnl10",
             "pnl20",
+            "traded",
         ]
     ].copy()
 
@@ -375,6 +513,7 @@ def render_token_table(rows: list[dict]) -> None:
             "~5",
             "~10",
             "~20",
+            "Trade",
         ]
     )
 
@@ -402,30 +541,33 @@ def render_token_table(rows: list[dict]) -> None:
                 break
 
         if full == "BORDERLINE":
-            return ["background-color: #3a3a1a; color: #facc15"] * len(row)
+            return ["background-color: rgba(250,204,21,0.15); color: #a16207"] * len(
+                row
+            )
 
         if pnl > 0:
-            # Brighter green for bigger gains: +10% = mild, +100% = vivid
             intensity = min(pnl / 100, 1.0)
-            bg_g = int(30 + 50 * intensity)
-            fg_g = int(160 + 95 * intensity)
+            alpha = 0.08 + 0.22 * intensity
             return [
-                f"background-color: #{26:02x}{bg_g:02x}{26:02x}; color: #{74:02x}{fg_g:02x}{128:02x}"
+                f"background-color: rgba(34,197,94,{alpha:.2f}); color: #166534"
             ] * len(row)
         if pnl < 0:
-            # Brighter red for bigger losses: -10% = mild, -100% = vivid
             intensity = min(abs(pnl) / 100, 1.0)
-            bg_r = int(30 + 50 * intensity)
-            fg_r = int(160 + 95 * intensity)
+            alpha = 0.08 + 0.22 * intensity
             return [
-                f"background-color: #{bg_r:02x}{26:02x}{26:02x}; color: #{fg_r:02x}{113:02x}{113:02x}"
+                f"background-color: rgba(239,68,68,{alpha:.2f}); color: #991b1b"
             ] * len(row)
         return [""] * len(row)
 
-    styled = display_df.style.apply(color_row, axis=1)
+    cell_count = len(display_df) * len(display_df.columns)
+    data_for_render = (
+        display_df.style.apply(color_row, axis=1)
+        if cell_count <= 200_000
+        else display_df
+    )
 
     st.dataframe(
-        styled,
+        data_for_render,
         use_container_width=True,
         height=min(len(display_df) * 35 + 38, 700),
         hide_index=True,
@@ -440,6 +582,28 @@ def render_token_table(rows: list[dict]) -> None:
 
 
 # ── Helpers ────────────────────────────────────────────────────
+
+
+def _load_scores_for_mints(db: Database, mints: list[str]) -> dict[str, dict]:
+    """Load token_scores for a list of mints. Returns {mint: score_dict}."""
+    import sqlite3
+
+    if not mints:
+        return {}
+    conn = sqlite3.connect(db.db_path)
+    conn.row_factory = sqlite3.Row
+    result: dict[str, dict] = {}
+    for mint in mints:
+        row = conn.execute(
+            "SELECT fast_decision, fast_score, decision, total_score, "
+            "unique_buyers, buy_volume_sol, curve_progress_pct, sell_pressure "
+            "FROM token_scores WHERE mint=? AND source='live' LIMIT 1",
+            (mint,),
+        ).fetchone()
+        if row:
+            result[mint] = dict(row)
+    conn.close()
+    return result
 
 
 def format_ts(ts: float) -> str:

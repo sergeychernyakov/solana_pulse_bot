@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
-# qa — run all tests and quality checks for pulse_bot
+# qa — run all tests and quality checks.
+# If invoked from a project that has its own ./qa, delegate to it.
+# Otherwise run the pulse_bot checks below.
 # Usage:
-#   ./qa          — quick checks (pre-commit, ~5 sec)
-#   ./qa --full   — quick + verify300 integration test (~25 min)
+#   qa            — quick checks (pre-commit, ~5 sec)
+#   qa --full     — quick + verify300 integration test (~25 min)
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+LOCAL_QA="$PWD/qa"
+if [ -x "$LOCAL_QA" ] && [ "$LOCAL_QA" != "$SELF" ]; then
+    exec "$LOCAL_QA" "$@"
+fi
+
 cd "$(dirname "$0")"
 source .venv/bin/activate
 

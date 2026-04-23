@@ -33,9 +33,21 @@ class Scorer:
         tokens_last_5min: int = 0,
         concurrent_observations: int = 0,
         creator_snapshot: CreatorStats | None = None,
+        creator_tokens_today: int | None = None,
+        holder_snapshot: dict | None = None,
     ) -> ScoringResult:
-        """Compute all metrics, run scoring rules, produce decision."""
-        creator_tokens_today = self._db.get_creator_tokens_today_sync(token.creator)
+        """Compute all metrics, run scoring rules, produce decision.
+
+        `creator_tokens_today` may be passed by the optimizer to reflect the
+        value as-of the token's creation date during a historical replay; when
+        None we fall back to the live "today" count from the DB.
+        """
+        if creator_tokens_today is None:
+            creator_tokens_today = (
+                self._db.get_creator_tokens_today_sync(token.creator)
+                if self._db is not None
+                else 0
+            )
 
         m = self._metrics.compute(
             token,
@@ -53,7 +65,7 @@ class Scorer:
         creator_reason_local = ""
 
         for rule_score, rule_reason, is_reject, is_creator in self._apply_rules(
-            m, token, trades, creator_snapshot
+            m, token, trades, creator_snapshot, holder_snapshot
         ):
             total_score += rule_score
             reasons.append(rule_reason)
@@ -106,6 +118,17 @@ class Scorer:
             first_buy_sol=m.first_buy_sol,
             buy_velocity_trend=m.buy_velocity_trend,
             buy_size_trend=m.buy_size_trend,
+            first_half_buy_rate=m.first_half_buy_rate,
+            second_half_buy_rate=m.second_half_buy_rate,
+            avg_first_half_buy_sol=m.avg_first_half_buy_sol,
+            avg_second_half_buy_sol=m.avg_second_half_buy_sol,
+            time_gap_median_first20=m.time_gap_median_first20,
+            buy_volume_first10s=m.buy_volume_first10s,
+            unique_buyers_first30s=m.unique_buyers_first30s,
+            unique_buyers_last30s=m.unique_buyers_last30s,
+            curve_progress_at_t30=m.curve_progress_at_t30,
+            curve_progress_at_t60=m.curve_progress_at_t60,
+            curve_progress_at_t90=m.curve_progress_at_t90,
             time_to_first_buy=m.time_to_first_buy,
             buys_per_unique=m.buys_per_unique,
             # Curve
@@ -149,6 +172,7 @@ class Scorer:
         token: Token,
         trades: list[Trade],
         creator_snapshot: CreatorStats | None = None,
+        holder_snapshot: dict | None = None,
     ):
         """Generator of (score, reason, is_hard_reject, is_creator) tuples."""
         cfg = self._cfg
@@ -169,22 +193,139 @@ class Scorer:
         ):
             yield 0, f"curve_too_low_{m.curve_progress_pct:.0f}%", True, False
             return
+        # Rug-filter hard gates (all default-off; optimizer tunes them).
+        if (
+            cfg.entry_min_unique_buyers_hard > 0
+            and m.unique_buyers < cfg.entry_min_unique_buyers_hard
+        ):
+            yield 0, f"uniq_buyers_low_{m.unique_buyers}", True, False
+            return
+        if (
+            cfg.entry_min_sol_volume_hard > 0
+            and m.total_buy_volume_sol < cfg.entry_min_sol_volume_hard
+        ):
+            yield 0, f"sol_vol_low_{m.total_buy_volume_sol:.2f}", True, False
+            return
+        if (
+            cfg.entry_min_velocity_accel > 0
+            and m.buy_velocity_trend < cfg.entry_min_velocity_accel
+        ):
+            yield 0, f"velocity_fade_{m.buy_velocity_trend:.2f}", True, False
+            return
+        if (
+            cfg.entry_min_curve_velocity > 0
+            and m.curve_velocity < cfg.entry_min_curve_velocity
+        ):
+            yield 0, f"curve_vel_low_{m.curve_velocity:.3f}", True, False
+            return
+        if m.curve_acceleration < cfg.entry_min_curve_acceleration:
+            yield 0, f"curve_accel_low_{m.curve_acceleration:.3f}", True, False
+            return
+        max_curve_accel = getattr(cfg, "entry_max_curve_acceleration", 100.0)
+        if max_curve_accel < 100.0 and m.curve_acceleration > max_curve_accel:
+            yield 0, f"curve_accel_high_{m.curve_acceleration:.3f}", True, False
+            return
+        if (
+            cfg.entry_max_top3_buyer_pct < 100
+            and m.top3_buyer_pct > cfg.entry_max_top3_buyer_pct
+        ):
+            yield 0, f"top3_concentrated_{m.top3_buyer_pct:.1f}", True, False
+            return
+        max_creator_today = getattr(cfg, "creator_max_tokens_today", 1000)
+        if max_creator_today < 1000 and m.creator_tokens_today > max_creator_today:
+            yield 0, f"creator_spammer_{m.creator_tokens_today}", True, False
+            return
+        # Helius holder concentration hard gates (Apr 2026). Applied only
+        # when a snapshot is available (live path captures T+30; backtest
+        # joins with token_holders_snapshots at replay time). Absent
+        # snapshot = skip gate (neutral).
+        holder = holder_snapshot
+        if holder is not None:
+            h_top1 = holder.get("top1_pct")
+            h_top5 = holder.get("top5_pct")
+            h_d1 = holder.get("top1_delta_pct")
+            max_top1 = getattr(cfg, "entry_max_top1_holder_pct", 100.0)
+            max_top5 = getattr(cfg, "entry_max_top5_holder_pct", 100.0)
+            max_d1 = getattr(cfg, "entry_max_top1_delta_pct", 100.0)
+            min_d1 = getattr(cfg, "entry_min_top1_delta_pct", -100.0)
+            if max_top1 < 100.0 and h_top1 is not None and h_top1 > max_top1:
+                yield 0, f"holder_top1_{h_top1:.1f}", True, False
+                return
+            if max_top5 < 100.0 and h_top5 is not None and h_top5 > max_top5:
+                yield 0, f"holder_top5_{h_top5:.1f}", True, False
+                return
+            # Delta gates (positive delta = dev buying more → likely rug).
+            if h_d1 is not None:
+                if max_d1 < 100.0 and h_d1 > max_d1:
+                    yield 0, f"holder_delta1_high_{h_d1:+.1f}", True, False
+                    return
+                if min_d1 > -100.0 and h_d1 < min_d1:
+                    yield 0, f"holder_delta1_low_{h_d1:+.1f}", True, False
+                    return
 
-        # ── Creator (snapshot is local param, no shared state) ──
-        stats = (
-            creator_snapshot
-            if creator_snapshot
-            else self._db.get_creator_stats_sync(token.creator)
-        )
+        # Creator snapshot is always provided by the caller (pipeline /
+        # optimizer / backtest) as a leak-free as-of view anchored on
+        # ROWID. We never fall back to the cumulative ``creators`` table
+        # here — that would leak future upserts back into entry scoring
+        # and desynchronise live from replay.
+        stats = creator_snapshot
         if stats and stats.blacklisted:
             yield 0, "creator_blacklisted", True, True
             return
+        # Snapshot-based hard gates (#58). Only fire if snapshot has enough
+        # prior tokens to be statistically meaningful — avoids rejecting
+        # brand-new creators on a sample of 1.
+        if (
+            stats is not None
+            and stats.snapshot_prior_tokens >= cfg.creator_snapshot_min_priors
+        ):
+            if (
+                cfg.creator_rug_rate_reject < 1.0
+                and stats.rug_rate >= cfg.creator_rug_rate_reject
+            ):
+                yield (
+                    0,
+                    f"creator_rug_rate_{stats.rug_rate:.2f}",
+                    True,
+                    True,
+                )
+                return
+            if (
+                cfg.creator_min_graduation_rate > 0.0
+                and stats.graduation_rate < cfg.creator_min_graduation_rate
+            ):
+                yield (
+                    0,
+                    f"creator_grad_rate_low_{stats.graduation_rate:.2f}",
+                    True,
+                    True,
+                )
+                return
+            if (
+                cfg.creator_min_age_days > 0.0
+                and stats.creator_age_days < cfg.creator_min_age_days
+            ):
+                yield (
+                    0,
+                    f"creator_too_new_{stats.creator_age_days:.1f}d",
+                    True,
+                    True,
+                )
+                return
         if stats and stats.total_tokens_created > cfg.creator_serial_threshold:
             reason = f"serial_creator({stats.total_tokens_created}tok)"
             yield -5, reason, False, True
         elif stats and stats.total_tokens_created > 1:
             reason = f"clean_creator({stats.total_tokens_created}tok)"
             yield 10, reason, False, True
+        # Soft bonus: creator has graduated tokens before (from snapshot).
+        if (
+            stats is not None
+            and stats.snapshot_prior_tokens >= cfg.creator_snapshot_min_priors
+            and stats.graduation_rate > 0.0
+        ):
+            bonus = min(20, int(stats.graduation_rate * 30))
+            yield bonus, f"creator_graduated_{stats.graduation_rate:.2f}", False, True
 
         # ── Unique buyers ──────────────────────────────────
         if m.unique_buyers >= 30:

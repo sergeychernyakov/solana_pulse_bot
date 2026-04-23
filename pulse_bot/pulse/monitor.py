@@ -30,6 +30,14 @@ class PulseSnapshot:
     trend_declining_count: int  # consecutive declining windows
     curve_progress_pct: float
     window_events: int  # how many events in window
+    # Peak buy_rate observed since monitor start; combined with buy_rate
+    # lets ExitManager detect momentum fade relative to the token's own
+    # history rather than an absolute threshold.
+    peak_buy_rate: float = 0.0
+    # Ratio current/peak: 1.0 = still at peak, 0.3 = dropped 70%.
+    buy_rate_drop_from_peak: float = 1.0
+    # Max single-trade sell SOL in window (for whale-exit threshold tuning).
+    max_sell_sol: float = 0.0
 
 
 class PulseMonitor:
@@ -46,6 +54,7 @@ class PulseMonitor:
         self._prev_buy_rate: float | None = None
         self._prev_avg_buy: float | None = None
         self._trend_declining_count: int = 0
+        self._peak_buy_rate: float = 0.0
 
     def update(self, trade: Trade) -> PulseSnapshot | None:
         """Add trade to window. Returns snapshot if enough events, else None."""
@@ -77,11 +86,9 @@ class PulseMonitor:
             t.is_creator and t.tx_type == "sell" for t in self._window
         )
 
-        # Whale exit
-        whale_exit = any(
-            t.sol_amount > self._cfg.pulse_whale_exit_sol and t.tx_type == "sell"
-            for t in sells
-        )
+        # Whale exit + max sell size (latter exposed for whale threshold tuning)
+        max_sell_sol = max((t.sol_amount for t in sells), default=0.0)
+        whale_exit = max_sell_sol > self._cfg.pulse_whale_exit_sol
 
         # Trends
         buy_rate_trend = self._compute_trend(buy_rate, self._prev_buy_rate)
@@ -94,6 +101,10 @@ class PulseMonitor:
 
         self._prev_buy_rate = buy_rate
         self._prev_avg_buy = avg_buy
+        self._peak_buy_rate = max(self._peak_buy_rate, buy_rate)
+        drop_from_peak = (
+            buy_rate / self._peak_buy_rate if self._peak_buy_rate > 0 else 1.0
+        )
 
         # Curve
         curve_pct = 0.0
@@ -118,6 +129,9 @@ class PulseMonitor:
             trend_declining_count=self._trend_declining_count,
             curve_progress_pct=curve_pct,
             window_events=len(self._window),
+            peak_buy_rate=self._peak_buy_rate,
+            buy_rate_drop_from_peak=drop_from_peak,
+            max_sell_sol=max_sell_sol,
         )
 
     def _compute_trend(self, current: float, previous: float | None) -> str:
