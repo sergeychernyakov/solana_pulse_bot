@@ -132,6 +132,29 @@ def build_entry_dataset(
     # hc_velocity = holders added per second between T+30 and T+120
     # (90-second window). Positive = growing, negative = exiting.
     base["hc_velocity"] = (base["hc_120"] - base["hc_30"]) / 90.0
+    # Phase B derived features — mirror extract_entry_features logic so
+    # train and serve see identical values.
+    base["top5_minus_top1_120"] = base["top5_120"] - base["top1_120"]
+    base["top10_minus_top5_120"] = base["top10_120"] - base["top5_120"]
+    base["buy_vol_to_sell_vol_ratio"] = base["buy_volume_sol"] / (
+        base["sell_volume_sol"] + 0.01
+    )
+    base["buy_count_to_sell_count_ratio"] = base["buy_count"] / (
+        base["sell_count"] + 1.0
+    )
+    base["hc_growth_ratio"] = base["hc_120"] / (base["hc_30"] + 1.0)
+    # Phase C derived — mirror extract_entry_features.
+    import numpy as _np_c
+
+    base["buy_size_growth"] = base["max_buy_sol"] / (base["avg_buy_sol"] + 0.001)
+    base["fast_to_full_volume_ratio"] = base["fast_volume_sol"] / (
+        base["buy_volume_sol"] + 0.01
+    )
+    base["log_market_cap"] = _np_c.log(
+        _np_c.maximum(base["market_cap_sol"], 0.0) + 1.0
+    )
+    full_rate = base["buy_count"] / 90.0
+    base["fast_buy_rate_to_full"] = base["fast_buy_rate"] / (full_rate + 0.001)
 
     # TODO(Phase A2): market-context features. Implement when scorer.py
     # grows a MarketSnapshot helper that captures same values at live
@@ -154,7 +177,6 @@ def build_entry_dataset(
                inter_token_interval_sec AS creator_inter_token_interval_sec,
                total_prior_tokens AS creator_total_prior_tokens,
                creator_balance_sol,
-               rug_count AS creator_rug_count,
                graduated_count AS creator_graduated_count
         FROM creator_snapshots
         """,
@@ -208,7 +230,6 @@ def build_entry_dataset(
             "creator_inter_token_interval_sec",
             "creator_total_prior_tokens",
             "creator_balance_sol",
-            "creator_rug_count",
             "creator_graduated_count",
         ]
         for c in creator_cols:

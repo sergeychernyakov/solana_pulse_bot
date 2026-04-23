@@ -105,10 +105,28 @@ SCORER_FEATURES: list[str] = [
     # scorer.py has market-snapshot plumbing.
 ]
 
-# Derived from ``hour_utc`` (cyclical encoding — see codex v9 P2 fix).
+# Derived features — computed at extraction time from other fields.
+# Train/serve parity is automatic because the derivation lives in
+# ``extract_entry_features``; both dataset build and live inference
+# call the same function.
 DERIVED_FEATURES: list[str] = [
     "hour_sin",
     "hour_cos",
+    # Phase B (derived, 2026-04-24): concentration slices and volume
+    # ratios. All from existing SCORER + HELIUS fields — safe to add
+    # without scorer.py changes.
+    "top5_minus_top1_120",       # Mid-tier (holders #2-5) concentration
+    "top10_minus_top5_120",      # Outer tier (holders #6-10) — HIGHEST gain
+    "buy_vol_to_sell_vol_ratio", # Imbalance on SOL volume
+    "buy_count_to_sell_count_ratio",  # Imbalance on trade count
+    "hc_growth_ratio",           # hc_120 / (hc_30 + 1) — growth factor
+    # Phase C (derived, 2026-04-24): ratios and log-scaled MC.
+    "buy_size_growth",           # max_buy_sol / (avg_buy_sol + 0.001)
+    # `repeat_buyer_fraction` DROPPED: UNSTABLE nz=2/5 on first run.
+    # Keep at protocol level — doesn't add stable signal.
+    "fast_to_full_volume_ratio", # fast_volume_sol / (buy_volume_sol + 0.01)
+    "log_market_cap",            # log(market_cap_sol + 1) — skew normalisation
+    "fast_buy_rate_to_full",     # fast_buy_rate / (buy_count / 90 + 0.001)
 ]
 
 # Helius holder snapshot features. Captured post-discovery at T+30 and
@@ -169,11 +187,11 @@ CREATOR_FEATURES: list[str] = [
     "creator_inter_token_interval_sec",
     "creator_total_prior_tokens",
     "creator_balance_sol",
-    # 2026-04-23 v9 additions — raw integer counts. Avoid the divide-by-N
-    # smearing of rug_rate / graduation_rate: when total_prior_tokens=0,
-    # the ratio collapses to 0 which masks "no data" as "clean record".
-    # Raw counts encode both presence and magnitude unambiguously.
-    "creator_rug_count",
+    # 2026-04-24 v13 cleanup: removed `creator_rug_count` — STABLE_DEAD
+    # in TWO sequential schema versions (entry_v11 and entry_v12 runs,
+    # gain=0 across 5 seeds each time). Per feature-stability protocol,
+    # safe to remove. `creator_graduated_count` stays — only one DEAD
+    # reading so far (needs 2 consecutive to drop).
     "creator_graduated_count",
 ]
 
@@ -188,7 +206,7 @@ ENTRY_FEATURE_ORDER: list[str] = [
 
 # Bumped on any schema change. Prediction path refuses to load models
 # whose meta.json reports a different version.
-FEATURE_SCHEMA_VERSION: str = "entry_v11_20260424"
+FEATURE_SCHEMA_VERSION: str = "entry_v13_20260424"
 
 
 # ── Exit classifier ────────────────────────────────────────────────
@@ -316,6 +334,27 @@ def extract_entry_features(
     feats["hour_sin"], feats["hour_cos"] = _cyclical_hour(h)
     for name in HELIUS_FEATURES:
         feats[name] = _get(holder_snapshot, name) if holder_snapshot else 0.0
+    # Phase B derived features — pure functions of scorer + helius fields.
+    # Small epsilon on denominators to avoid ZeroDivisionError; XGBoost
+    # sees the inflated value near zero as a distinct split signal.
+    feats["top5_minus_top1_120"] = feats["top5_120"] - feats["top1_120"]
+    feats["top10_minus_top5_120"] = feats["top10_120"] - feats["top5_120"]
+    feats["buy_vol_to_sell_vol_ratio"] = feats["buy_volume_sol"] / (
+        feats["sell_volume_sol"] + 0.01
+    )
+    feats["buy_count_to_sell_count_ratio"] = feats["buy_count"] / (
+        feats["sell_count"] + 1.0
+    )
+    feats["hc_growth_ratio"] = feats["hc_120"] / (feats["hc_30"] + 1.0)
+    # Phase C derived — ratios & log-scale.
+    feats["buy_size_growth"] = feats["max_buy_sol"] / (feats["avg_buy_sol"] + 0.001)
+    feats["fast_to_full_volume_ratio"] = feats["fast_volume_sol"] / (
+        feats["buy_volume_sol"] + 0.01
+    )
+    feats["log_market_cap"] = math.log(max(feats["market_cap_sol"], 0.0) + 1.0)
+    # fast_buy_rate vs full-window average rate (buy_count / 90s)
+    full_rate = feats["buy_count"] / 90.0
+    feats["fast_buy_rate_to_full"] = feats["fast_buy_rate"] / (full_rate + 0.001)
     for name in CREATOR_FEATURES:
         # CreatorStats + creator_snapshots use INCONSISTENT naming:
         # some fields keep the ``creator_`` prefix (``creator_age_days``,
