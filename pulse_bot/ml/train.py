@@ -36,6 +36,17 @@ def load_df(path: Path) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
+# Codex Q4 #1 recommendation (2026-04-23): regression head trains against
+# realized_pnl_pct (continuous) rather than binary label (sign only). Every
+# labeled row now carries magnitude information, so gradients use 5-10×
+# more signal per example. Label column is ``realized_pnl_pct`` — already
+# computed by build_entry_dataset alongside binary label, so no dataset
+# rebuild required. Guardrail: values clipped to [-100, +300] to avoid
+# rare extreme rows dominating MSE.
+PNL_CLIP_LO = -100.0
+PNL_CLIP_HI = 300.0
+
+
 def split_chronological(
     df: pd.DataFrame, time_col: str, train_frac: float = 0.8
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -204,11 +215,22 @@ def train_entry(data_path: Path, model_out: Path, split: str = "chrono") -> dict
     raw = booster.get_score(importance_type="gain")
     importance = dict(sorted(raw.items(), key=lambda x: -x[1])[:15])
 
+    # Bootstrap 95% CIs (codex 2026-04-23) — point estimates at N_test=100
+    # are ±10pp noise; CI is the only honest way to report them.
+    auc_lo, auc_hi = _bootstrap_ci(proba_test, y_test.values, "auc")
+    prec_lo, prec_hi = _bootstrap_ci(proba_test, y_test.values, "precision_top10")
+
     logger.info("=" * 60)
     logger.info("ENTRY MODEL RESULTS")
-    logger.info("  AUC (holdout):         %.4f", auc)
+    logger.info(
+        "  AUC (holdout):         %.4f   95%% CI [%.3f, %.3f]",
+        auc, auc_lo, auc_hi,
+    )
     logger.info("  Base rate (test):      %.2f%%", y_test.mean() * 100)
-    logger.info("  Precision at top 10%%:  %.2f%%", precision_top10 * 100)
+    logger.info(
+        "  Precision at top 10%%:  %.2f%%   95%% CI [%.0f%%, %.0f%%]",
+        precision_top10 * 100, prec_lo * 100, prec_hi * 100,
+    )
     logger.info("  Top-15 features:")
     for f, v in importance.items():
         logger.info("    %.4f  %s", v, f)
@@ -224,7 +246,9 @@ def train_entry(data_path: Path, model_out: Path, split: str = "chrono") -> dict
                 "features": feature_cols,
                 "schema_version": FEATURE_SCHEMA_VERSION,
                 "auc": auc,
+                "auc_ci95": [auc_lo, auc_hi],
                 "precision_top10": precision_top10,
+                "precision_top10_ci95": [prec_lo, prec_hi],
                 "base_rate": float(y_test.mean()),
                 "train_rows": len(train_df),
                 "val_rows": len(val_df),
@@ -244,6 +268,306 @@ def train_entry(data_path: Path, model_out: Path, split: str = "chrono") -> dict
     }
 
 
+def train_entry_regression(
+    data_path: Path, model_out: Path, split: str = "chrono"
+) -> dict:
+    """Train XGBoost regressor on realized_pnl_pct target.
+
+    Codex Q4 #1 recommendation: use magnitude of realized PnL as target
+    instead of sign-only binary label. Each example now contributes
+    ordered signal (how much up, how much down), so the gradient carries
+    5-10× more information per row without enlarging the dataset.
+
+    Confidence gating maps naturally onto PnL thresholds:
+        predicted_pnl >= PNL_CEILING → BUY (high-EV)
+        predicted_pnl <  PNL_FLOOR   → SKIP (high negative-EV)
+        else                         → RULES (defer to rule scorer)
+
+    Target clipped to [-100%, +300%] to protect MSE from rare moonshots.
+    """
+    df = load_df(data_path)
+    if "realized_pnl_pct" not in df.columns:
+        raise ValueError(
+            "entry.parquet missing 'realized_pnl_pct' — rebuild via "
+            "pulse_bot.ml.build_dataset (codex Q4 #1 added this column)."
+        )
+    # Drop rows without realized PnL (DOA tokens) — build_dataset already
+    # drops them via dropna(subset=['label']) but we defend here anyway.
+    df = df.dropna(subset=["realized_pnl_pct"])
+    logger.info(
+        "Entry regression dataset: %d rows, PnL mean=%.2f%% median=%.2f%%",
+        len(df),
+        df.realized_pnl_pct.mean(),
+        df.realized_pnl_pct.median(),
+    )
+
+    from pulse_bot.ml.features import (ENTRY_FEATURE_ORDER,
+                                       FEATURE_SCHEMA_VERSION)
+
+    missing = [c for c in ENTRY_FEATURE_ORDER if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"entry.parquet missing canonical features {missing}. "
+            "Rebuild via build_dataset before training."
+        )
+    feature_cols = list(ENTRY_FEATURE_ORDER)
+
+    if split == "random":
+        logger.warning(
+            "RANDOM SPLIT — regression AUC analogue leaks regime. "
+            "Use --split chrono for honest numbers."
+        )
+        np.random.seed(42)
+        idx = np.random.permutation(len(df))
+        cut = int(len(df) * 0.8)
+        train_df = df.iloc[idx[:cut]]
+        test_df = df.iloc[idx[cut:]]
+        val_df = test_df.iloc[: len(test_df) // 2]
+        test_df = test_df.iloc[len(test_df) // 2 :]
+    else:
+        df = df.sort_values("scored_at").reset_index(drop=True)
+        n = len(df)
+        train_end = int(n * 0.70)
+        val_end = int(n * 0.85)
+        train_df = df.iloc[:train_end]
+        val_df = df.iloc[train_end:val_end]
+        test_df = df.iloc[val_end:]
+    logger.info(
+        "Regression split (%s): train=%d val=%d test=%d",
+        split,
+        len(train_df),
+        len(val_df),
+        len(test_df),
+    )
+
+    # Clip target to stabilize MSE against long-tail outliers.
+    y_train = train_df["realized_pnl_pct"].clip(PNL_CLIP_LO, PNL_CLIP_HI).values
+    y_val = val_df["realized_pnl_pct"].clip(PNL_CLIP_LO, PNL_CLIP_HI).values
+    y_test = test_df["realized_pnl_pct"].clip(PNL_CLIP_LO, PNL_CLIP_HI).values
+    X_train = train_df[feature_cols]
+    X_val = val_df[feature_cols]
+    X_test = test_df[feature_cols]
+
+    model = xgb.XGBRegressor(
+        n_estimators=300,
+        max_depth=3,
+        min_child_weight=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        objective="reg:squarederror",
+        eval_metric="rmse",
+        early_stopping_rounds=30,
+        random_state=42,
+    )
+    model.fit(
+        X_train,
+        y_train,
+        eval_set=[(X_val, y_val)],
+        verbose=False,
+    )
+
+    pred_val = model.predict(X_val)
+    pred_test = model.predict(X_test)
+
+    # Regression metrics
+    from sklearn.metrics import mean_absolute_error, mean_squared_error
+    from scipy.stats import spearmanr
+
+    rmse = float(np.sqrt(mean_squared_error(y_test, pred_test)))
+    mae = float(mean_absolute_error(y_test, pred_test))
+    spearman_rho, _ = spearmanr(pred_test, y_test)
+    spearman_rho = float(spearman_rho) if not np.isnan(spearman_rho) else 0.0
+
+    # AUC-equivalent: can the model rank winners above losers?
+    # Treat realized_pnl > 0 as positive for ranking metric.
+    y_test_binary = (y_test > 0).astype(int)
+    auc = (
+        roc_auc_score(y_test_binary, pred_test)
+        if y_test_binary.sum() not in (0, len(y_test_binary))
+        else float("nan")
+    )
+
+    # Precision at top 10% by predicted PnL
+    k = max(1, len(pred_test) // 10)
+    top_idx = pred_test.argsort()[::-1][:k]
+    precision_top10 = float(y_test_binary[top_idx].mean())
+    avg_pnl_top10 = float(y_test[top_idx].mean())
+
+    # PnL thresholds tuned on val
+    thresholds = _search_pnl_thresholds(pred_val, y_val)
+    logger.info(
+        "PnL-gating thresholds (val-tuned): FLOOR=%.2f%% CEILING=%.2f%%",
+        thresholds["floor"],
+        thresholds["ceiling"],
+    )
+    logger.info(
+        "  below FLOOR: n=%d avg_pnl=%.2f%% WR=%.1f%%",
+        thresholds["floor_n"],
+        thresholds["floor_avg_pnl"],
+        thresholds["floor_wr"] * 100,
+    )
+    logger.info(
+        "  above CEILING: n=%d avg_pnl=%.2f%% WR=%.1f%%",
+        thresholds["ceiling_n"],
+        thresholds["ceiling_avg_pnl"],
+        thresholds["ceiling_wr"] * 100,
+    )
+
+    test_metrics = _evaluate_gated_regression(pred_test, y_test, thresholds)
+    logger.info(
+        "Test gating: BUY n=%d avg_pnl=%.2f%% WR=%.1f%% | "
+        "SKIP n=%d avg_pnl=%.2f%% | RULES n=%d avg_pnl=%.2f%%",
+        test_metrics["buy_n"],
+        test_metrics["buy_avg_pnl"],
+        test_metrics["buy_wr"] * 100,
+        test_metrics["skip_n"],
+        test_metrics["skip_avg_pnl"],
+        test_metrics["rules_n"],
+        test_metrics["rules_avg_pnl"],
+    )
+
+    booster = model.get_booster()
+    raw_imp = booster.get_score(importance_type="gain")
+    importance = dict(sorted(raw_imp.items(), key=lambda x: -x[1])[:15])
+
+    logger.info("=" * 60)
+    logger.info("ENTRY REGRESSION MODEL RESULTS")
+    logger.info("  RMSE (holdout):        %.3f%%", rmse)
+    logger.info("  MAE  (holdout):        %.3f%%", mae)
+    logger.info("  Spearman ρ:            %.4f", spearman_rho)
+    logger.info("  AUC (sign ranking):    %.4f", auc)
+    logger.info("  Precision @ top 10%%:   %.2f%%", precision_top10 * 100)
+    logger.info("  Avg PnL @ top 10%%:     %.2f%%", avg_pnl_top10)
+    logger.info("  Top-15 features:")
+    for f, v in importance.items():
+        logger.info("    %.4f  %s", v, f)
+    logger.info("=" * 60)
+
+    model.save_model(model_out)
+    logger.info("Saved regression model to %s", model_out)
+    meta_out = model_out.with_suffix(".meta.json")
+    meta_out.write_text(
+        json.dumps(
+            {
+                "objective": "reg:squarederror",
+                "features": feature_cols,
+                "schema_version": FEATURE_SCHEMA_VERSION,
+                "rmse": rmse,
+                "mae": mae,
+                "spearman_rho": spearman_rho,
+                "auc_sign": auc,
+                "precision_top10": precision_top10,
+                "avg_pnl_top10": avg_pnl_top10,
+                "base_rate": float(y_test_binary.mean()),
+                "pnl_clip_lo": PNL_CLIP_LO,
+                "pnl_clip_hi": PNL_CLIP_HI,
+                "train_rows": len(train_df),
+                "val_rows": len(val_df),
+                "test_rows": len(test_df),
+                "confidence_thresholds": thresholds,
+                "test_gated": test_metrics,
+            },
+            indent=2,
+        )
+    )
+    return {
+        "rmse": rmse,
+        "mae": mae,
+        "spearman_rho": spearman_rho,
+        "precision_top10": precision_top10,
+        "thresholds": thresholds,
+        "test_gated": test_metrics,
+    }
+
+
+def _search_pnl_thresholds(
+    pred: "np.ndarray",
+    realized_pnl: "np.ndarray",
+    min_bucket: int = 30,
+) -> dict:
+    """Grid-search PNL_FLOOR / PNL_CEILING on a validation set.
+
+    FLOOR: predicted-PnL threshold below which the observed WR is lowest
+    (filter out high-confidence losers). CEILING: threshold above which
+    the observed avg PnL + WR peaks.
+
+    Grid covers [-20%, +30%] in 5pp steps — wide enough to capture the
+    natural FAST_BUY base-rate window (~27% WR, avg ~-2% PnL).
+    """
+    grid = np.arange(-20.0, 30.01, 5.0)
+    realized_binary = (realized_pnl > 0).astype(int)
+
+    best_floor = 0.0
+    best_floor_wr = 1.0
+    for t in grid:
+        mask = pred < t
+        if mask.sum() < min_bucket:
+            continue
+        wr = float(realized_binary[mask].mean())
+        if wr < best_floor_wr:
+            best_floor_wr = wr
+            best_floor = float(t)
+
+    best_ceiling = 10.0
+    best_ceiling_score = -1e9  # combined WR + avg_pnl
+    for t in grid:
+        mask = pred >= t
+        if mask.sum() < min_bucket:
+            continue
+        wr = float(realized_binary[mask].mean())
+        avg_pnl = float(realized_pnl[mask].mean())
+        score = wr + avg_pnl / 100.0  # WR weighted + small magnitude bias
+        if score > best_ceiling_score:
+            best_ceiling_score = score
+            best_ceiling = float(t)
+
+    below = pred < best_floor
+    above = pred >= best_ceiling
+    return {
+        "floor": best_floor,
+        "ceiling": best_ceiling,
+        "floor_n": int(below.sum()),
+        "floor_wr": float(realized_binary[below].mean()) if below.sum() else 0.0,
+        "floor_avg_pnl": (
+            float(realized_pnl[below].mean()) if below.sum() else 0.0
+        ),
+        "ceiling_n": int(above.sum()),
+        "ceiling_wr": float(realized_binary[above].mean()) if above.sum() else 0.0,
+        "ceiling_avg_pnl": (
+            float(realized_pnl[above].mean()) if above.sum() else 0.0
+        ),
+        "min_bucket": min_bucket,
+        "grid_step": 5.0,
+    }
+
+
+def _evaluate_gated_regression(
+    pred: "np.ndarray",
+    realized_pnl: "np.ndarray",
+    thresholds: dict,
+) -> dict:
+    """Report BUY/SKIP/RULES bucket sizes + avg PnL + WR on held-out test."""
+    pred = np.asarray(pred, dtype=float)
+    realized_pnl = np.asarray(realized_pnl, dtype=float)
+    realized_binary = (realized_pnl > 0).astype(int)
+    buy = pred >= thresholds["ceiling"]
+    skip = pred < thresholds["floor"]
+    rules = (~buy) & (~skip)
+    return {
+        "buy_n": int(buy.sum()),
+        "buy_avg_pnl": float(realized_pnl[buy].mean()) if buy.sum() else 0.0,
+        "buy_wr": float(realized_binary[buy].mean()) if buy.sum() else 0.0,
+        "skip_n": int(skip.sum()),
+        "skip_avg_pnl": float(realized_pnl[skip].mean()) if skip.sum() else 0.0,
+        "skip_wr": float(realized_binary[skip].mean()) if skip.sum() else 0.0,
+        "rules_n": int(rules.sum()),
+        "rules_avg_pnl": float(realized_pnl[rules].mean()) if rules.sum() else 0.0,
+        "rules_wr": float(realized_binary[rules].mean()) if rules.sum() else 0.0,
+        "test_avg_pnl": float(realized_pnl.mean()) if len(realized_pnl) else 0.0,
+    }
+
+
 def _search_confidence_thresholds(
     proba: "np.ndarray",
     y: "np.ndarray",
@@ -255,13 +579,16 @@ def _search_confidence_thresholds(
     CEILING: choose proba value such that ``above-ceiling`` bucket is at
     least ``min_bucket`` samples and has the highest empirical WR.
 
-    Hyperparameters intentionally coarse — val set will be tiny (15% of
-    661 ≈ 99 rows, ~18 positives). Finer grids would overfit.
+    Codex 2026-04-23: widened from min_bucket=10 + 0.05 grid to
+    min_bucket=30 + 0.1 grid to reduce selection bias on small val sets
+    (previous tuning showed val CEILING WR 43% collapsed to 32% on test
+    — a classic max-over-noise positive bias). Coarser grid + wider
+    bucket mean we can't *tune* to a narrow spike of ~18 positives.
     """
     import numpy as np
 
-    min_bucket = max(10, int(0.1 * len(proba)))
-    grid = np.linspace(0.10, 0.90, 17)  # 0.05 steps
+    min_bucket = 30
+    grid = np.arange(0.10, 0.91, 0.1)  # 0.1 steps, 9 points
     base_wr = float(y.mean()) if len(y) else 0.0
 
     # FLOOR: seek low WR below threshold.
@@ -297,6 +624,8 @@ def _search_confidence_thresholds(
         "ceiling_n": int(above.sum()),
         "ceiling_wr": float(y[above].mean()) if above.sum() else 0.0,
         "val_base_rate": base_wr,
+        "min_bucket": min_bucket,
+        "grid_step": 0.1,
     }
 
 
@@ -304,27 +633,72 @@ def _fit_platt(proba: "np.ndarray", y: "np.ndarray") -> dict:
     """Platt scaling: fit 1-D logistic regression proba_raw → label.
 
     Returns {a, b} such that calibrated_proba = sigmoid(a*raw + b).
-    Uses pure numpy to avoid a sklearn dependency at inference time.
+
+    Codex 2026-04-23: switched from handrolled gradient descent to
+    sklearn.LogisticRegression(C=1.0). Previous implementation had no
+    convergence check, no regularization, and could diverge on the ~18-
+    positive val sample — producing extreme a/b that made sigmoid output
+    unreliable. sklearn is already imported elsewhere in train.py for
+    roc_auc_score, so no new dependency surface.
     """
     import numpy as np
+    from sklearn.linear_model import LogisticRegression
 
     x = np.asarray(proba, dtype=float).reshape(-1, 1)
-    yv = np.asarray(y, dtype=float).reshape(-1)
+    yv = np.asarray(y, dtype=int).reshape(-1)
     if yv.sum() == 0 or yv.sum() == len(yv):
-        # Degenerate case — identity calibration.
         return {"a": 1.0, "b": 0.0, "note": "degenerate"}
-    # Gradient descent. For such small N this is adequate.
-    a, b = 1.0, 0.0
-    lr, steps = 0.5, 500
-    for _ in range(steps):
-        z = a * x.ravel() + b
-        p = 1.0 / (1.0 + np.exp(-z))
-        err = p - yv
-        ga = float((err * x.ravel()).mean())
-        gb = float(err.mean())
-        a -= lr * ga
-        b -= lr * gb
-    return {"a": float(a), "b": float(b)}
+    # C=1.0 is standard sklearn default (moderate L2). For N~99 and
+    # 1 feature, the risk is over-regularized coefficients — acceptable
+    # trade for a well-conditioned fit. solver='lbfgs' is deterministic.
+    clf = LogisticRegression(C=1.0, solver="lbfgs", max_iter=200)
+    clf.fit(x, yv)
+    return {
+        "a": float(clf.coef_[0, 0]),
+        "b": float(clf.intercept_[0]),
+        "source": "sklearn.LogisticRegression(C=1.0)",
+    }
+
+
+def _bootstrap_ci(
+    arr: "np.ndarray", y: "np.ndarray", metric: str,
+    n_boot: int = 500, alpha: float = 0.05, seed: int = 42,
+) -> tuple[float, float]:
+    """Percentile bootstrap CI for a metric computed over paired arrays.
+
+    Codex 2026-04-23 requirement: stop reporting point estimates without
+    uncertainty bars at N_test=100. Returns ``(lo, hi)`` 95% CI.
+    Supported ``metric``: "auc", "precision_top10", "base_rate".
+    """
+    import numpy as np
+    from sklearn.metrics import roc_auc_score
+
+    rng = np.random.default_rng(seed)
+    n = len(arr)
+    if n == 0:
+        return (float("nan"), float("nan"))
+    vals: list[float] = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, size=n)
+        a = arr[idx]
+        yb = y[idx]
+        if yb.sum() == 0 or yb.sum() == n:
+            continue
+        if metric == "auc":
+            vals.append(float(roc_auc_score(yb, a)))
+        elif metric == "precision_top10":
+            k = max(1, n // 10)
+            top_idx = a.argsort()[::-1][:k]
+            vals.append(float(yb[top_idx].mean()))
+        elif metric == "base_rate":
+            vals.append(float(yb.mean()))
+        else:
+            raise ValueError(f"Unknown metric: {metric}")
+    if not vals:
+        return (float("nan"), float("nan"))
+    lo = float(np.quantile(vals, alpha / 2))
+    hi = float(np.quantile(vals, 1 - alpha / 2))
+    return lo, hi
 
 
 def _evaluate_gated(
@@ -472,6 +846,15 @@ def main() -> None:
         help="chrono = honest (default). random = DEBUG ONLY, AUC leaks "
         "regime; codex v9 audit forbids citing it as generalization.",
     )
+    ap.add_argument(
+        "--objective",
+        choices=["classification", "regression"],
+        default="classification",
+        help="classification = binary label (legacy). regression = "
+        "realized_pnl_pct target (codex Q4 #1; uses magnitude for 5-10x "
+        "more gradient information per row). Writes a separate model "
+        "file (entry_model_reg.ubj) so both can coexist.",
+    )
     args = ap.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -488,7 +871,12 @@ def main() -> None:
         if data is None:
             logger.error("No entry.parquet or entry.csv in %s", data_dir)
             sys.exit(1)
-        train_entry(data, data_dir / "entry_model.ubj", split=args.split)
+        if args.objective == "regression":
+            train_entry_regression(
+                data, data_dir / "entry_model_reg.ubj", split=args.split
+            )
+        else:
+            train_entry(data, data_dir / "entry_model.ubj", split=args.split)
 
     if args.dataset in ("exit", "both"):
         data = next(

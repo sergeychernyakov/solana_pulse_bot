@@ -131,6 +131,10 @@ class Scorer:
             curve_progress_at_t90=m.curve_progress_at_t90,
             time_to_first_buy=m.time_to_first_buy,
             buys_per_unique=m.buys_per_unique,
+            # 2026-04-23 v11 — collected but NOT yet in ENTRY_FEATURE_ORDER
+            # (codex: premature at N=661 / 118 positives, wait for N_pos ≥ 250).
+            median_time_between_buys=m.median_time_between_buys,
+            buy_wallet_entropy=m.buy_wallet_entropy,
             # Curve
             curve_progress_pct=m.curve_progress_pct,
             curve_velocity=m.curve_velocity,

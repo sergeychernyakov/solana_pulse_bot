@@ -222,6 +222,25 @@ class PulseBotConfig:
     exit_weak_pulse_min_profit_pct: float = 50.0
     exit_moonbag_pct: float = 0.10
 
+    # ── EXIT ML ACTIVATION (codex Q4 Phase B, 2026-04-23) ──
+    # Exit model was shadow-logged via ``ExitManager.ml_exit_proba`` for
+    # weeks. Activating it under a conservative single-threshold policy:
+    # if enabled AND the advisor returns proba >= threshold, escalate
+    # ``hold`` → ``sell_all`` with reason ``ml_exit_trigger``. Never
+    # overrides hard rules (creator_dump, hard_stop, timeout, etc.) — those
+    # are checked FIRST. Never softens a rule-based sell (ML cannot hold
+    # us in a rug). Disabled by default so the bot only changes behavior
+    # when ops explicitly opts in via PULSE_EXIT_ML_ACTIVE=1.
+    exit_ml_active: bool = False
+    # Conservative default 0.80 — calibrated so that only very confident
+    # "definitely sell now" signals trigger. Tune after shadow analysis
+    # of ml_exit_proba distribution on held positions.
+    exit_ml_sell_threshold: float = 0.80
+    # Optional minimum hold guard (seconds) to prevent ML from flipping
+    # us out of a position the moment we enter — e.g., MEV bot buys
+    # triggering premature "drop coming" prediction. Set to 0 to disable.
+    exit_ml_min_hold_seconds: float = 15.0
+
     # ── BACKTEST ───────────────────────────────────────────
     # Source DB for `main.py backtest` replay; defaults to live DB.
     backtest_db_path: str = "pulse_bot.db"
@@ -253,6 +272,12 @@ def get_config() -> PulseBotConfig:
             "collector_only",
             lambda v: v.lower() in ("1", "true", "yes"),
         ),
+        "PULSE_EXIT_ML_ACTIVE": (
+            "exit_ml_active",
+            lambda v: v.lower() in ("1", "true", "yes"),
+        ),
+        "PULSE_EXIT_ML_SELL_THRESHOLD": ("exit_ml_sell_threshold", float),
+        "PULSE_EXIT_ML_MIN_HOLD_SECONDS": ("exit_ml_min_hold_seconds", float),
     }
     for env_key, target in env_map.items():
         val = os.environ.get(env_key)

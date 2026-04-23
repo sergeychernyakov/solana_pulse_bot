@@ -132,3 +132,77 @@ def test_advisor_failure_does_not_crash(tmp_path: Path) -> None:
 def test_exit_signal_default_ml_proba_is_none() -> None:
     s = ExitSignal(action="hold", reason="x", sell_pct=0.0)
     assert s.ml_exit_proba is None
+
+
+# ── Exit ML activation (codex Q4 Phase B, 2026-04-23) ──
+
+class _FakeHighConfAdvisor:
+    """ML advisor that always returns a very high sell proba."""
+
+    def predict_proba(self, state, pulse) -> float:
+        return 0.95
+
+
+class _FakeLowConfAdvisor:
+    """ML advisor that always returns a low sell proba."""
+
+    def predict_proba(self, state, pulse) -> float:
+        return 0.10
+
+
+def test_ml_escalates_hold_to_sell_when_active_and_confident() -> None:
+    cfg = PulseBotConfig(
+        exit_ml_active=True,
+        exit_ml_sell_threshold=0.80,
+        exit_ml_min_hold_seconds=10.0,
+    )
+    mgr = ExitManager(cfg, ml_advisor=_FakeHighConfAdvisor())
+    signal = mgr.decide(_pulse(), pnl_pct=5.0, elapsed_sec=30.0)
+    assert signal.action == "sell_all"
+    assert signal.reason == "ml_exit_trigger"
+    assert signal.ml_exit_proba == 0.95
+
+
+def test_ml_does_not_escalate_when_inactive() -> None:
+    cfg = PulseBotConfig(exit_ml_active=False)
+    mgr = ExitManager(cfg, ml_advisor=_FakeHighConfAdvisor())
+    signal = mgr.decide(_pulse(), pnl_pct=5.0, elapsed_sec=30.0)
+    assert signal.action == "hold"
+    assert signal.ml_exit_proba == 0.95
+
+
+def test_ml_does_not_escalate_below_threshold() -> None:
+    cfg = PulseBotConfig(exit_ml_active=True, exit_ml_sell_threshold=0.80)
+    mgr = ExitManager(cfg, ml_advisor=_FakeLowConfAdvisor())
+    signal = mgr.decide(_pulse(), pnl_pct=5.0, elapsed_sec=30.0)
+    assert signal.action == "hold"
+    assert signal.ml_exit_proba == 0.10
+
+
+def test_ml_respects_min_hold_seconds() -> None:
+    cfg = PulseBotConfig(
+        exit_ml_active=True,
+        exit_ml_sell_threshold=0.80,
+        exit_ml_min_hold_seconds=60.0,
+    )
+    mgr = ExitManager(cfg, ml_advisor=_FakeHighConfAdvisor())
+    # elapsed < min_hold → no escalation
+    signal = mgr.decide(_pulse(), pnl_pct=5.0, elapsed_sec=5.0)
+    assert signal.action == "hold"
+    # elapsed >= min_hold → escalation
+    signal = mgr.decide(_pulse(), pnl_pct=5.0, elapsed_sec=70.0)
+    assert signal.action == "sell_all"
+    assert signal.reason == "ml_exit_trigger"
+
+
+def test_ml_never_overrides_hard_rules_even_when_active() -> None:
+    cfg = PulseBotConfig(
+        exit_ml_active=True,
+        exit_ml_sell_threshold=0.80,
+        exit_ml_min_hold_seconds=0.0,
+    )
+    mgr = ExitManager(cfg, ml_advisor=_FakeLowConfAdvisor())
+    # Creator dump fires regardless of ML preferring hold
+    s = mgr.decide(_pulse(creator_selling=True), pnl_pct=0.0, elapsed_sec=30.0)
+    assert s.action == "sell_all"
+    assert s.reason == "creator_dump"

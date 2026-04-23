@@ -133,7 +133,7 @@ class ExitManager:
 
         available = self._remaining_pct - self._cfg.exit_moonbag_pct
         if available <= 0.01:
-            return self._hold(ml_proba)
+            return self._maybe_ml_escalate(pnl_pct, elapsed_sec, ml_proba)
 
         # Strong profit → take partial
         if pnl_pct > self._cfg.exit_profit_threshold_pct and not self._has_taken_profit:
@@ -149,6 +149,33 @@ class ExitManager:
             sell_pct = min(self._cfg.exit_partial_on_weak_pulse_pct, available)
             return self._sell_partial(sell_pct, "weak_pulse_profit", ml_proba)
 
+        return self._maybe_ml_escalate(pnl_pct, elapsed_sec, ml_proba)
+
+    def _maybe_ml_escalate(
+        self,
+        pnl_pct: float,
+        elapsed_sec: float,
+        ml_proba: float | None,
+    ) -> ExitSignal:
+        """Escalate ``hold`` → ``sell_all`` when ML is highly confident.
+
+        Only called at spots where the rule-based decision is ``hold`` —
+        i.e., no stronger rule fired. This is the ONLY path by which the
+        exit ML influences action (codex Q4 Phase B activation). The rule
+        set above remains the safety floor: creator_dump, hard_stop,
+        timeout, whale_exit, etc. always dominate.
+
+        Protected by ``exit_ml_min_hold_seconds`` to prevent the model
+        from flipping us out of a fresh position on MEV noise.
+        """
+        cfg = self._cfg
+        if (
+            getattr(cfg, "exit_ml_active", False)
+            and ml_proba is not None
+            and ml_proba >= getattr(cfg, "exit_ml_sell_threshold", 0.80)
+            and elapsed_sec >= getattr(cfg, "exit_ml_min_hold_seconds", 15.0)
+        ):
+            return self._sell_all("ml_exit_trigger", ml_proba)
         return self._hold(ml_proba)
 
     def _sell_all(self, reason: str, ml_proba: float | None = None) -> ExitSignal:

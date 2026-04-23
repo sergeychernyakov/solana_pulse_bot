@@ -32,9 +32,25 @@ from pulse_bot.ml.features import (ENTRY_FEATURE_ORDER, EXIT_FEATURE_ORDER,
 logger = logging.getLogger(__name__)
 
 DEFAULT_ENTRY_MODEL_PATH = Path("data/ml/entry_model.ubj")
+DEFAULT_ENTRY_REG_MODEL_PATH = Path("data/ml/entry_model_reg.ubj")
 DEFAULT_ENTRY_THRESHOLD = 0.5
 DEFAULT_EXIT_MODEL_PATH = Path("data/ml/exit_model.ubj")
 DEFAULT_EXIT_THRESHOLD = 0.5
+
+
+def _resolve_entry_model_path() -> Path:
+    """Pick entry model based on ``PULSE_ML_OBJECTIVE`` env var.
+
+    ``classification`` (default) → entry_model.ubj (binary).
+    ``regression``              → entry_model_reg.ubj (realized_pnl_pct).
+
+    Codex Q4 #1 (2026-04-23): regression head uses realized-PnL magnitude
+    instead of sign-only label — same dataset, richer gradient.
+    """
+    obj = os.environ.get("PULSE_ML_OBJECTIVE", "classification").lower()
+    if obj == "regression":
+        return DEFAULT_ENTRY_REG_MODEL_PATH
+    return DEFAULT_ENTRY_MODEL_PATH
 
 
 def sha256_file(path: Path, chunk_bytes: int = 65536) -> str:
@@ -68,27 +84,33 @@ class EntryMLPolicy:
 
     def __init__(
         self,
-        model: xgb.XGBClassifier,
+        model: "xgb.XGBClassifier | xgb.XGBRegressor",
         model_hash: str,
         threshold: float = DEFAULT_ENTRY_THRESHOLD,
         schema_version: str = FEATURE_SCHEMA_VERSION,
         proba_floor: float | None = None,
         proba_ceiling: float | None = None,
         calibration: dict | None = None,
+        objective: str = "binary:logistic",
     ) -> None:
         self._model = model
         self.model_hash = model_hash
         self.threshold = float(threshold)
         self.schema_version = schema_version
-        # Confidence-gating: 2026-04-23. If val-tuned thresholds weren't
-        # persisted (pre-v8 model), fall back to symmetric ±0.2 around
-        # the binary threshold so nothing breaks — but all tokens will
-        # land in the RULES bucket, effectively disabling gating.
+        # Codex Q4 #1: regression head uses predicted PnL% (not proba) as
+        # the gated score. Same floor/ceiling contract — the UNIT of the
+        # threshold just switches from [0,1] to PnL%. ``objective`` is
+        # authoritative for that interpretation.
+        self.objective = objective
+        default_floor = self.threshold - 0.2 if objective == "binary:logistic" else 0.0
+        default_ceiling = (
+            self.threshold + 0.2 if objective == "binary:logistic" else 10.0
+        )
         self.proba_floor = (
-            float(proba_floor) if proba_floor is not None else self.threshold - 0.2
+            float(proba_floor) if proba_floor is not None else default_floor
         )
         self.proba_ceiling = (
-            float(proba_ceiling) if proba_ceiling is not None else self.threshold + 0.2
+            float(proba_ceiling) if proba_ceiling is not None else default_ceiling
         )
         self.calibration = calibration or {"a": 1.0, "b": 0.0}
 
@@ -103,14 +125,10 @@ class EntryMLPolicy:
             raise FileNotFoundError(f"Entry model not found: {p}")
         meta_path = p.with_suffix(".meta.json")
         schema_version = FEATURE_SCHEMA_VERSION
+        objective = "binary:logistic"
         if meta_path.exists():
             meta = json.loads(meta_path.read_text())
             meta_features = meta.get("features")
-            # 2026-04-23: this used to only warn and then load. Silently
-            # loading a stale-schema model is exactly how the creator
-            # skew bug masked itself for weeks — the model ran, the
-            # predictions looked plausible, but the feature columns were
-            # mis-aligned. Refuse to load unless explicitly overridden.
             if meta_features is not None and meta_features != ENTRY_FEATURE_ORDER:
                 detail = (
                     f"Model {p} feature schema does not match current "
@@ -139,10 +157,16 @@ class EntryMLPolicy:
                     FEATURE_SCHEMA_VERSION,
                 )
                 schema_version = str(meta_schema)
-        model = xgb.XGBClassifier()
+            objective = str(meta.get("objective", "binary:logistic"))
+        # Codex Q4 #1: load XGBRegressor for regression objective, else
+        # XGBClassifier. File format is the same (.ubj), but the wrapper
+        # class determines which predict* method is valid.
+        if objective == "reg:squarederror":
+            model: "xgb.XGBRegressor | xgb.XGBClassifier" = xgb.XGBRegressor()
+        else:
+            model = xgb.XGBClassifier()
         model.load_model(p)
         model_hash = sha256_file(p)
-        # Pull confidence-gating thresholds and calibration from meta
         proba_floor = None
         proba_ceiling = None
         calibration = None
@@ -161,23 +185,39 @@ class EntryMLPolicy:
             proba_floor=proba_floor,
             proba_ceiling=proba_ceiling,
             calibration=calibration,
+            objective=objective,
         )
 
-    def predict_proba(
+    def predict_score(
         self,
         scoring_result: Any,
         holder_snapshot: Mapping[str, Any] | None = None,
         creator_snapshot: Any = None,
     ) -> float:
-        """Return P(token is profitable) ∈ [0, 1]."""
+        """Raw model score.
+
+        * classification → P(profitable) ∈ [0, 1].
+        * regression     → predicted realized PnL %, typically in [-30, +50].
+
+        Same skew-guards apply to both — a zero feature slice with a
+        non-None snapshot is a bug in either objective.
+        """
         vec = extract_entry_vector(scoring_result, holder_snapshot, creator_snapshot)
-        # 2026-04-23 skew guard: a healthy FAST_BUY token has ≥30 non-zero
-        # scorer metrics. If nearly the whole vector is 0, the scoring
-        # side did not populate ScoringResult properly — most likely an
-        # attribute rename or a missing pass-through. Under-the-radar
-        # in shadow mode, silently wrong in production.
+        # 2026-04-23 skew guard (codex-tightened): the original 20%
+        # global threshold (≥10 non-zero of 51) would NOT have caught
+        # the creator skew bug, because only 3-4 of 51 features were
+        # affected. Fix: also verify *per-feature-group* coverage. A
+        # legitimate non-None snapshot should produce at least one
+        # non-zero feature in its group (creator / holder). An all-zero
+        # group when its snapshot was passed means lookup broke.
+        from pulse_bot.ml.features import (
+            CREATOR_FEATURES,
+            HELIUS_FEATURES,
+            SCORER_FEATURES,
+        )
+
         nz = sum(1 for v in vec if v != 0.0)
-        if nz < max(5, int(0.2 * len(vec))):
+        if nz < max(5, int(0.4 * len(vec))):
             logger.warning(
                 "predict_proba: only %d/%d features non-zero for %s "
                 "(creator=%s holder=%s). Suspected train/serve skew — "
@@ -188,9 +228,48 @@ class EntryMLPolicy:
                 type(creator_snapshot).__name__ if creator_snapshot else "None",
                 type(holder_snapshot).__name__ if holder_snapshot else "None",
             )
+        # Per-group coverage — catches the creator skew class directly:
+        # if snapshot was provided (non-None) but every feature in that
+        # group is still 0, a lookup path is broken.
+        n_scorer = len(SCORER_FEATURES)
+        n_helius = len(HELIUS_FEATURES)
+        n_creator = len(CREATOR_FEATURES)
+        # SCORER_FEATURES + DERIVED (2 hour_sin/cos) + HELIUS + CREATOR — slice indices
+        helius_slice = vec[n_scorer + 2 : n_scorer + 2 + n_helius]
+        creator_slice = vec[n_scorer + 2 + n_helius :]
+        if holder_snapshot is not None and not any(v != 0.0 for v in helius_slice):
+            logger.warning(
+                "predict_proba: holder_snapshot provided but all %d "
+                "HELIUS_FEATURES resolved to 0.0 — possible lookup regression",
+                n_helius,
+            )
+        if creator_snapshot is not None and not any(v != 0.0 for v in creator_slice):
+            logger.warning(
+                "predict_proba: creator_snapshot provided but all %d "
+                "CREATOR_FEATURES resolved to 0.0 — creator skew fingerprint",
+                n_creator,
+            )
         arr = np.asarray([vec], dtype=float)
+        if self.objective == "reg:squarederror":
+            # XGBRegressor.predict returns 1-D array of predicted targets
+            return float(self._model.predict(arr)[0])
         # XGBClassifier.predict_proba returns [[P(0), P(1)]] → take P(1)
         return float(self._model.predict_proba(arr)[0, 1])
+
+    def predict_proba(
+        self,
+        scoring_result: Any,
+        holder_snapshot: Mapping[str, Any] | None = None,
+        creator_snapshot: Any = None,
+    ) -> float:
+        """Back-compat alias. For classification returns P(profitable).
+
+        For regression returns the predicted PnL% — callers that expected
+        [0,1] must either check ``policy.objective`` or switch to
+        ``predict_score``. Shadow-logging paths are the main affected
+        callers — they log the raw score either way.
+        """
+        return self.predict_score(scoring_result, holder_snapshot, creator_snapshot)
 
     def decide(
         self,
@@ -198,13 +277,19 @@ class EntryMLPolicy:
         holder_snapshot: Mapping[str, Any] | None = None,
         creator_snapshot: Any = None,
     ) -> tuple[bool, float]:
-        """Return (should_buy, proba). Threshold compared with >=.
+        """Return (should_buy, score). ``score`` is proba for classification,
+        predicted PnL% for regression.
 
         The calling code keeps the rule-based hard rejects (sell pressure,
         curve progress, creator blacklist) as a safety layer *before*
         calling this — ML decides only among tokens that pass those."""
-        p = self.predict_proba(scoring_result, holder_snapshot, creator_snapshot)
-        return (p >= self.threshold, p)
+        s = self.predict_score(scoring_result, holder_snapshot, creator_snapshot)
+        # For regression, threshold semantics differ: a PnL > 0 is the
+        # natural "buy" signal. For classification, >= threshold (0.5
+        # default) remains.
+        if self.objective == "reg:squarederror":
+            return (s > 0.0, s)
+        return (s >= self.threshold, s)
 
     def decide_with_confidence(
         self,
@@ -214,35 +299,39 @@ class EntryMLPolicy:
     ) -> tuple[str, float, float]:
         """Confidence-gated three-way decision.
 
-        Returns ``(action, proba_raw, proba_calibrated)`` where ``action``
+        Returns ``(action, score_raw, score_calibrated)`` where ``action``
         is one of:
-            * ``"BUY"``    — proba >= ceiling (high-confidence winner)
-            * ``"SKIP"``   — proba <  floor   (high-confidence loser)
-            * ``"RULES"``  — in the grey zone; caller should defer to the
-                             rule-based decision.
+            * ``"BUY"``    — score >= ceiling (high-EV winner)
+            * ``"SKIP"``   — score <  floor   (high-EV loser)
+            * ``"RULES"``  — grey zone; caller defers to rules.
 
-        Thresholds + calibration come from ``meta.json`` (val-tuned at
-        train time). ``proba_calibrated`` applies Platt scaling so the
-        number reflects empirical frequency, not raw XGBoost logit.
+        Thresholds come from ``meta.json`` (val-tuned at train time). For
+        classification, ``score_calibrated`` applies Platt scaling. For
+        regression, calibration is a no-op (predicted PnL is already in
+        physical units — no logit remap needed) and ``score_raw`` ==
+        ``score_calibrated``.
         """
-        p_raw = self.predict_proba(scoring_result, holder_snapshot, creator_snapshot)
-        p_cal = self._calibrate(p_raw)
-        if p_raw >= self.proba_ceiling:
+        s_raw = self.predict_score(scoring_result, holder_snapshot, creator_snapshot)
+        s_cal = self._calibrate(s_raw)
+        if s_raw >= self.proba_ceiling:
             action = "BUY"
-        elif p_raw < self.proba_floor:
+        elif s_raw < self.proba_floor:
             action = "SKIP"
         else:
             action = "RULES"
-        return action, p_raw, p_cal
+        return action, s_raw, s_cal
 
-    def _calibrate(self, p_raw: float) -> float:
-        """Apply Platt: sigmoid(a*p + b). Bound to (0, 1)."""
+    def _calibrate(self, raw: float) -> float:
+        """Platt scaling for classification (sigmoid(a*p + b)). No-op for
+        regression — PnL predictions are already in physical units.
+        """
+        if getattr(self, "objective", "binary:logistic") == "reg:squarederror":
+            return float(raw)
         import math
 
         a = float(self.calibration.get("a", 1.0))
         b = float(self.calibration.get("b", 0.0))
-        z = a * float(p_raw) + b
-        # Guard against overflow on extreme values.
+        z = a * float(raw) + b
         if z > 50:
             return 1.0
         if z < -50:
@@ -336,13 +425,17 @@ def get_active_policy_name() -> str:
 
 
 def load_entry_policy_if_available(
-    path: Path | str = DEFAULT_ENTRY_MODEL_PATH,
+    path: Path | str | None = None,
     threshold: float = DEFAULT_ENTRY_THRESHOLD,
 ) -> EntryMLPolicy | None:
     """Try to load the entry model. Return None if missing — caller falls
     back to rules-only (no shadow logging). Prevents production crash on
-    fresh clones that haven't run weekly_retrain yet."""
-    p = Path(path)
+    fresh clones that haven't run weekly_retrain yet.
+
+    ``path`` defaults to ``_resolve_entry_model_path()`` which picks
+    classification vs regression based on ``PULSE_ML_OBJECTIVE``.
+    """
+    p = Path(path) if path is not None else _resolve_entry_model_path()
     if not p.exists():
         logger.info("No entry model at %s — shadow logging disabled.", p)
         return None

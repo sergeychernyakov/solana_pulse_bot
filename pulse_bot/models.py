@@ -132,6 +132,9 @@ class ScoringResult:
     curve_progress_at_t90: float = 0.0
     time_to_first_buy: float = 0.0
     buys_per_unique: float = 0.0
+    # 2026-04-23 v11 additions
+    median_time_between_buys: float = 0.0
+    buy_wallet_entropy: float = 0.0
 
     # ── Bonding curve ──────────────────────────────────────
     curve_progress_pct: float = 0.0

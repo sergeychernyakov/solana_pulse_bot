@@ -53,6 +53,9 @@ class TokenMetrics:
     curve_progress_at_t90: float = 0.0
     time_to_first_buy: float = 0.0  # seconds from create to first buy
     buys_per_unique: float = 0.0  # buy_count / unique_buyers (>1.5 = wash)
+    # 2026-04-23 v11 additions
+    median_time_between_buys: float = 0.0  # bot-throttle detector (sec)
+    buy_wallet_entropy: float = 0.0  # normalized Shannon [0,1]; 1=diffuse, 0=concentrated
 
     # ── Bonding curve metrics ──────────────────────────────
     curve_progress_pct: float = 0.0  # % of graduation threshold
@@ -165,6 +168,38 @@ class MetricsCalculator:
         # ── Buys per unique ────────────────────────────────
         if m.unique_buyers > 0:
             m.buys_per_unique = m.buy_count / m.unique_buyers
+
+        # ── Median time between consecutive buys (v11 add) ─────
+        # Low value (and low variance) = bot-like throttle. High = organic
+        # interaction. Zero = single buy or no buys. Unit: seconds.
+        if len(buys) >= 3:
+            gaps = [
+                buys[i + 1].timestamp - buys[i].timestamp
+                for i in range(len(buys) - 1)
+            ]
+            if gaps:
+                m.median_time_between_buys = statistics.median(gaps)
+
+        # ── Buyer-wallet Shannon entropy (v11 add) ─────────────
+        # Measures how evenly the BUY VOLUME is distributed across
+        # distinct wallets. Low = concentrated (few whales), high =
+        # diffuse (organic). Normalized to [0, 1] by dividing by
+        # log2(unique_buyers) so value is invariant to sample size.
+        if buys and m.total_buy_volume_sol > 0 and m.unique_buyers >= 2:
+            import math as _math
+
+            wv: dict[str, float] = {}
+            for tr in buys:
+                wv[tr.wallet] = wv.get(tr.wallet, 0.0) + tr.sol_amount
+            total = sum(wv.values())
+            # Shannon H = -Σ p·log2(p); normalize by log2(n)
+            h = 0.0
+            for v in wv.values():
+                p = v / total
+                if p > 0:
+                    h -= p * _math.log2(p)
+            max_h = _math.log2(len(wv)) if len(wv) > 1 else 1.0
+            m.buy_wallet_entropy = h / max_h
 
         # ── Velocity + size half-splits ────────────────────
         # Keep the ratio fields for backward compat (scorer still reads
