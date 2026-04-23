@@ -353,17 +353,15 @@ class EntryMLPolicy:
 class ExitMLPolicy:
     """Exit advisor. Predicts P(should sell now) ∈ [0, 1].
 
-    Live integration (2026-04-23 v2, codex-reviewed):
-    * ``predict_proba(state, pulse, entry_ml_proba)`` — single scalar.
+    Live integration (2026-04-23 v3):
+    * ``predict_proba(state, pulse)`` — single scalar ∈ [0, 1].
     * ``decide_with_confidence(...)`` — 4-way gated decision
       (SELL_ALL / SELL_PARTIAL / RULES / HOLD_HARD).
 
-    Safety: HOLD_HARD can ONLY block ``weak_pulse_profit`` partial exits
-    (see ExitManager); all hard rules (creator_dump, hard_stop, timeout,
-    take_profit, trailing_stop, whale, near_graduation) stay immutable.
-    Entry model hash is persisted into exit meta.json; ``from_path``
-    refuses to load if the current entry hash diverges (prevents silent
-    cross-model feature skew during retrain windows).
+    Safety: HOLD_HARD can ONLY block ``weak_pulse_profit`` and
+    ``take_profit`` (the latter under strict conditions); all other
+    hard rules (creator_dump, hard_stop, timeout, trailing_stop,
+    whale, near_graduation) stay immutable.
     """
 
     # Phase E2 gate defaults. HOLD_HARD threshold is HARDCODED per codex —
@@ -457,13 +455,8 @@ class ExitMLPolicy:
             entry_model_hash=entry_model_hash,
         )
 
-    def predict_proba(
-        self,
-        state: Any,
-        pulse: Any = None,
-        entry_ml_proba: float | None = None,
-    ) -> float:
-        vec = extract_exit_vector(state, pulse, entry_ml_proba=entry_ml_proba)
+    def predict_proba(self, state: Any, pulse: Any = None) -> float:
+        vec = extract_exit_vector(state, pulse)
         arr = np.asarray([vec], dtype=float)
         return float(self._model.predict_proba(arr)[0, 1])
 
@@ -471,7 +464,6 @@ class ExitMLPolicy:
         self,
         state: Any,
         pulse: Any = None,
-        entry_ml_proba: float | None = None,
         current_pnl_pct: float | None = None,
     ) -> tuple[str, float]:
         """4-way confidence-gated exit decision.
@@ -489,7 +481,7 @@ class ExitMLPolicy:
         (PnL above ``HOLD_HARD_MIN_PNL_PCT``). If PnL is worse than that,
         hard rules alone decide.
         """
-        p = self.predict_proba(state, pulse, entry_ml_proba=entry_ml_proba)
+        p = self.predict_proba(state, pulse)
         if p >= self.sell_ceiling:
             return ("SELL_ALL", p)
         if p >= self.partial_floor:
@@ -561,14 +553,9 @@ class ExitQuantilePolicy:
             coverage=float(meta.get("coverage", 0.0)),
         )
 
-    def predict(
-        self,
-        state: Any,
-        pulse: Any = None,
-        entry_ml_proba: float | None = None,
-    ) -> float:
+    def predict(self, state: Any, pulse: Any = None) -> float:
         """Predicted forward-60s PnL at the requested quantile."""
-        vec = extract_exit_vector(state, pulse, entry_ml_proba=entry_ml_proba)
+        vec = extract_exit_vector(state, pulse)
         arr = np.asarray([vec], dtype=float)
         return float(self._model.predict(arr)[0])
 

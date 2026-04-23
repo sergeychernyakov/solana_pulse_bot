@@ -81,7 +81,6 @@ class ExitManager:
         self,
         config: PulseBotConfig,
         ml_advisor: "ExitMLPolicy | None" = None,
-        entry_ml_proba: float | None = None,
         quantile_sl_policy: "ExitQuantilePolicy | None" = None,
     ) -> None:
         self._cfg = config
@@ -92,13 +91,8 @@ class ExitManager:
         self._ml_advisor = ml_advisor
         # E3: SL-tightening quantile advisor. Activated only when
         # ``exit_regression_active=True`` and binary ML is directionally
-        # confident — see _maybe_ml_sl_tighten for the full gate.
+        # confident — see _should_sl_tighten for the full gate.
         self._quantile_sl = quantile_sl_policy
-        # E1: entry ML's proba at BUY time. Carried through Position
-        # lifecycle so every exit evaluation sees the same value.
-        self._entry_ml_proba = (
-            float(entry_ml_proba) if entry_ml_proba is not None else None
-        )
         self.ml_counters: dict[str, int] = {
             "ml_override_count": 0,
             "ml_partial_count": 0,
@@ -109,10 +103,6 @@ class ExitManager:
     @property
     def remaining_pct(self) -> float:
         return self._remaining_pct
-
-    @property
-    def entry_ml_proba(self) -> float | None:
-        return self._entry_ml_proba
 
     def decide(
         self, pulse: PulseSnapshot, pnl_pct: float, elapsed_sec: float
@@ -128,7 +118,6 @@ class ExitManager:
                 ml_action, ml_proba = self._ml_advisor.decide_with_confidence(
                     state,
                     pulse,
-                    entry_ml_proba=self._entry_ml_proba,
                     current_pnl_pct=pnl_pct,
                 )
             except Exception:
@@ -181,9 +170,7 @@ class ExitManager:
         if self._should_sl_tighten(ml_action, pnl_pct):
             state = self._build_state_for_ml(pulse, pnl_pct, elapsed_sec)
             try:
-                q25 = self._quantile_sl.predict(
-                    state, pulse, entry_ml_proba=self._entry_ml_proba
-                )
+                q25 = self._quantile_sl.predict(state, pulse)
             except Exception:
                 q25 = 0.0
             if q25 < -5.0:
@@ -274,9 +261,6 @@ class ExitManager:
             "current_pnl_pct": pnl_pct,
             "peak_pnl_pct": self._peak_pnl_pct,
             "drawdown_from_peak": drawdown,
-            # None = "entry was uncertain"; extract_exit_features maps
-            # None → NaN so XGBoost treats it as missing, not as 0.
-            "entry_ml_proba": self._entry_ml_proba,
         }
 
     def _should_sl_tighten(self, ml_action: str | None, pnl_pct: float) -> bool:

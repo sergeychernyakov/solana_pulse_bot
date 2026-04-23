@@ -65,11 +65,11 @@ class _FakeAdvisorBase:
         self._action = action
         self._proba = proba
 
-    def predict_proba(self, state, pulse, entry_ml_proba=None):
+    def predict_proba(self, state, pulse):
         return self._proba
 
     def decide_with_confidence(
-        self, state, pulse, entry_ml_proba=None, current_pnl_pct=None
+        self, state, pulse, current_pnl_pct=None
     ):
         return (self._action, self._proba)
 
@@ -150,11 +150,11 @@ def test_advisor_failure_does_not_crash(tmp_path: Path) -> None:
         TP_HOLD_HARD_MAX_PEAK_PCT = 300.0
         TP_HOLD_HARD_MAX_CURRENT_PCT = 500.0
 
-        def predict_proba(self, state, pulse, entry_ml_proba=None):
+        def predict_proba(self, state, pulse):
             raise RuntimeError("simulated failure")
 
         def decide_with_confidence(
-            self, state, pulse, entry_ml_proba=None, current_pnl_pct=None
+            self, state, pulse, current_pnl_pct=None
         ):
             raise RuntimeError("simulated failure")
 

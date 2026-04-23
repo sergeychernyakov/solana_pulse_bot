@@ -181,7 +181,6 @@ class PaperTradeRunner:
         self,
         config: PulseBotConfig,
         entry_price: float,
-        entry_ml_proba: float | None = None,
     ) -> None:
         self._config = config
         self._entry_price = entry_price
@@ -189,8 +188,11 @@ class PaperTradeRunner:
         self._pulse = PulseMonitor(config)
         # Exit ML stack: binary classifier (always loaded when model
         # file present) + quantile SL head (loaded only when
-        # exit_regression_active=True). ``entry_ml_proba`` carries the
-        # Entry model's verdict through the Position lifecycle.
+        # exit_regression_active=True).
+        # TODO(cross-model entry signal): re-add entry_ml_proba plumbing
+        # when task #123 fires. Pipeline already computes ml_proba at
+        # entry time, so reviving is a local change here + a param on
+        # ExitManager + one line in extract_exit_features.
         from pulse_bot.ml.policy import (load_exit_policy_if_available,
                                          load_exit_quantile_if_available)
 
@@ -203,7 +205,6 @@ class PaperTradeRunner:
         self._exit_mgr = ExitManager(
             config,
             ml_advisor=load_exit_policy_if_available(),
-            entry_ml_proba=entry_ml_proba,
             quantile_sl_policy=quantile_sl,
         )
         self._total_buys = 0

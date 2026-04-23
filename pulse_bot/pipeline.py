@@ -726,22 +726,10 @@ class Pipeline:
                     entry_ts = token.created_at + self._config.observe_seconds
                 else:
                     entry_ts = time.time()
-                # Train/serve parity for exit model's entry_ml_proba
-                # feature. build_dataset stores None/NaN for uncertain
-                # entries so XGBoost treats "no directional call" as
-                # missing. Mirror that here — grey-zone classifier
-                # (RULES action) and regression |pred| < 3% both pass
-                # None through to the exit stack.
-                entry_proba_for_exit = ml_proba
-                if ml_action == "RULES":
-                    entry_proba_for_exit = None
-                elif (
-                    ml_proba is not None
-                    and self._ml_entry_policy is not None
-                    and self._ml_entry_policy.objective == "reg:squarederror"
-                    and abs(ml_proba) < 3.0
-                ):
-                    entry_proba_for_exit = None
+                # TODO(cross-model entry signal): entry_ml_proba was
+                # threaded into _paper_trade here in exit_v2. Removed
+                # with exit_v3 — restore alongside the feature (see
+                # task #123) using the grey-zone/RULES + |pred|<3% gate.
                 asyncio.create_task(
                     self._paper_trade(
                         token,
@@ -751,7 +739,6 @@ class Pipeline:
                         entry_type,
                         entry_score,
                         entry_ts,
-                        entry_ml_proba=entry_proba_for_exit,
                     )
                 )
             else:
@@ -772,7 +759,6 @@ class Pipeline:
         entry_ts: float,
         resume_trade_id: int | None = None,
         resume_last_event_ts: float | None = None,
-        entry_ml_proba: float | None = None,
     ) -> None:
         """Virtual paper trade: open position, monitor with PulseMonitor, close on exit signal.
 
@@ -821,9 +807,7 @@ class Pipeline:
 
         from pulse_bot.core import PaperTradeRunner
 
-        runner = PaperTradeRunner(
-            self._config, entry_price, entry_ml_proba=entry_ml_proba
-        )
+        runner = PaperTradeRunner(self._config, entry_price)
         # Last observed event, in the trade-stream clock. For resume, start
         # from the DB-recorded activity so a long idle period before restart
         # is NOT forgiven by a fresh inactivity window.

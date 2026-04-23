@@ -959,21 +959,7 @@ def train_exit(data_path: Path, model_out: Path) -> dict:
 
     model.save_model(model_out)
     meta_out = model_out.with_suffix(".meta.json")
-    # Persist entry_model_hash (E1 codex gate): exit model depends on
-    # live entry_ml_proba at inference. If the entry model retrains and
-    # its hash no longer matches what exit trained against, the cross-
-    # model feature distribution drifts. ExitMLPolicy.from_path will
-    # refuse to load when the hashes diverge.
     from pulse_bot.ml.features import EXIT_FEATURE_SCHEMA_VERSION
-    from pulse_bot.ml.policy import _resolve_entry_model_path, sha256_file
-
-    entry_hash: str | None = None
-    entry_path = _resolve_entry_model_path()  # respects PULSE_ML_OBJECTIVE
-    if entry_path.exists():
-        try:
-            entry_hash = sha256_file(entry_path)
-        except Exception as e:
-            logger.warning("Couldn't hash entry model: %s", e)
 
     meta_out.write_text(
         json.dumps(
@@ -982,13 +968,11 @@ def train_exit(data_path: Path, model_out: Path) -> dict:
                 "schema_version": EXIT_FEATURE_SCHEMA_VERSION,
                 "auc": auc,
                 "base_rate": float(y_test.mean()),
-                "entry_model_hash": entry_hash,
             },
             indent=2,
         )
     )
-    logger.info("Saved model to %s (entry_hash=%s)",
-                model_out, (entry_hash or "<none>")[:16])
+    logger.info("Saved model to %s", model_out)
     return {"auc": auc}
 
 
