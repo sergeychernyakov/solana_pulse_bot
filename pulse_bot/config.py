@@ -223,15 +223,14 @@ class PulseBotConfig:
     exit_moonbag_pct: float = 0.10
 
     # ── EXIT ML ACTIVATION (codex Q4 Phase B, 2026-04-23) ──
-    # Exit model was shadow-logged via ``ExitManager.ml_exit_proba`` for
-    # weeks. Activating it under a conservative single-threshold policy:
-    # if enabled AND the advisor returns proba >= threshold, escalate
-    # ``hold`` → ``sell_all`` with reason ``ml_exit_trigger``. Never
-    # overrides hard rules (creator_dump, hard_stop, timeout, etc.) — those
-    # are checked FIRST. Never softens a rule-based sell (ML cannot hold
-    # us in a rug). Disabled by default so the bot only changes behavior
-    # when ops explicitly opts in via PULSE_EXIT_ML_ACTIVE=1.
-    exit_ml_active: bool = False
+    # Exit model (AUC 0.80, base rate 14.8%) escalates rule-based ``hold``
+    # to ``sell_all`` when proba >= threshold. Safety floor: hard rules
+    # (creator_dump, hard_stop, timeout, whale, near_graduation, etc.)
+    # are checked FIRST and are immutable — ML cannot soften a sell into
+    # a hold (preventing the "ML keeps us in a rug" failure mode).
+    # Activated by default 2026-04-23 per user directive. Disable via
+    # PULSE_EXIT_ML_ACTIVE=0 if needed.
+    exit_ml_active: bool = True
     # Conservative default 0.80 — calibrated so that only very confident
     # "definitely sell now" signals trigger. Tune after shadow analysis
     # of ml_exit_proba distribution on held positions.

@@ -127,6 +127,30 @@ class Pipeline:
             self._policy_mode = "rules"
         self._ml_overrides_buy: int = 0
         self._ml_overrides_skip: int = 0
+        # Exit ML status log — confirms at boot whether the exit advisor
+        # is loaded and whether it can actively escalate rule-based holds.
+        from pulse_bot.ml.policy import load_exit_policy_if_available
+
+        _exit_pol = load_exit_policy_if_available()
+        if _exit_pol is None:
+            logger.info("Exit ML: no model loaded (advisor disabled).")
+        elif getattr(self._config, "exit_ml_active", False):
+            logger.info(
+                "Exit ML ACTIVE: model_hash=%s threshold=%.2f min_hold=%.0fs "
+                "— will escalate hold→sell_all when proba>=threshold. "
+                "Hard rules (creator_dump/hard_stop/timeout/etc.) remain "
+                "immutable.",
+                _exit_pol.model_hash[:16],
+                self._config.exit_ml_sell_threshold,
+                self._config.exit_ml_min_hold_seconds,
+            )
+        else:
+            logger.info(
+                "Exit ML shadow-only: model_hash=%s — proba logged to "
+                "ExitSignal.ml_exit_proba but never overrides rules. "
+                "Set PULSE_EXIT_ML_ACTIVE=1 to activate.",
+                _exit_pol.model_hash[:16],
+            )
 
     async def run(self) -> None:
         """Main entry point. Connect to WS and process tokens until interrupted."""
