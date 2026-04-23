@@ -456,7 +456,17 @@ def _precompute_entry_probas(
             )
             p = 0.0
         # Confidence gate — only keep the proba when entry was decisive.
-        if policy.objective != "reg:squarederror" and floor <= p < ceiling:
+        # For regression entry, "uncertain" = predicted PnL within
+        # ±REG_UNCERTAIN_BAND% of zero (no directional call). Same
+        # collapse-to-0.0 treatment as classifier grey zone.
+        REG_UNCERTAIN_BAND = 3.0
+        is_grey = False
+        if policy.objective == "reg:squarederror":
+            if abs(p) < REG_UNCERTAIN_BAND:
+                is_grey = True
+        elif floor <= p < ceiling:
+            is_grey = True
+        if is_grey:
             grey_zeroed += 1
             p = 0.0
         else:

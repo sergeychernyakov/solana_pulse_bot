@@ -727,14 +727,20 @@ class Pipeline:
                 else:
                     entry_ts = time.time()
                 # Train/serve parity for exit model's entry_ml_proba
-                # feature: build_dataset collapses grey-zone probas
-                # (RULES action, 0.30 ≤ p < 0.40 for classification) to
-                # 0.0 so the exit model only trains on confident-entry
-                # cases. Mirror that here — if entry was RULES (grey
-                # zone), pass 0.0 through to the exit advisor. Keeps
-                # live and training distributions aligned.
+                # feature. build_dataset collapses "uncertain" entry
+                # outputs to 0.0 so the exit model trains only on
+                # directionally confident entry calls. Mirror that gate
+                # here, and apply the same semantics for regression
+                # entry (±3% band around zero = no directional call).
                 entry_proba_for_exit = ml_proba
                 if ml_action == "RULES":
+                    entry_proba_for_exit = 0.0
+                elif (
+                    ml_proba is not None
+                    and self._ml_entry_policy is not None
+                    and self._ml_entry_policy.objective == "reg:squarederror"
+                    and abs(ml_proba) < 3.0
+                ):
                     entry_proba_for_exit = 0.0
                 asyncio.create_task(
                     self._paper_trade(
