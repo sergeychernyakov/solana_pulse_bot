@@ -12,6 +12,34 @@
 
 ---
 
+## 2026-04-25 19:00 — Phase 2.5: time-aware (multi-snapshot) features в main entry-модели
+
+**Что изменилось:**
+- `pulse_bot/ml/features.py` → `FEATURE_SCHEMA_VERSION` поднят `entry_v17_20260425` → `entry_v18_20260425`.
+- Добавлены две новые группы фич в `ENTRY_FEATURE_ORDER` (в конце, чтобы не сдвигать порядок старых колонок):
+  * `TIME_AWARE_FEATURES` (9 шт): `unique_buyers_at_{30,60,90}`, `buy_rate_at_{30,60,90}`, `buy_volume_sol_at_{30,60,90}`. Считаются по обрезке buy-stream'а до `created_at + age`. Знаменатель `buy_rate_at_N` — это N (а не observation_seconds), чтобы значение было сопоставимо между токенами с разным окном наблюдения.
+  * `TIME_AWARE_DERIVED_FEATURES` (4 шт): `top1_at_60` (линейная интерполяция между Helius-снимками @30 и @120 — Helius @60 не снимает), `delta_top1_30_to_60`, `delta_buy_rate_60_to_90`, `delta_unique_buyers_30_to_60`.
+- `pulse_bot/filters/metrics.py` → `TokenMetrics` получил 9 новых полей `*_at_{30,60,90}`; `MetricsCalculator.compute()` считает их через `_stats_up_to(age)`.
+- `pulse_bot/filters/scorer.py` → `ScoringResult` пробрасывает 9 новых полей.
+- `pulse_bot/models.py` → 9 новых дефолтных полей в `ScoringResult`.
+- `pulse_bot/ml/build_dataset.py` → новый helper `_compute_time_aware_features()`; `build_entry_dataset()` после wallet-блока bulk-fетчит trades [created_at, +90s] по чанкам 500 mints, агрегирует @30/@60/@90, считает интерполяцию `top1_at_60` и три delta-фичи. Парность с live-путём проверена в тестах.
+- Новый файл `tests/pulse_bot/test_time_aware_features.py` (8 тестов): truncation, deltas, schema layout, build_dataset wiring, parity invariant `@90 == full-window`.
+- Обновлены `tests/pulse_bot/test_features_parity.py`: `test_feature_order_is_stable` теперь учитывает 7 групп; `test_parity_with_parquet_if_present` корректно скипает старый parquet, у которого нет v18-колонок (требует пересборки датасета — отдельный шаг).
+
+**Зачем:** Phase 2.5 из ROADMAP_2026_05.md. Идея: вместо отдельных голов @T+30/@T+45/@T+60 (Phase 3, для **раннего** решения) расширить feature vector главной T+90 модели снимками траектории, чтобы единый классификатор учил «эволюцию» токена. 70 → 83 фич; те же 1292 labels — XGBoost регуляризацией справляется на этом N (codex 2026-04-24). Не заменяет Phase 3 для fast-decision'а.
+
+**Результат:**
+- 8 новых тестов + 14 регрессионных в `test_features_parity.py` зелёные (22 passed, 2 skipped).
+- Парность @90 = full-window подтверждена бит-в-бит на синтетическом стриме.
+- Ruff/black/isort чистые на всех изменённых файлах.
+- **Модель НЕ переобучена** — это отдельный шаг (по требованию: «DO NOT retrain model»). Существующая модель станет несовместима по `FEATURE_SCHEMA_VERSION` — нужен retrain до следующей попытки запуска `EntryMLPolicy`.
+
+**Open question:** `top1_at_60` — линейная интерполяция между Helius @30 и @120 (Helius не делает @60-snapshot). Альтернатива — переснять top1@60 напрямую из bonding-curve trade-stream'а, но это требует индексации wallet-долей по trades, что дорого. Решение отложено до Phase 3 prereq (clean Helius T+30 snapshot flow).
+
+**Откат:** вернуть `FEATURE_SCHEMA_VERSION = "entry_v17_20260425"`, удалить `TIME_AWARE_FEATURES` + `TIME_AWARE_DERIVED_FEATURES` из `ENTRY_FEATURE_ORDER` и обработку в `extract_entry_features` / `build_entry_dataset`. Поля в `TokenMetrics` / `ScoringResult` можно оставить — они не ломают обратную совместимость.
+
+---
+
 ## 2026-04-25 18:00 — config_hash drift guard + Helius T+30 lag instrumentation
 
 **Что изменилось:**

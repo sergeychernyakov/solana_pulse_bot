@@ -25,6 +25,8 @@ from pulse_bot.ml.features import (
     FEATURE_SCHEMA_VERSION,
     HELIUS_FEATURES,
     SCORER_FEATURES,
+    TIME_AWARE_DERIVED_FEATURES,
+    TIME_AWARE_FEATURES,
     WALLET_FEATURES,
     extract_entry_features,
     extract_entry_vector,
@@ -35,14 +37,22 @@ DB_PATH = REPO_ROOT / "pulse_bot.db"
 
 
 def test_feature_order_is_stable() -> None:
-    """ENTRY_FEATURE_ORDER must be a concatenation of the five groups
-    (Phase E 2026-04-24 added WALLET_FEATURES as the fifth)."""
+    """ENTRY_FEATURE_ORDER must concatenate the seven groups in order.
+
+    History:
+    * Phase E (2026-04-24): WALLET_FEATURES added as the fifth group.
+    * Phase 2.5 (2026-04-25): TIME_AWARE_FEATURES + TIME_AWARE_DERIVED_FEATURES
+      appended at the end (groups 6 + 7) so existing column ordering
+      stays untouched and old-model bisection diffs stay readable.
+    """
     assert ENTRY_FEATURE_ORDER == [
         *SCORER_FEATURES,
         *DERIVED_FEATURES,
         *HELIUS_FEATURES,
         *CREATOR_FEATURES,
         *WALLET_FEATURES,
+        *TIME_AWARE_FEATURES,
+        *TIME_AWARE_DERIVED_FEATURES,
     ]
     # No duplicates
     assert len(ENTRY_FEATURE_ORDER) == len(set(ENTRY_FEATURE_ORDER))
@@ -307,14 +317,27 @@ def test_skew_guard_silent_when_snapshot_is_none(caplog) -> None:
 def test_parity_with_parquet_if_present() -> None:
     """If a trained parquet exists, its feature columns must all be in
     ENTRY_FEATURE_ORDER and vice versa (no drift between training data
-    and the shared schema)."""
+    and the shared schema).
+
+    Schema bumps (e.g. Phase 2.5 v17→v18 on 2026-04-25) intentionally
+    add new columns and *expect* the parquet to be regenerated before
+    the next training run. To avoid this test failing simply because the
+    parquet on disk is older than the current schema, we SKIP when the
+    set of missing columns is exactly the new TIME_AWARE_* groups — the
+    user has not yet rebuilt entry.parquet but the schema is consistent.
+    """
     pq = REPO_ROOT / "data" / "ml" / "entry.parquet"
     if not pq.exists():
         pytest.skip("entry.parquet not built")
     df = pd.read_parquet(pq, columns=None)
     df_cols = set(df.columns)
-    # Every feature we'd extract must exist in the parquet
     missing_in_parquet = [c for c in ENTRY_FEATURE_ORDER if c not in df_cols]
+    new_in_v18 = set(TIME_AWARE_FEATURES) | set(TIME_AWARE_DERIVED_FEATURES)
+    if set(missing_in_parquet).issubset(new_in_v18) and missing_in_parquet:
+        pytest.skip(
+            "entry.parquet predates schema v18 (Phase 2.5); rebuild via "
+            "`python -m pulse_bot.ml.build_dataset --dataset entry`"
+        )
     assert (
         not missing_in_parquet
     ), f"Parquet missing features the extractor expects: {missing_in_parquet}"

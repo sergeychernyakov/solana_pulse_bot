@@ -52,6 +52,55 @@ def _pg_exec(conn, sql: str, params: tuple | list | None = None):
 logger = logging.getLogger(__name__)
 
 
+def _compute_time_aware_features(
+    trade_rows: list[tuple], created_at: float
+) -> dict[str, float]:
+    """Phase 2.5 — re-aggregate buy stream at T+30/60/90 from raw trade rows.
+
+    Mirrors :meth:`MetricsCalculator._stats_up_to` (live path) so train and
+    serve see identical values. Each ``trade_row`` is the tuple selected by
+    the bulk query in :func:`build_entry_dataset`:
+    ``(mint, timestamp, tx_type, sol_amount, wallet)``.
+
+    Buy-rate denominator is the snapshot age (30/60/90), not
+    observation_seconds — represents "buys/sec since launch up to T+N",
+    invariant across rows with different observation windows.
+    """
+    out: dict[str, float] = {
+        "unique_buyers_at_30": 0.0,
+        "unique_buyers_at_60": 0.0,
+        "unique_buyers_at_90": 0.0,
+        "buy_rate_at_30": 0.0,
+        "buy_rate_at_60": 0.0,
+        "buy_rate_at_90": 0.0,
+        "buy_volume_sol_at_30": 0.0,
+        "buy_volume_sol_at_60": 0.0,
+        "buy_volume_sol_at_90": 0.0,
+    }
+    if not trade_rows or created_at <= 0:
+        return out
+    buys = [
+        (float(t[1] or 0.0), t[4] or "", float(t[3] or 0.0))
+        for t in trade_rows
+        if t[2] == "buy"
+    ]
+    if not buys:
+        return out
+    for age in (30.0, 60.0, 90.0):
+        cutoff = created_at + age
+        sub = [b for b in buys if b[0] <= cutoff]
+        if not sub:
+            continue
+        uniq = len({b[1] for b in sub})
+        vol = sum(b[2] for b in sub)
+        rate = len(sub) / age
+        suffix = f"_at_{int(age)}"
+        out[f"unique_buyers{suffix}"] = float(uniq)
+        out[f"buy_rate{suffix}"] = float(rate)
+        out[f"buy_volume_sol{suffix}"] = float(vol)
+    return out
+
+
 # ── Entry classifier ────────────────────────────────────────────────
 
 # Scorer metrics to SELECT from ``token_scores``. Canonical list lives in
@@ -356,6 +405,68 @@ def build_entry_dataset(
         len(base),
         (nz_wallet_feat_count / max(len(base), 1)) * 100.0,
     )
+
+    # ── Phase 2.5 (2026-04-25): time-aware snapshot features ─────────────
+    # Re-aggregate the BUY stream truncated at created_at + 30/60/90 to
+    # populate unique_buyers / buy_rate / buy_volume_sol @ each age.
+    # token_scores does not store these columns directly (legacy rows
+    # predate v18 schema), so we always recompute from trades to get a
+    # consistent value. Live path (Scorer) already computes the same
+    # values via MetricsCalculator._stats_up_to — see parity test.
+    from pulse_bot.ml.features import TIME_AWARE_DERIVED_FEATURES, TIME_AWARE_FEATURES
+
+    ta_mints: list[str] = base["mint"].tolist()
+    obs_trades_by_mint: dict[str, list[tuple]] = {m: [] for m in ta_mints}
+    if ta_mints:
+        cur = conn.cursor()
+        chunk_size = 500
+        ta_rows_fetched = 0
+        for chunk_start in range(0, len(ta_mints), chunk_size):
+            chunk = ta_mints[chunk_start : chunk_start + chunk_size]
+            cur.execute(
+                """SELECT mint, timestamp, tx_type, sol_amount, wallet
+                   FROM trades
+                   WHERE mint = ANY(%s::text[])
+                   ORDER BY mint ASC, timestamp ASC""",
+                (chunk,),
+            )
+            for tr in cur:
+                obs_trades_by_mint[tr[0]].append(tr)
+                ta_rows_fetched += 1
+        cur.close()
+        logger.info(
+            "Phase 2.5: bulk-fetched %d trades for time-aware aggregation",
+            ta_rows_fetched,
+        )
+
+    created_map = {
+        str(row["mint"]): float(row["created_at"]) for _, row in base.iterrows()
+    }
+    ta_feat_rows: list[dict[str, float]] = []
+    for _, row in base.iterrows():
+        mint = str(row["mint"])
+        created_at = created_map.get(mint, 0.0)
+        trade_rows = obs_trades_by_mint.get(mint) or []
+        feats = _compute_time_aware_features(trade_rows, created_at)
+        ta_feat_rows.append(feats)
+    ta_df = pd.DataFrame(ta_feat_rows)
+    for col in TIME_AWARE_FEATURES:
+        base[col] = ta_df[col].values
+
+    # Derived deltas — mirror extract_entry_features so train/serve parity
+    # is bit-identical. top1_at_60 uses Helius @30/@120 (already merged
+    # earlier in this function) with linear interpolation.
+    base["top1_at_60"] = base["top1_30"] + (base["top1_120"] - base["top1_30"]) * (
+        60.0 - 30.0
+    ) / (120.0 - 30.0)
+    base["delta_top1_30_to_60"] = base["top1_at_60"] - base["top1_30"]
+    base["delta_buy_rate_60_to_90"] = base["buy_rate_at_90"] - base["buy_rate_at_60"]
+    base["delta_unique_buyers_30_to_60"] = (
+        base["unique_buyers_at_60"] - base["unique_buyers_at_30"]
+    )
+    # Sanity: TIME_AWARE_DERIVED_FEATURES must all be present on base.
+    for col in TIME_AWARE_DERIVED_FEATURES:
+        assert col in base.columns, f"Phase 2.5: derived column {col!r} missing"
 
     # Label v2 (codex 2026-04-22): realized PnL % applying the SAME
     # fee+slippage math as live ``PaperTradeRunner._calc_leg_pnl``.

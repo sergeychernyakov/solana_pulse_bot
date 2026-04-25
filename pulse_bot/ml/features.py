@@ -211,24 +211,188 @@ WALLET_FEATURES: list[str] = [
     "top3_buyer_wallet_age_days_avg",  # mean days since first seen
 ]
 
+# Phase 2.5 (2026-04-25): time-aware snapshots in the MAIN entry model.
+# Instead of training separate @T+30 / @T+45 / @T+90 heads (Phase 3),
+# expand the main model's feature vector with sub-window snapshots so a
+# single classifier can learn token "evolution" between 30 and 90 sec of
+# token life. Raw values come from ``MetricsCalculator._stats_up_to`` —
+# bit-identical between live ScoringResult and the build_dataset.py
+# re-aggregation path (verified in test_time_aware_features.py).
+#
+# Parity invariant: when ``observation_seconds`` == 90s the @90 columns
+# equal the existing full-window analogues bit-for-bit (e.g.
+# ``unique_buyers_at_90`` == ``unique_buyers``).
+#
+# Note: Phase 2.5 does NOT replace Phase 3's @T+30 model — Phase 3
+# delivers EARLY decisions (BUY/SKIP at T+30s, before T+90 snapshot is
+# available). Phase 2.5 still waits for T+90 to score; it only enriches
+# what the T+90 model knows about the trajectory leading up to T+90.
+TIME_AWARE_FEATURES: list[str] = [
+    "unique_buyers_at_30",
+    "unique_buyers_at_60",
+    "unique_buyers_at_90",
+    "buy_rate_at_30",  # buys/sec across [0, 30s]
+    "buy_rate_at_60",  # buys/sec across [0, 60s]
+    "buy_rate_at_90",  # buys/sec across [0, 90s]
+    "buy_volume_sol_at_30",
+    "buy_volume_sol_at_60",
+    "buy_volume_sol_at_90",
+]
+
+# Phase 2.5 derived deltas — acceleration / deceleration signals on the
+# time-aware metrics. Computed in ``extract_entry_features`` from
+# TIME_AWARE_FEATURES (and HELIUS_FEATURES for top1 interpolation) so
+# train/serve parity is automatic.
+#
+# ``top1_at_60`` is LINEARLY INTERPOLATED between Helius @30 and @120
+# snapshots — Helius does not capture a T+60 holder snapshot natively.
+# So the value is approximate; it serves as a coarse "concentration was
+# rising / falling between 30s and 120s" signal. Open question for
+# Phase 3 infra: capture top1 at T+60 directly (would let us drop the
+# interpolation).
+TIME_AWARE_DERIVED_FEATURES: list[str] = [
+    "top1_at_60",  # linear interp(top1_30, top1_120) at age=60s
+    "delta_top1_30_to_60",  # top1_at_60 - top1_30
+    "delta_buy_rate_60_to_90",  # buy_rate_at_90 - buy_rate_at_60
+    "delta_unique_buyers_30_to_60",  # unique_buyers_at_60 - unique_buyers_at_30
+]
+
 # Canonical feature order — this is what the model was trained against.
 # DO NOT re-order without bumping FEATURE_SCHEMA_VERSION and retraining.
+# Phase 2.5 (2026-04-25): TIME_AWARE_* groups appended at the END so
+# existing column ordering stays unchanged — minimises diff vs older
+# models when bisecting feature-induced regressions.
 ENTRY_FEATURE_ORDER: list[str] = [
     *SCORER_FEATURES,
     *DERIVED_FEATURES,
     *HELIUS_FEATURES,
     *CREATOR_FEATURES,
     *WALLET_FEATURES,
+    *TIME_AWARE_FEATURES,
+    *TIME_AWARE_DERIVED_FEATURES,
 ]
 
 # Bumped on any schema change. Prediction path refuses to load models
 # whose meta.json reports a different version.
-FEATURE_SCHEMA_VERSION: str = "entry_v17_20260425"
-# v17: Remove token_price_sol — on pump.fun it equals market_cap_sol / 1e9
-# (constant supply), so it is perfectly correlated with the v16-removed
-# market_cap_sol and carries the same momentum-bias leakage. After v16 it
-# rose to gain-importance #2, confirming it was absorbing the same spurious
-# signal. Added to KNOWN_LEAK_FEATURES. Retrain required.
+FEATURE_SCHEMA_VERSION: str = "entry_v18_20260425"
+# v18 (2026-04-25): Phase 2.5 time-aware features — 9 raw snapshot
+# metrics (unique_buyers / buy_rate / buy_volume_sol @30/@60/@90) + 4
+# derived deltas (top1_at_60 interpolated, delta_top1_30_to_60,
+# delta_buy_rate_60_to_90, delta_unique_buyers_30_to_60). Retrain
+# required. Total feature count grows by 13.
+#
+# v17 (2026-04-25): Remove token_price_sol — perfectly correlated with
+# market_cap_sol / 1e9 on pump.fun (constant supply); absorbed v16's
+# leakage signal at gain rank #2. Added to KNOWN_LEAK_FEATURES.
+
+
+# ── Entry @T+30 schema (Phase 3 dual-snapshot) ──────────────────────
+#
+# Goal: a SECOND classifier that scores tokens at T+30s instead of T+90s.
+# Decisions: proba >= 0.75 → BUY immediately, proba < 0.15 → SKIP, else
+# wait for the main T+90 model. Halves latency for clear cases and frees
+# slots for clear losers earlier.
+#
+# Feature space is a STRICT SUBSET of the T+90 features — only those
+# physically observable by 30s of token life. Trained labels stay the
+# same (existing simulate_exit-based labels — outcome is fixed regardless
+# of when we score; only the FEATURE snapshot moves earlier).
+#
+# Excluded vs ENTRY_FEATURE_ORDER:
+#   * top1_120 / top5_120 / top10_120 / hc_120 — captured at T+120 by Helius
+#   * top{1,5,10}_delta, hc_velocity — derived from T+30 minus T+120
+#   * top5_minus_top1_120, top10_minus_top5_120, hc_growth_ratio — derived
+#     from T+120 columns
+#
+# Included (subset known good by T+30):
+#   * All FAST_* primitives (fast_buy_count, fast_unique_buyers,
+#     fast_volume_sol, fast_buy_rate, fast_sell_ratio,
+#     pnl_at_fast_entry_pct) — all computed from trades up to T+30s
+#   * Aggregate scorer features that do not depend on a 90s window for
+#     correctness (e.g. unique_buyers, buy_count). At T+30 these are
+#     simply "scorer values truncated at 30s of observation". Train and
+#     serve must both use the truncated window — see build_dataset_t30.
+#   * Helius @T+30 holder snapshot (top1_30/top5_30/top10_30/hc_30) plus
+#     a derived hc_velocity_to_30 = hc_30 / 30
+#   * Creator snapshot — known at T+0
+#   * Wallet prior stats from top-3 buyers up to T+30s
+#   * sol_price_usd, hour_sin, hour_cos
+#
+# Not included anywhere in v1: time_to_first_buy (already captured), but
+# `gap_create_to_first_trade` IS included — both are anchored at T<=30s
+# behaviour.
+
+SCORER_FEATURES_T30: list[str] = [
+    "unique_buyers",
+    "unique_sellers",
+    "buy_count",
+    "sell_count",
+    "buy_volume_sol",
+    "sell_volume_sol",
+    "buy_diversity",
+    "max_buy_sol",
+    "avg_buy_sol",
+    "median_buy_sol",
+    "sell_pressure",
+    "top3_buyer_pct",
+    "repeat_buyer_count",
+    "first_buy_sol",
+    "buy_velocity_trend",
+    "buy_size_trend",
+    "time_to_first_buy",
+    "buys_per_unique",
+    "curve_velocity",
+    "curve_acceleration",
+    "creator_tokens_today",
+    "fast_buy_count",
+    "fast_unique_buyers",
+    "fast_volume_sol",
+    "fast_buy_rate",
+    "fast_sell_ratio",
+    "tokens_last_5min",
+    "concurrent_observations",
+    "pnl_at_fast_entry_pct",
+    "fast_trade_count",
+    "full_trade_count",
+    "gap_create_to_first_trade",
+    "sol_price_usd",
+]
+
+DERIVED_FEATURES_T30: list[str] = [
+    "hour_sin",
+    "hour_cos",
+    # T+30-only derived ratios (no T+120 dependency).
+    "buy_vol_to_sell_vol_ratio",
+    "buy_count_to_sell_count_ratio",
+    "buy_size_growth",
+    "fast_to_full_volume_ratio",
+    "fast_buy_rate_to_full",
+    # Holder-count velocity using ONLY the T+30 snapshot. Naïve estimate:
+    # holders per second since token creation. Deliberately distinct from
+    # the T+120 hc_velocity (90s window) — same name family but different
+    # arithmetic, so XGBoost trains on a clean signal.
+    "hc_velocity_to_30",
+]
+
+HELIUS_FEATURES_T30: list[str] = [
+    "top1_30",
+    "top5_30",
+    "top10_30",
+    "hc_30",
+]
+
+# Creator + wallet feature groups are known at T+0 (creator) / computable
+# from trades-up-to-T+30 (wallet) — reuse the same lists as T+90 model.
+
+ENTRY_T30_FEATURE_ORDER: list[str] = [
+    *SCORER_FEATURES_T30,
+    *DERIVED_FEATURES_T30,
+    *HELIUS_FEATURES_T30,
+    *CREATOR_FEATURES,
+    *WALLET_FEATURES,
+]
+
+FEATURE_SCHEMA_VERSION_T30: str = "entry_t30_v1_20260425"
 
 
 # ── Exit classifier ────────────────────────────────────────────────
@@ -509,6 +673,30 @@ def extract_entry_features(
             wallet_prior_stats, top3_buyer_wallets, cutoff_ts
         )
     )
+    # Phase 2.5 (2026-04-25) — time-aware snapshots. Raw values come
+    # straight off the ScoringResult / token_scores row (computed by
+    # MetricsCalculator._stats_up_to in the live path; re-aggregated
+    # in build_dataset.py for older rows). Default 0.0 when missing —
+    # legitimate for tokens with no buys in the window.
+    for name in TIME_AWARE_FEATURES:
+        feats[name] = _get(scoring_result, name)
+    # Derived deltas + interpolation. ``top1_at_60`` is a coarse linear
+    # interp between the Helius @30 and @120 holder snapshots — Helius
+    # itself does not capture an @60 snapshot. When either side is
+    # zero-filled (snapshot missing → 0.0 NaN policy) the interpolated
+    # value reduces to a midpoint of available data; XGBoost can split
+    # on the (zero, non-zero) co-occurrence to detect missingness.
+    top1_30 = feats.get("top1_30", 0.0)
+    top1_120 = feats.get("top1_120", 0.0)
+    # 60s lies 1/3 of the way from 30s to 120s on the (30, 120) interval.
+    feats["top1_at_60"] = top1_30 + (top1_120 - top1_30) * (60.0 - 30.0) / (
+        120.0 - 30.0
+    )
+    feats["delta_top1_30_to_60"] = feats["top1_at_60"] - top1_30
+    feats["delta_buy_rate_60_to_90"] = feats["buy_rate_at_90"] - feats["buy_rate_at_60"]
+    feats["delta_unique_buyers_30_to_60"] = (
+        feats["unique_buyers_at_60"] - feats["unique_buyers_at_30"]
+    )
     return feats
 
 
@@ -586,3 +774,95 @@ def extract_entry_vector(
         cutoff_ts=cutoff_ts,
     )
     return [feats[k] for k in ENTRY_FEATURE_ORDER]
+
+
+# ── Entry @T+30 extractor (Phase 3) ─────────────────────────────────
+
+
+def extract_entry_features_t30(
+    scoring_result_partial: Any,
+    holder_snapshot_t30: Mapping[str, Any] | None = None,
+    creator_snapshot: Mapping[str, Any] | None = None,
+    *,
+    hour_utc: float | int | None = None,
+    wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
+    top3_buyer_wallets: list[str] | None = None,
+    cutoff_ts: float | None = None,
+) -> dict[str, float]:
+    """Return the @T+30 feature dict in canonical ``ENTRY_T30_FEATURE_ORDER``.
+
+    ``scoring_result_partial`` is the live ScoringResult truncated at
+    T+30 (or, in training, the same scorer values pre-aggregated against
+    a 30-second window). Caller is responsible for ensuring the values
+    really were observed by T+30 — extract_entry_features_t30 cannot
+    police that and naïvely zero-fills missing keys.
+
+    ``holder_snapshot_t30`` exposes ``top1_30``, ``top5_30``, ``top10_30``,
+    ``hc_30``. ``creator_snapshot`` reuses the same shape as the T+90
+    model. ``wallet_prior_stats`` + ``top3_buyer_wallets`` + ``cutoff_ts``
+    feed the wallet group; pass cutoff = scored_at (=T+30 epoch).
+    """
+    feats: dict[str, float] = {}
+    for name in SCORER_FEATURES_T30:
+        feats[name] = _get(scoring_result_partial, name)
+    h = hour_utc if hour_utc is not None else _get(scoring_result_partial, "hour_utc")
+    feats["hour_sin"], feats["hour_cos"] = _cyclical_hour(h)
+    for name in HELIUS_FEATURES_T30:
+        feats[name] = _get(holder_snapshot_t30, name) if holder_snapshot_t30 else 0.0
+    # Derived ratios — same arithmetic as T+90 model where shared.
+    feats["buy_vol_to_sell_vol_ratio"] = feats["buy_volume_sol"] / (
+        feats["sell_volume_sol"] + 0.01
+    )
+    feats["buy_count_to_sell_count_ratio"] = feats["buy_count"] / (
+        feats["sell_count"] + 1.0
+    )
+    feats["buy_size_growth"] = feats["max_buy_sol"] / (feats["avg_buy_sol"] + 0.001)
+    feats["fast_to_full_volume_ratio"] = feats["fast_volume_sol"] / (
+        feats["buy_volume_sol"] + 0.01
+    )
+    # At T+30 the "full" window is the same 30s — divide by 30 not 90.
+    full_rate_30 = feats["buy_count"] / 30.0
+    feats["fast_buy_rate_to_full"] = feats["fast_buy_rate"] / (full_rate_30 + 0.001)
+    # Holder-count velocity from T+30 snapshot only. Defaults to 0 if the
+    # snapshot is missing (consistent with HELIUS zero-fill above).
+    feats["hc_velocity_to_30"] = feats["hc_30"] / 30.0
+    for name in CREATOR_FEATURES:
+        feats[name] = _get_creator_feat(creator_snapshot, name)
+    if creator_snapshot is not None and CREATOR_FEATURES:
+        if all(feats[k] == 0.0 for k in CREATOR_FEATURES):
+            logger.warning(
+                "extract_entry_features_t30: creator_snapshot passed (%s) "
+                "but all %d CREATOR_FEATURES resolved to 0.0 — possible "
+                "naming-convention regression (creator skew bug signature).",
+                type(creator_snapshot).__name__,
+                len(CREATOR_FEATURES),
+            )
+    feats.update(
+        _extract_wallet_prior_features(
+            wallet_prior_stats, top3_buyer_wallets, cutoff_ts
+        )
+    )
+    return feats
+
+
+def extract_entry_vector_t30(
+    scoring_result_partial: Any,
+    holder_snapshot_t30: Mapping[str, Any] | None = None,
+    creator_snapshot: Mapping[str, Any] | None = None,
+    *,
+    hour_utc: float | int | None = None,
+    wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
+    top3_buyer_wallets: list[str] | None = None,
+    cutoff_ts: float | None = None,
+) -> list[float]:
+    """Positional list in ENTRY_T30_FEATURE_ORDER — shape predict_proba expects."""
+    feats = extract_entry_features_t30(
+        scoring_result_partial,
+        holder_snapshot_t30,
+        creator_snapshot,
+        hour_utc=hour_utc,
+        wallet_prior_stats=wallet_prior_stats,
+        top3_buyer_wallets=top3_buyer_wallets,
+        cutoff_ts=cutoff_ts,
+    )
+    return [feats[k] for k in ENTRY_T30_FEATURE_ORDER]

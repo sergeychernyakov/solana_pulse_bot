@@ -305,6 +305,181 @@ def train_entry(data_path: Path, model_out: Path, split: str = "chrono") -> dict
     }
 
 
+def train_entry_t30(data_path: Path, model_out: Path, split: str = "chrono") -> dict:
+    """Train the @T+30 dual-snapshot entry classifier (Phase 3).
+
+    Mirrors ``train_entry`` but uses the T+30 feature schema from
+    ``ENTRY_T30_FEATURE_ORDER``. Saves to ``data/ml/entry_model_t30.ubj``
+    + matching meta.json. Bumps ``schema_version`` to
+    ``FEATURE_SCHEMA_VERSION_T30`` so the live ``EntryT30Policy`` will
+    refuse to load a stale T+30 file.
+    """
+    df = load_df(data_path)
+    logger.info(
+        "T30 entry dataset: %d rows, label balance %.1f%%",
+        len(df),
+        df.label.mean() * 100,
+    )
+
+    from pulse_bot.ml.features import (
+        ENTRY_T30_FEATURE_ORDER,
+        FEATURE_SCHEMA_VERSION_T30,
+    )
+
+    missing = [c for c in ENTRY_T30_FEATURE_ORDER if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"entry_t30.parquet missing canonical features {missing}. "
+            "Rebuild via pulse_bot.ml.build_dataset_t30 before training."
+        )
+    feature_cols = list(ENTRY_T30_FEATURE_ORDER)
+
+    if split == "random":
+        logger.warning(
+            "RANDOM SPLIT — leaks regime/time correlation. Use chrono "
+            "for honest numbers."
+        )
+        np.random.seed(42)
+        idx = np.random.permutation(len(df))
+        cut = int(len(df) * 0.8)
+        train_df = df.iloc[idx[:cut]]
+        test_df = df.iloc[idx[cut:]]
+        val_df = test_df.iloc[: len(test_df) // 2]
+        test_df = test_df.iloc[len(test_df) // 2 :]
+    else:
+        df = df.sort_values("scored_at").reset_index(drop=True)
+        n = len(df)
+        train_end = int(n * 0.70)
+        val_end = int(n * 0.85)
+        train_df = df.iloc[:train_end]
+        val_df = df.iloc[train_end:val_end]
+        test_df = df.iloc[val_end:]
+    logger.info(
+        "T30 split (%s): train=%d val=%d test=%d",
+        split,
+        len(train_df),
+        len(val_df),
+        len(test_df),
+    )
+
+    X_train = train_df[feature_cols]
+    y_train = train_df["label"]
+    X_val = val_df[feature_cols]
+    y_val = val_df["label"]
+    X_test = test_df[feature_cols]
+    y_test = test_df["label"]
+
+    pos = int(y_train.sum())
+    neg = len(y_train) - pos
+    spw = max(neg / max(pos, 1), 1.0)
+
+    from pulse_bot.config import get_config
+
+    _cfg = get_config()
+    model = xgb.XGBClassifier(
+        n_estimators=_cfg.entry_train_n_estimators,
+        max_depth=_cfg.entry_train_max_depth,
+        min_child_weight=_cfg.entry_train_min_child_weight,
+        learning_rate=_cfg.entry_train_learning_rate,
+        subsample=_cfg.entry_train_subsample,
+        colsample_bytree=_cfg.entry_train_colsample_bytree,
+        scale_pos_weight=spw,
+        objective="binary:logistic",
+        eval_metric="auc",
+        early_stopping_rounds=20,
+        random_state=42,
+    )
+    if y_test.sum() == 0 or y_train.sum() == 0:
+        logger.warning(
+            "T30 label imbalance: train_pos=%d val_pos=%d test_pos=%d — "
+            "cannot train/evaluate reliably.",
+            int(y_train.sum()),
+            int(y_val.sum()),
+            int(y_test.sum()),
+        )
+    model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+
+    proba_val = model.predict_proba(X_val)[:, 1]
+    proba_test = model.predict_proba(X_test)[:, 1]
+    auc = roc_auc_score(y_test, proba_test) if y_test.sum() > 0 else float("nan")
+
+    thresh = (
+        proba_test[proba_test.argsort()[::-1][len(proba_test) // 10]]
+        if len(proba_test) > 10
+        else 0.5
+    )
+    mask = proba_test >= thresh
+    precision_top10 = y_test[mask].mean() if mask.sum() else 0.0
+
+    thresholds = _search_confidence_thresholds(proba_val, y_val.values)
+    calib = _fit_platt(proba_val, y_val.values)
+    test_metrics = _evaluate_gated(proba_test, y_test.values, thresholds, calib)
+
+    booster = model.get_booster()
+    raw = booster.get_score(importance_type="gain")
+    importance = dict(sorted(raw.items(), key=lambda x: -float(x[1]))[:15])  # type: ignore[arg-type]
+
+    logger.info("=" * 60)
+    logger.info("ENTRY @T+30 MODEL RESULTS")
+    logger.info("  AUC (holdout):         %.4f", auc)
+    logger.info("  Base rate (test):      %.2f%%", y_test.mean() * 100)
+    logger.info("  Precision at top 10%%:  %.2f%%", precision_top10 * 100)
+    logger.info(
+        "  Gating: BUY=%d WR=%.2f%% | SKIP=%d WR=%.2f%% | RULES=%d WR=%.2f%%",
+        test_metrics["buy_n"],
+        test_metrics["buy_wr"] * 100,
+        test_metrics["skip_n"],
+        test_metrics["skip_wr"] * 100,
+        test_metrics["rules_n"],
+        test_metrics["rules_wr"] * 100,
+    )
+    logger.info("  Top-15 features:")
+    for f, v in importance.items():
+        logger.info("    %.4f  %s", v, f)
+    logger.info("=" * 60)
+
+    model.save_model(model_out)
+    from pulse_bot.ml.config_hash import (
+        TRAIN_RELEVANT_FIELDS,
+        compute_config_hash,
+        extract_relevant_fields,
+    )
+
+    config_hash = compute_config_hash(_cfg)
+    config_values = extract_relevant_fields(_cfg)
+    meta_out = model_out.with_suffix(".meta.json")
+    meta_out.write_text(
+        json.dumps(
+            {
+                "features": feature_cols,
+                "schema_version": FEATURE_SCHEMA_VERSION_T30,
+                "auc": auc,
+                "precision_top10": float(precision_top10),
+                "base_rate": float(y_test.mean()),
+                "train_rows": len(train_df),
+                "val_rows": len(val_df),
+                "test_rows": len(test_df),
+                "confidence_thresholds": thresholds,
+                "calibration": calib,
+                "test_gated": test_metrics,
+                "config_hash": config_hash,
+                "config_fields_version": 1,
+                "config_field_names": list(TRAIN_RELEVANT_FIELDS),
+                "config_values": config_values,
+                "snapshot_age_sec": 30.0,
+            },
+            indent=2,
+        )
+    )
+    logger.info("Saved T30 model to %s", model_out)
+    return {
+        "auc": auc,
+        "precision_top10": float(precision_top10),
+        "thresholds": thresholds,
+        "test_gated": test_metrics,
+    }
+
+
 def train_entry_regression(
     data_path: Path, model_out: Path, split: str = "chrono"
 ) -> dict:

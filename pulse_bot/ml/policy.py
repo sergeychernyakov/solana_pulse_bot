@@ -25,11 +25,15 @@ import xgboost as xgb
 
 from pulse_bot.ml.features import (
     ENTRY_FEATURE_ORDER,
+    ENTRY_T30_FEATURE_ORDER,
     EXIT_FEATURE_ORDER,
     EXIT_FEATURE_SCHEMA_VERSION,
     FEATURE_SCHEMA_VERSION,
+    FEATURE_SCHEMA_VERSION_T30,
     extract_entry_features,
+    extract_entry_features_t30,
     extract_entry_vector,
+    extract_entry_vector_t30,
     extract_exit_vector,
 )
 
@@ -37,9 +41,16 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_ENTRY_MODEL_PATH = Path("data/ml/entry_model.ubj")
 DEFAULT_ENTRY_REG_MODEL_PATH = Path("data/ml/entry_model_reg.ubj")
+DEFAULT_ENTRY_T30_MODEL_PATH = Path("data/ml/entry_model_t30.ubj")
 DEFAULT_ENTRY_THRESHOLD = 0.5
 DEFAULT_EXIT_MODEL_PATH = Path("data/ml/exit_model.ubj")
 DEFAULT_EXIT_THRESHOLD = 0.5
+
+# Phase 3 defaults — early-decision gates from the roadmap. proba >= 0.75
+# fires BUY at T+30; proba < 0.15 fires SKIP at T+30; otherwise the bot
+# defers to the T+90 main model.
+DEFAULT_ENTRY_T30_BUY_CEILING: float = 0.75
+DEFAULT_ENTRY_T30_SKIP_FLOOR: float = 0.15
 
 
 def _resolve_entry_model_path() -> Path:
@@ -492,6 +503,207 @@ class EntryMLPolicy:
             cutoff_ts=cutoff_ts,
         )
         return json.dumps(feats, separators=(",", ":"))
+
+
+class EntryT30Policy:
+    """Phase 3 — @T+30 dual-snapshot entry advisor.
+
+    Loads ``entry_model_t30.ubj`` and applies the early-decision gate
+    described in the roadmap:
+
+        proba >= ``buy_ceiling`` (0.75 default) → BUY immediately
+        proba <  ``skip_floor``  (0.15 default) → SKIP immediately
+        otherwise                                → DEFER to T+90 main model
+
+    Distinct from :class:`EntryMLPolicy` so the two models can coexist
+    with independent schemas, calibration, and gating thresholds.
+    Pipeline integration is OUT OF SCOPE for this module — caller is the
+    Phase 3 deployment task.
+    """
+
+    def __init__(
+        self,
+        model: "xgb.XGBClassifier",
+        model_hash: str,
+        schema_version: str = FEATURE_SCHEMA_VERSION_T30,
+        buy_ceiling: float = DEFAULT_ENTRY_T30_BUY_CEILING,
+        skip_floor: float = DEFAULT_ENTRY_T30_SKIP_FLOOR,
+        calibration: dict | None = None,
+    ) -> None:
+        self._model = model
+        self.model_hash = model_hash
+        self.schema_version = schema_version
+        self.buy_ceiling = float(buy_ceiling)
+        self.skip_floor = float(skip_floor)
+        if self.buy_ceiling <= self.skip_floor:
+            raise ValueError(
+                f"EntryT30Policy: buy_ceiling ({self.buy_ceiling}) must be "
+                f"strictly greater than skip_floor ({self.skip_floor}). "
+                "Otherwise the DEFER bucket is empty by construction."
+            )
+        self.calibration = calibration or {"a": 1.0, "b": 0.0}
+
+    @classmethod
+    def from_path(
+        cls,
+        path: Path | str = DEFAULT_ENTRY_T30_MODEL_PATH,
+        buy_ceiling: float = DEFAULT_ENTRY_T30_BUY_CEILING,
+        skip_floor: float = DEFAULT_ENTRY_T30_SKIP_FLOOR,
+    ) -> "EntryT30Policy":
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"Entry T30 model not found: {p}")
+        meta_path = p.with_suffix(".meta.json")
+        schema_version = FEATURE_SCHEMA_VERSION_T30
+        calibration = None
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text())
+            meta_features = meta.get("features")
+            if meta_features is not None and meta_features != ENTRY_T30_FEATURE_ORDER:
+                detail = (
+                    f"Model {p} feature schema does not match current "
+                    f"ENTRY_T30_FEATURE_ORDER. "
+                    f"Expected {len(ENTRY_T30_FEATURE_ORDER)} features, "
+                    f"model has {len(meta_features)}. "
+                    f"First divergence: "
+                    f"{_first_mismatch(ENTRY_T30_FEATURE_ORDER, meta_features)}. "
+                    f"Retrain with `python -m pulse_bot.ml.train --dataset entry_t30`."
+                )
+                if os.environ.get("PULSE_ALLOW_STALE_MODEL") == "1":
+                    logger.error(
+                        "Loading STALE-SCHEMA T30 model "
+                        "(PULSE_ALLOW_STALE_MODEL=1): %s",
+                        detail,
+                    )
+                else:
+                    raise RuntimeError(detail)
+            meta_schema = meta.get("schema_version")
+            if meta_schema is not None and meta_schema != FEATURE_SCHEMA_VERSION_T30:
+                logger.warning(
+                    "T30 model schema_version=%s differs from code "
+                    "FEATURE_SCHEMA_VERSION_T30=%s — consider retraining.",
+                    meta_schema,
+                    FEATURE_SCHEMA_VERSION_T30,
+                )
+                schema_version = str(meta_schema)
+            calibration = meta.get("calibration")
+            _check_config_drift(meta_path, _safe_get_runtime_config())
+        model = xgb.XGBClassifier()
+        model.load_model(p)
+        return cls(
+            model,
+            sha256_file(p),
+            schema_version=schema_version,
+            buy_ceiling=buy_ceiling,
+            skip_floor=skip_floor,
+            calibration=calibration,
+        )
+
+    def predict_proba(
+        self,
+        scoring_result_partial: Any,
+        holder_snapshot_t30: Mapping[str, Any] | None = None,
+        creator_snapshot: Any = None,
+        *,
+        wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
+        top3_buyer_wallets: list[str] | None = None,
+        cutoff_ts: float | None = None,
+    ) -> float:
+        """Return P(profitable | observed by T+30) ∈ [0, 1]."""
+        vec = extract_entry_vector_t30(
+            scoring_result_partial,
+            holder_snapshot_t30,
+            creator_snapshot,
+            wallet_prior_stats=wallet_prior_stats,
+            top3_buyer_wallets=top3_buyer_wallets,
+            cutoff_ts=cutoff_ts,
+        )
+        arr = np.asarray([vec], dtype=float)
+        return float(self._model.predict_proba(arr)[0, 1])
+
+    def decide_with_confidence(
+        self,
+        scoring_result_partial: Any,
+        holder_snapshot_t30: Mapping[str, Any] | None = None,
+        creator_snapshot: Any = None,
+        *,
+        wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
+        top3_buyer_wallets: list[str] | None = None,
+        cutoff_ts: float | None = None,
+    ) -> tuple[str, float]:
+        """3-way @T+30 decision.
+
+        Returns ``(action, proba)`` where ``action`` is one of:
+            * ``"BUY"``    — proba >= buy_ceiling (clear winner, enter early)
+            * ``"SKIP"``   — proba <  skip_floor  (clear loser, free slot)
+            * ``"DEFER"``  — grey zone; caller waits for T+90 main model.
+        """
+        p = self.predict_proba(
+            scoring_result_partial,
+            holder_snapshot_t30,
+            creator_snapshot,
+            wallet_prior_stats=wallet_prior_stats,
+            top3_buyer_wallets=top3_buyer_wallets,
+            cutoff_ts=cutoff_ts,
+        )
+        if p >= self.buy_ceiling:
+            return ("BUY", p)
+        if p < self.skip_floor:
+            return ("SKIP", p)
+        return ("DEFER", p)
+
+    def dump_features_json(
+        self,
+        scoring_result_partial: Any,
+        holder_snapshot_t30: Mapping[str, Any] | None = None,
+        creator_snapshot: Any = None,
+        *,
+        wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
+        top3_buyer_wallets: list[str] | None = None,
+        cutoff_ts: float | None = None,
+    ) -> str:
+        feats = extract_entry_features_t30(
+            scoring_result_partial,
+            holder_snapshot_t30,
+            creator_snapshot,
+            wallet_prior_stats=wallet_prior_stats,
+            top3_buyer_wallets=top3_buyer_wallets,
+            cutoff_ts=cutoff_ts,
+        )
+        return json.dumps(feats, separators=(",", ":"))
+
+
+def _safe_get_runtime_config() -> Any:
+    """Wrapper used by ``_check_config_drift`` from new policy classes.
+
+    Centralises the try/except so a missing ``pulse_bot.config`` import
+    (e.g. in narrow unit-test contexts) does not nuke ``from_path``.
+    """
+    try:
+        from pulse_bot.config import get_config
+
+        return get_config()
+    except Exception:  # noqa: BLE001 — defensive boundary
+        return None
+
+
+def load_entry_t30_policy_if_available(
+    path: Path | str = DEFAULT_ENTRY_T30_MODEL_PATH,
+    buy_ceiling: float = DEFAULT_ENTRY_T30_BUY_CEILING,
+    skip_floor: float = DEFAULT_ENTRY_T30_SKIP_FLOOR,
+) -> "EntryT30Policy | None":
+    """Try to load the @T+30 entry model. Return None if missing."""
+    p = Path(path)
+    if not p.exists():
+        logger.info("No entry T30 model at %s — T+30 advisory disabled.", p)
+        return None
+    try:
+        return EntryT30Policy.from_path(
+            p, buy_ceiling=buy_ceiling, skip_floor=skip_floor
+        )
+    except Exception as e:
+        logger.exception("Failed to load entry T30 model: %s", e)
+        return None
 
 
 class ExitMLPolicy:

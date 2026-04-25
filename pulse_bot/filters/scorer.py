@@ -135,6 +135,16 @@ class Scorer:
             # (codex: premature at N=661 / 118 positives, wait for N_pos ≥ 250).
             median_time_between_buys=m.median_time_between_buys,
             buy_wallet_entropy=m.buy_wallet_entropy,
+            # Phase 2.5 (2026-04-25) — time-aware snapshots
+            unique_buyers_at_30=m.unique_buyers_at_30,
+            unique_buyers_at_60=m.unique_buyers_at_60,
+            unique_buyers_at_90=m.unique_buyers_at_90,
+            buy_rate_at_30=m.buy_rate_at_30,
+            buy_rate_at_60=m.buy_rate_at_60,
+            buy_rate_at_90=m.buy_rate_at_90,
+            buy_volume_sol_at_30=m.buy_volume_sol_at_30,
+            buy_volume_sol_at_60=m.buy_volume_sol_at_60,
+            buy_volume_sol_at_90=m.buy_volume_sol_at_90,
             # Curve
             curve_progress_pct=m.curve_progress_pct,
             curve_velocity=m.curve_velocity,

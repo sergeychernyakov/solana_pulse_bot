@@ -136,6 +136,20 @@ class ScoringResult:
     median_time_between_buys: float = 0.0
     buy_wallet_entropy: float = 0.0
 
+    # ── Phase 2.5 (2026-04-25) time-aware snapshots ────────
+    # Trade-stream stats truncated at T+30/60/90 since token.created_at.
+    # @90 == full-window analogues when observation_seconds == 90 — see
+    # tests/pulse_bot/test_time_aware_features.py for parity.
+    unique_buyers_at_30: int = 0
+    unique_buyers_at_60: int = 0
+    unique_buyers_at_90: int = 0
+    buy_rate_at_30: float = 0.0
+    buy_rate_at_60: float = 0.0
+    buy_rate_at_90: float = 0.0
+    buy_volume_sol_at_30: float = 0.0
+    buy_volume_sol_at_60: float = 0.0
+    buy_volume_sol_at_90: float = 0.0
+
     # ── Bonding curve ──────────────────────────────────────
     curve_progress_pct: float = 0.0
     curve_velocity: float = 0.0

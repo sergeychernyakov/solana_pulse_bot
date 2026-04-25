@@ -59,6 +59,23 @@ class TokenMetrics:
         0.0  # normalized Shannon [0,1]; 1=diffuse, 0=concentrated
     )
 
+    # ── Phase 2.5 (2026-04-25): time-aware snapshots ────────
+    # Trade-stream metrics truncated at T+30s, T+60s, T+90s relative to
+    # ``token.created_at``. Lets ML learn token "evolution" rather than
+    # only summary stats over the full observation window. The @90 values
+    # are bit-for-bit equal to the existing full-window features when
+    # observation_seconds == 90s — parity-tested in
+    # tests/pulse_bot/test_time_aware_features.py.
+    unique_buyers_at_30: int = 0
+    unique_buyers_at_60: int = 0
+    unique_buyers_at_90: int = 0
+    buy_rate_at_30: float = 0.0  # buys/sec on the truncated window
+    buy_rate_at_60: float = 0.0
+    buy_rate_at_90: float = 0.0
+    buy_volume_sol_at_30: float = 0.0
+    buy_volume_sol_at_60: float = 0.0
+    buy_volume_sol_at_90: float = 0.0
+
     # ── Bonding curve metrics ──────────────────────────────
     curve_progress_pct: float = 0.0  # % of graduation threshold
     curve_velocity: float = 0.0  # SOL/sec into curve
@@ -353,5 +370,36 @@ class MetricsCalculator:
         m.curve_progress_at_t30 = _curve_pct_at(30.0)
         m.curve_progress_at_t60 = _curve_pct_at(60.0)
         m.curve_progress_at_t90 = _curve_pct_at(90.0)
+
+        # ── Phase 2.5 (2026-04-25) — time-aware snapshots ───────────
+        # Truncate the BUY stream at create_at+30/60/90 and re-aggregate
+        # unique buyers, buys/sec, and SOL volume. Buy rate denominator
+        # is the snapshot age (30/60/90), not observation_seconds — it
+        # represents "buys/sec since launch up to T+N", which is
+        # invariant across rows with different observation windows and
+        # which the model can compare across snapshots without a
+        # division-by-window confound.
+        def _stats_up_to(age_sec: float) -> tuple[int, float, float]:
+            cutoff = token.created_at + age_sec
+            sub = [t for t in buys if t.timestamp <= cutoff]
+            if not sub:
+                return 0, 0.0, 0.0
+            uniq = len({t.wallet for t in sub})
+            vol = sum(t.sol_amount for t in sub)
+            rate = len(sub) / age_sec if age_sec > 0 else 0.0
+            return uniq, rate, vol
+
+        u30, r30, v30 = _stats_up_to(30.0)
+        u60, r60, v60 = _stats_up_to(60.0)
+        u90, r90, v90 = _stats_up_to(90.0)
+        m.unique_buyers_at_30 = u30
+        m.unique_buyers_at_60 = u60
+        m.unique_buyers_at_90 = u90
+        m.buy_rate_at_30 = r30
+        m.buy_rate_at_60 = r60
+        m.buy_rate_at_90 = r90
+        m.buy_volume_sol_at_30 = v30
+        m.buy_volume_sol_at_60 = v60
+        m.buy_volume_sol_at_90 = v90
 
         return m
