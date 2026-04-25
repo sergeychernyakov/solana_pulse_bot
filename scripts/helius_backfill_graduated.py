@@ -126,16 +126,18 @@ def fetch_graduated_mints(db: Database, limit: int | None = None) -> list[dict]:
     return rows
 
 
-def fetch_existing_trade_keys(db: Database, mint: str) -> set[tuple[float, str]]:
-    """Existing trade dedup keys for ``mint`` (timestamp rounded + wallet).
+def fetch_existing_trade_keys(db: Database, mint: str) -> set[tuple[int, str]]:
+    """Existing trade dedup keys for ``mint`` (timestamp truncated + wallet).
 
-    Helius timestamps are second-resolution; existing bot timestamps may
-    be sub-second. We round both sides to the nearest second so dedup
-    works across that mismatch."""
+    Helius timestamps are integer-seconds (block time floored); existing
+    bot timestamps are sub-second. Use int() (truncate, not round)
+    on both sides for deterministic match. Banker's rounding caused
+    600K duplicate rows in earlier runs (live ts=X.7 rounded to X+1
+    while Helius ts=X — different keys, both inserted)."""
     rows = db._sync_query(
         "SELECT timestamp, wallet FROM trades WHERE mint = ?", (mint,)
     )
-    return {(round(float(r["timestamp"])), r["wallet"]) for r in rows}
+    return {(int(float(r["timestamp"])), r["wallet"]) for r in rows}
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -385,7 +387,7 @@ async def backfill_one_mint(
 
     # Idempotent insert: dedup against existing rows for this mint.
     existing = fetch_existing_trade_keys(db, mint)
-    new_trades = [t for t in trades if (round(t.timestamp), t.wallet) not in existing]
+    new_trades = [t for t in trades if (int(t.timestamp), t.wallet) not in existing]
     if not new_trades:
         return (len(trades), 0, time.time() - t0)
 
@@ -427,37 +429,53 @@ async def run(args: argparse.Namespace) -> None:
     total_inserted = 0
     elapsed_per_mint: list[float] = []
 
+    # Parallelize across mints: process MINT_PARALLELISM mints concurrently.
+    # Each backfill_one_mint internally fetches with its own client concurrency.
+    # Total in-flight Helius calls ≈ MINT_PARALLELISM × (1-2) typical.
+    mint_parallelism = max(1, args.mint_parallelism)
+
+    async def _process(mint_row):
+        try:
+            return await backfill_one_mint(db, client, mint_row)
+        except Exception as exc:
+            logger.exception("mint=%s failed: %s", mint_row["mint"], exc)
+            return None
+
+    idx = 0
+    aborted = False
     try:
-        for idx, mint_row in enumerate(pending, start=1):
-            mint = mint_row["mint"]
-            try:
-                parsed, inserted, elapsed = await backfill_one_mint(
-                    db, client, mint_row
+        i = 0
+        while i < len(pending) and not aborted:
+            batch = pending[i : i + mint_parallelism]
+            results = await asyncio.gather(*(_process(m) for m in batch))
+            for mint_row, result in zip(batch, results):
+                idx += 1
+                mint = mint_row["mint"]
+                if result is None:
+                    continue
+                parsed, inserted, elapsed = result
+                total_parsed += parsed
+                total_inserted += inserted
+                elapsed_per_mint.append(elapsed)
+                logger.info(
+                    "[%d/%d] %s sigs->%d parsed->%d inserted->%d in %.1fs",
+                    idx,
+                    len(pending),
+                    mint[:12],
+                    parsed,
+                    parsed,
+                    inserted,
+                    elapsed,
                 )
-            except Exception as exc:
-                logger.exception("mint=%s failed: %s", mint, exc)
-                continue
-            total_parsed += parsed
-            total_inserted += inserted
-            elapsed_per_mint.append(elapsed)
-            logger.info(
-                "[%d/%d] %s sigs->%d parsed->%d inserted->%d in %.1fs",
-                idx,
-                len(pending),
-                mint[:12],
-                parsed,  # parsed already excludes unknown
-                parsed,
-                inserted,
-                elapsed,
-            )
-            completed.add(mint)
+                completed.add(mint)
             state["completed_mints"] = sorted(completed)
             state["rpc_calls"] = client.stats.sig_calls + client.stats.parsed_calls
-            if idx % 25 == 0 or idx == len(pending):
-                _save_state(state_path, state)
+            _save_state(state_path, state)
             if client.stats.rate_limit_hits >= 50:
                 logger.error("Too many 429s — aborting; rerun to resume")
+                aborted = True
                 break
+            i += mint_parallelism
     finally:
         _save_state(state_path, state)
         await client.close()
@@ -498,7 +516,14 @@ def parse_args() -> argparse.Namespace:
         "--concurrency",
         type=int,
         default=DEFAULT_CONCURRENCY,
-        help=f"Max in-flight Helius RPC calls (default {DEFAULT_CONCURRENCY}).",
+        help=f"Max in-flight Helius RPC calls per mint (default {DEFAULT_CONCURRENCY}).",
+    )
+    p.add_argument(
+        "--mint-parallelism",
+        type=int,
+        default=20,
+        help="How many mints to process concurrently (default 20). Total in-flight "
+        "Helius calls ≈ mint_parallelism × concurrency for a brief instant.",
     )
     p.add_argument(
         "--state-file",
