@@ -1,10 +1,10 @@
 # Solana Pulse Bot
 
-Бот-наблюдатель для мемкоин-лончпадов на Solana. Наблюдает за новыми токенами, оценивает органичность интереса, принимает решение о покупке. Двухфазный скоринг: быстрый вход (5 сек) + полный анализ (45 сек). 62 метрики на токен, 80+ конфигурируемых параметров.
+Бот-наблюдатель для мемкоин-лончпадов на Solana (pump.fun, letsbonk). Наблюдает за новыми токенами, оценивает органичность интереса, принимает решение о покупке. Двухфазный скоринг: быстрый вход (T+5s) + полный анализ (T+90s). **79 ML-фич на токен**, 80+ конфигурируемых параметров, 6 ML голов (entry main / entry @T+30 / entry-timing / survival / SL+TP quantile heads).
 
-Бэктест использует тот же код что и live бот — **100% совпадение решений** (верифицировано на 178 токенах).
+Бэктест использует тот же код что и live бот — **100% совпадение решений** (верифицировано на 300+ токенах).
 
-## Архитектура
+## Архитектура (v18, 2026-04-25)
 
 ```
 Pipeline (один код для live и backtest):
@@ -12,55 +12,89 @@ Pipeline (один код для live и backtest):
   Token CREATE (WS или replay)
     │
   Main loop (sequential, deterministic):
-    ├─ insert_token
-    ├─ upsert_creator
-    ├─ snapshot creator stats
+    ├─ insert_token + upsert_creator + snapshot creator stats
     │
   Parallel task (per token):
-    ├─ Phase 1: Fast (5s) → FAST_BUY / WAIT
-    ├─ Phase 2: Full (45s) → BUY / SKIP / BORDERLINE
-    ├─ Score with 62 metrics + creator snapshot
-    └─ Store to token_scores (source='live' or 'backtest')
+    ├─ T+5s   Fast filter            → FAST_BUY / WAIT
+    ├─ T+15s  ─┐
+    ├─ T+30s   │ Phase 5 entry-timing checkpoints (3-class WAIT/BUY/SKIP)
+    ├─ T+30s  ←─ Helius snapshot + Phase 3 T+30 model (раннее BUY/SKIP/DEFER)
+    ├─ T+45s   │
+    ├─ T+60s  ←─ Helius snapshot (для top1@60 интерполяции)
+    ├─ T+75s   │
+    ├─ T+90s  ─┘ Main entry model (XGBoost binary + regression head)
+    │            schema entry_v18 — 79 фич, time-aware @30/@60/@90 + дельты
+    ├─ T+120s ←─ Helius snapshot (top1_120, hc_120 для time-aware фич)
+    │
+    ├─ BUY → paper_trade с ExitManager (rules + survival + quantile heads)
+    │       Timer tick каждые 5s + survival predict каждые 10s
+    │
+    └─ SKIP → extended observation N сек (PULSE_EXTENDED_OBSERVE_SECONDS)
+              продолжаем сохранять trades для длинных ML labels
 ```
 
-Ключевой принцип: **все обновления состояния в main loop (последовательно), скоринг в parallel tasks (с замороженным snapshot)**. Это даёт 100% детерминизм при сохранении параллелизма.
+Ключевые принципы:
+- **Все обновления состояния в main loop** (последовательно), скоринг в parallel tasks (с замороженным snapshot). 100% детерминизм при параллелизме.
+- **Все ML модели опциональны** — каждая включается отдельным env var, default OFF. Бот без ML работает на rules.
+- **Schema версионирование** — модели проверяют `feature_schema_version` при загрузке, отказываются работать с несовместимым датасетом.
+- **Config drift guard** — `config_hash` в meta.json, runtime config-mismatch → WARNING на старте.
 
 ## Структура проекта
 
 ```
 pulse_bot/
-├── __init__.py
-├── models.py              # Token, Trade, ScoringResult (62 fields), CreatorStats
-├── config.py              # PulseBotConfig — 80+ параметров для backtesting
-├── db.py                  # SQLite с WAL mode, token_scores (source: live/backtest)
-├── pipeline.py            # Pipeline — единый код для live и replay
-├── clock.py               # Clock ABC + RealClock + SimulatedClock
-├── portfolio.py           # Balance, positions, P&L tracking
-├── execution.py           # SimulatedExecution — slippage model on bonding curve
-├── backtest.py            # BacktestEngine — full cycle replay
-├── optimizer.py           # Grid search over parameter combinations
-├── dashboard.py           # Streamlit: live token monitoring
-├── backtest_dashboard.py  # Streamlit: optimization results
+├── models.py              # Token, Trade, ScoringResult (~80 fields), CreatorStats
+├── config.py              # PulseBotConfig — 80+ параметров (env-overridable)
+├── db.py                  # PostgreSQL — asyncpg + psycopg2 pools
+├── pipeline.py            # Pipeline — live + replay + paper_trade + tick loop
+├── core.py                # PaperTradeRunner — common entry/exit replay logic
+├── backtest.py            # BacktestEngine
+├── optimizer.py           # Grid search (rules-based exit sweeps)
+├── dashboard.py           # Streamlit live monitoring
+├── backtest_dashboard.py  # Streamlit optimization results
+│
+├── ml/                    # 6 ML heads + supporting infra
+│   ├── features.py            # ENTRY_FEATURE_ORDER (v18, 79 features) + T+30 subset
+│   ├── build_dataset.py       # main entry dataset + simulate_exit_batch
+│   ├── build_dataset_t30.py   # T+30 subset dataset (Phase 3)
+│   ├── train.py               # train_entry / train_entry_t30 / train_exit / quantile heads
+│   ├── policy.py              # EntryMLPolicy + EntryT30Policy + ExitMLPolicy + Quantile loaders
+│   ├── simulate_exit.py       # Pure-function exit replay (used for labels + sweeps)
+│   ├── survival.py            # Phase 4B discrete-time hazard model
+│   ├── entry_timing.py        # Phase 5 3-class WAIT/BUY/SKIP @ 15s checkpoints
+│   ├── daily_validation.py    # 9 honesty checks (shuffled labels, prior drift, economic_backtest, etc.)
+│   ├── feature_stability.py   # 5-seed stability protocol for feature pruning
+│   ├── config_hash.py         # train-time config snapshot + drift WARN
+│   ├── calibration_check.py
+│   ├── label_noise_floor.py
+│   ├── backfill_scoring.py
+│   ├── weekly_retrain.py
+│   └── wallet_indexer.py      # top-3 buyer prior PnL features
 │
 ├── sources/
-│   ├── backtest.py        # BacktestSource — SQLite replay
-│   └── replay.py          # ReplayLaunchpad — same Launchpad interface as live WS
+│   ├── backtest.py            # BacktestSource — PostgreSQL replay
+│   └── replay.py              # ReplayLaunchpad
 │
 ├── launchpads/
-│   ├── base.py            # Launchpad ABC
-│   └── pumpfun.py         # PumpFun WS: create events, trade streaming
+│   ├── pumpfun.py             # PumpPortal WS subscription
+│   └── letsbonk.py
 │
 ├── filters/
-│   ├── base.py            # Filter ABC
-│   ├── fast.py            # FastFilter — 5 sec entry decision
-│   ├── observation.py     # ObservationFilter — full 45 sec analysis
-│   ├── metrics.py         # MetricsCalculator — computes all 62 metrics
-│   ├── creator.py         # CreatorFilter — creator history
-│   └── scorer.py          # Scorer — aggregates filters, produces decision
+│   ├── fast.py                # FastFilter — T+5s decision
+│   ├── observation.py         # ObservationFilter — T+90s full analysis
+│   ├── metrics.py             # MetricsCalculator — time-truncated stats @30/@60/@90
+│   ├── creator.py
+│   └── scorer.py
 │
 └── pulse/
-    ├── monitor.py         # PulseMonitor — sliding window, trend detection
-    └── exit_manager.py    # ExitManager — 10 configurable exit rules
+    ├── monitor.py             # PulseMonitor — sliding window + update_empty_tick
+    └── exit_manager.py        # ExitManager — rules cascade + ML escalation
+
+scripts/
+├── exit_config_sweep.py       # SL/TP/max_hold sweep with relabel+retrain per combo
+├── migrate_copy.py            # SQLite → PG bulk migration (one-shot, done)
+├── sync_pg_schema.py
+└── run_daily_validation.sh
 ```
 
 ## Команды
@@ -95,7 +129,7 @@ streamlit run pulse_bot/backtest_dashboard.py --server.port 8502  # backtest res
 
 | | Live | Backtest |
 |---|---|---|
-| Launchpad | PumpFunLaunchpad (WebSocket) | ReplayLaunchpad (SQLite) |
+| Launchpad | PumpFunLaunchpad (WebSocket) | ReplayLaunchpad (PostgreSQL) |
 | Pipeline | тот же код | тот же код |
 | Scorer | тот же код | тот же код |
 | token_scores.source | 'live' | 'backtest' |
@@ -163,6 +197,10 @@ cd gg
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+pip install xgboost psycopg2-binary asyncpg  # ML + Postgres deps (не в requirements.txt)
+
+# ВАЖНО: всегда активировать venv перед запуском
+source .venv/bin/activate
 
 # Запустить мониторинг
 python main.py monitor
@@ -171,172 +209,181 @@ python main.py monitor
 streamlit run pulse_bot/dashboard.py --server.port 8501
 ```
 
-## ML Models — Цели и параметры
+### Переменные окружения
 
-### Главные цели
+```bash
+# Infrastructure
+export PULSE_PG_DSN="postgresql://sergeychernyakov@localhost/pulse_bot"
+export HELIUS_API_KEY="..."
+export PULSE_POLICY="hybrid"          # hybrid | rules
 
-| Модель | Главная метрика | Текущее | **Цель** |
-|---|---|---|---|
-| **Entry** (binary XGBoost + regression head) | **Precision@top-10%** — из топ-10% предсказаний сколько реально winners | **54.5% (binary) / 60% (regression)** | **>60%** (чтобы покрыть fees+slippage) |
-| **Exit** (binary XGBoost + quantile heads shadow) | **AUC on exit-now signal** + realized override PnL | AUC 0.72, entry_ml_proba #1 feature | AUC>0.75, net PnL uplift vs rules-only |
+# Phase 0 — extended trade collection post-scoring (КРИТИЧНО для ML labels)
+export PULSE_EXTENDED_OBSERVE_SECONDS=600    # 0 = старое (обрыв на T+90s); 600 = +10мин
 
-Base rate (winner без модели) = **14%** — regression head уже в 4× лучше случайного.
+# Phase 4A — timer tick (default 5s, 0 = откл.)
+export PULSE_TICK_SECONDS=5
 
-### Exit ML architecture (v2, 2026-04-23, codex-reviewed)
+# Phase 3 — T+30 dual-snapshot model (default OFF)
+export PULSE_ENTRY_T30_ACTIVE=0       # =1 включить T+30 hook (раннее BUY/SKIP/DEFER)
 
-Exit делает 4-way gated decision через `ExitMLPolicy.decide_with_confidence`:
+# Phase 4B — survival model в tick loop (default OFF)
+export PULSE_SURVIVAL_ACTIVE=0        # =1 включить predicted_remaining_life
 
-| Условие | Action | Что делает |
+# Phase 5 — entry-timing 15s checkpoints (default OFF)
+export PULSE_TIMING_ACTIVE=0          # =1 включить 3-class WAIT/BUY/SKIP
+
+# Exit ML
+export PULSE_EXIT_ML_ACTIVE=1         # 0 = pure rules
+export PULSE_EXIT_REGRESSION_ACTIVE=1  # quantile SL/TP heads (active 2026-04-23)
+
+# Entry ML thresholds (override val-tuned defaults from meta.json)
+export PULSE_ENTRY_PROBA_FLOOR=0.5    # ниже = SKIP
+export PULSE_ENTRY_PROBA_CEILING=0.5  # выше = BUY (ML-only при floor=ceiling)
+
+# Exit config (для sweep-скриптов)
+export PULSE_EXIT_HARD_STOP_LOSS_PCT=15
+export PULSE_EXIT_TAKE_PROFIT_PCT=100
+export PULSE_EXIT_MAX_HOLD_SECONDS=90
+export PULSE_EXIT_INACTIVITY_SECONDS=120
+
+# Helius RPC concurrency (для T+30/60/120 captures)
+export PULSE_HELIUS_HOLDER_CONCURRENCY=100
+```
+
+**Текущий рекомендуемый запуск (для накопления Phase 0 данных):**
+```bash
+PULSE_EXTENDED_OBSERVE_SECONDS=600 \
+PULSE_TICK_SECONDS=5 \
+.venv/bin/python main.py monitor
+```
+
+### Запуск тестов
+
+```bash
+# ОБЯЗАТЕЛЬНО: использовать python из .venv, не системный
+source .venv/bin/activate
+pytest tests/pulse_bot/ -q
+
+# или без активации:
+.venv/bin/python -m pytest tests/pulse_bot/ -q
+
+# Интеграционный (15 мин, 300+ токенов, backtest=live match):
+./verify300
+```
+
+## ML Models — 6 голов (state @ 2026-04-25)
+
+| Голова | Файл | Статус | AUC | Когда работает | Env switch |
+|---|---|---|---|---|---|
+| **Entry main** (binary) | `entry_model.ubj` v18 | ACTIVE | 0.96 | T+90s | always (v17 fallback если нет) |
+| **Entry regression** | `entry_model_reg.ubj` | ACTIVE (advisory) | — (Spearman 0.28) | T+90s | `PULSE_REGRESSION_ENTRY=1` |
+| **Entry @T+30** | `entry_model_t30.ubj` v1 | OFF | 0.94 | T+30s | `PULSE_ENTRY_T30_ACTIVE=1` |
+| **Entry-timing** (3-class) | `entry_timing_model.ubj` v1 | OFF | — | T+15/30/45/60/75s | `PULSE_TIMING_ACTIVE=1` |
+| **Survival** (hazard) | `survival_model.ubj` v1 | OFF | — | tick loop ×10s | `PULSE_SURVIVAL_ACTIVE=1` |
+| **Exit binary** | удалён 2026-04-25 | — | — | — | — |
+| **Exit quantile SL** | `exit_quantile_sl.ubj` | ACTIVE | — | dynamic SL | `PULSE_EXIT_REGRESSION_ACTIVE=1` |
+| **Exit quantile TP** | `exit_quantile_tp.ubj` | ACTIVE | — | dynamic TP | `PULSE_EXIT_REGRESSION_ACTIVE=1` |
+
+### Текущие метрики на holdout (2026-04-25, schema v18)
+
+```
+Main entry model:
+  AUC                  0.96   95% CI [0.95, 0.97]
+  Precision@top-10%    7.97%   95% CI [6.3%, 10.0%]
+  BUY zone (ceiling=0.6) WR=8.7%, ×11 base rate (0.81%)
+
+Economic backtest:    NEGATIVE   PnL=−1.96 SOL @ proba=0.5 threshold
+                      (модель не профитна на ОБРЕЗАННЫХ 90s данных —
+                      см. Phase 0 в ROADMAP, ждём 2-3 недели данных)
+```
+
+### Phase status (см. `docs/ROADMAP_2026_05.md`)
+
+```
+✅ Phase 0   extended observation             [DEPLOYED, accumulating data]
+✅ Phase 4A  timer tick infra                  [DEPLOYED, default ON]
+✅ Phase 4B  survival model                    [CODE READY, default OFF]
+✅ Phase 2.5 time-aware features (v18)         [DEPLOYED, schema v18 default]
+✅ Phase 3   @T+30 dual-snapshot model         [CODE READY, default OFF]
+✅ Phase 5   entry-timing classifier           [CODE READY, default OFF]
+✅ Infra     config_hash drift guard           [DEPLOYED]
+✅ Infra     simulate_exit_batch (2.5× speed)  [DEPLOYED]
+✅ Infra     Helius T+30 lag instrumentation   [DEPLOYED, sem 50→100]
+
+⏳ Blocked on Phase 0 data accumulation (2-3 weeks):
+   Phase 1   sanity check (N≥100 closed)
+   Phase 2   foundation retrain + exit sweep (N≥500)
+   Phase 6   TP quantile head (N≥3000 + tail)
+
+⏳ Заблокировано до пользовательского решения:
+   Активация Phase 3/4B/5 хуков на live боте
+```
+
+### Exit ML architecture (после удаления exit_model 2026-04-25)
+
+После удаления бинарной exit модели (AUC 0.55, near-random) exit логика работает так:
+
+1. **Hard rules first (immutable safety floor):**
+   `creator_dump`, `pulse_dead`, `trend_dying`, `sell_pressure`, `buy_rate_drop`, `no_new_blood`, `whale_exit`, `near_graduation`, `hard_stop (−15%)`, `take_profit (+100%)`, `trailing_stop`, `timeout (90s)`
+
+2. **Quantile heads (active, dynamic SL/TP):**
+   - `exit_quantile_sl.ubj` (q=0.25) — tightens SL для high-risk токенов
+   - `exit_quantile_tp.ubj` (q=0.75) — loosens TP когда модель ожидает большой gain
+
+3. **Survival model (Phase 4B, default OFF, активируется через `PULSE_SURVIVAL_ACTIVE=1`):**
+   Замена бинарной exit модели. Предсказывает `predicted_remaining_life`, форсит exit когда life < 30s.
+
+Отсортировано по **gain importance** (последний v18 retrain, 2026-04-25).
+
+| Feature | Смысл | Gain |
 |---|---|---|
-| `proba ≥ 0.80` (`sell_ceiling`) | **SELL_ALL** | Форсит полный выход (escalates hold) |
-| `0.55 ≤ proba < 0.80` | **SELL_PARTIAL** | Частичный выход, размер по proba |
-| `0.20 ≤ proba < 0.55` | **RULES** | Defer to rule-based cascade |
-| `proba < 0.20` AND `pnl ≥ -5%` | **HOLD_HARD** | Блок **только** `weak_pulse_profit` |
+| `top5_120` | % у топ-5 холдеров на T+120s | 10544 |
+| `buy_volume_sol_at_90` | Объём SOL за 90с (= total) | 8098 |
+| `delta_unique_buyers_30_to_60` | Δ уникальных покупателей T+30→T+60 | 6710 |
+| `hc_120` | Holders count на T+120 | 6082 |
+| `fast_buy_count` | Покупок в первые 5 сек | 4893 |
+| `top10_minus_top5_120` | Концентрация средней зоны (#6-10) | 4372 |
+| `buy_vol_to_sell_vol_ratio` | Имбаланс по объёму | 2690 |
+| `top1_120` | % у #1 холдера на T+120 | 2333 |
+| `curve_velocity` | SOL/сек в bonding curve | 1823 |
+| `delta_top1_30_to_60` | Δ концентрации T+30→T+60 | 1639 |
+| `sol_price_usd` | SOL цена (market regime) | 1596 |
+| `fast_buy_rate` | buys/sec первые 5 сек | 1376 |
+| `hour_cos`, `hour_sin` | Cyclical encoding часа UTC | ~1300 |
 
-**Sizing ladder** (hardcoded priors, codex E5 — не val-tune на том же N=1686):
-- `0.55-0.65` → 30%
-- `0.65-0.75` → 50%
-- `0.75-0.80` → 70%
-- `≥ 0.80` → 100% (SELL_ALL path)
+### Removed features (clean-up history)
 
-**Invariants (safety floor — immutable, always checked first):**
-
-`creator_dump`, `pulse_dead`, `trend_dying`, `sell_pressure`, `buy_rate_drop`, `no_new_blood`, `whale_exit`, `near_graduation`, `hard_stop (-15%)`, `take_profit (+100%)`, `trailing_stop (+50%/-50%)`, `timeout (90s)` — эти hard rules проверяются до ML gating. `HOLD_HARD` **не может** их блокировать. `strong_profit` partial (>+200%) тоже immutable.
-
-**Cross-model coupling — ВРЕМЕННО ОТКЛЮЧЕНО (exit_v3, 2026-04-23):**
-
-`entry_ml_proba` был включён как фича в exit model (v2, 2026-04-23) и давал #1 gain. Но при попытке активировать regression entry:
-- Classifier + NaN: exit AUC 0.6227 ✅
-- Regression + NaN: exit AUC 0.48 ❌ (regression predictions с spearman 0.28 на N=661 — слишком шумные для coupling)
-
-Принято решение убрать cross-feature **до** стабилизации regression. Live сейчас работает:
-- Entry: **regression** (precision@top10% 60%, Avg PnL@top10% +8.92%)
-- Exit: AUC 0.5472 — независимая модель, без cross-feature (−7pp от v2, но decoupled от regression noise)
-- Tandem: entry precision +5.5pp перевешивает exit AUC −7pp (exit всё равно имеет safety floor на immutable rules)
-
-**TODO — восстановить cross-feature когда:**
-- N_entry ≥ 2000 AND regression spearman_rho ≥ 0.45, ИЛИ
-- Выбрать путь classifier-only для cross-feature (regression entry активна, но в exit передаётся proba от classifier)
-
-При restore — вернуть `entry_ml_proba` в `EXIT_FEATURE_ORDER`, схема bump → v4, reinstate `_precompute_entry_probas` в build_dataset, cross-model hash gate в `ExitMLPolicy.from_path`, и `test_entry_proba_train_serve_parity`.
-
-**Quantile regression heads** (E3, shadow only, `PULSE_EXIT_REGRESSION_ACTIVE=0` по умолчанию): `exit_quantile_sl.ubj` (q=0.25) для SL-tightening и `exit_quantile_tp.ubj` (q=0.75) для TP-loosening. Активация требует 2 недели shadow + paired bootstrap 500 resamples показывает что bucket бьёт фиксированный порог на ≥1σ.
-
-**Env var rollback (3-layer disable):**
-- `PULSE_EXIT_ML_ACTIVE=0` — полностью откл. ML exit override
-- `PULSE_EXIT_ML_HOLD_HARD=0` — откл. только HOLD_HARD блок
-- `PULSE_EXIT_REGRESSION_ACTIVE=0` — откл. dynamic SL/TP (default)
-
-**Observability:** `ExitManager.ml_counters` отслеживает `ml_override_count`, `ml_partial_count`, `ml_hold_hard_count`. Каждый ML-driven exit пишет reason `ml_exit_trigger` / `ml_partial_trigger` / `ml_hold_hard_blocked_weak_pulse` в `paper_trades`.
-
-### Active features (31 — use by model)
-
-Отсортировано по **gain importance** (сколько деревья их реально используют).
-
-| Feature | Смысл | Gain | Статус |
-|---|---|---|---|
-| `avg_buy_sol` | Средний размер покупки | 43.1 | ✅ Top |
-| `buy_volume_sol` | Общий объём SOL вложено | 42.4 | ✅ Top |
-| `fast_volume_sol` | Объём первые 5 сек | 24.4 | ✅ Top |
-| `top3_buyer_pct` | % у топ-3 покупателей | 24.2 | ✅ Top |
-| `max_buy_sol` | Самая крупная покупка | 21.6 | ✅ Top |
-| `unique_buyers` | Уникальных покупателей | 20.3 | ✅ Top |
-| `creator_median_peak_mc_sol` | Средний пик MC у прошлых токенов creator'а | 20.2 | ✅ Top |
-| `top1_30` | % у #1 холдера на T+30s (Helius) | 18.9 | ✅ Top |
-| `fast_sell_ratio` | Доля продаж в первые 5 сек | 18.7 | ✅ Top |
-| `top1_delta` | Изменение концентрации T+30→T+120 | 18.2 | ✅ Top |
-| `sell_pressure` | sell_count / buy_count | ~17 | ✅ Medium |
-| `total_score` | Hand-tuned scorer output | ~15 | ⚠️ Circular (output rules we replace) |
-| `fast_score` | Hand-tuned fast scorer output | ~14 | ⚠️ Circular |
-| `curve_velocity` | SOL/сек в bonding curve | ~13 | ✅ Medium |
-| `curve_acceleration` | Ускорение curve | ~13 | ✅ Medium |
-| `first_buy_sol` | Размер первой покупки | ~12 | ✅ Medium |
-| `repeat_buyer_count` | Сколько кошельков купили >1 раз | ~12 | ✅ Medium |
-| `buy_size_trend` | Ratio avg 2-й половины / 1-й | ~12 | ✅ Medium |
-| `buy_velocity_trend` | Ratio rate 2-й половины / 1-й | ~12 | ✅ Medium |
-| `time_to_first_buy` | Сек от создания до 1-й покупки | 11.9 | 🔻 Low |
-| `pnl_at_fast_entry_pct` | PnL% если бы вошли на T+5s | 10.4 | 🔻 Low |
-| `creator_age_days` | Возраст кошелька creator'а | 9.7 | 🔻 Low |
-| `buy_diversity` | Сколько разных размеров покупок | 8.7 | 🔻 Low |
-| `hc_30` | Количество холдеров T+30s | 8.4 | 🔻 Low |
-| `concurrent_observations` | Tokens параллельно бот смотрит | 6.8 | 🔻 Low |
-| `top5_30` | % у топ-5 холдеров T+30s | 5.6 | 🔻 Low |
-| `tokens_last_5min` | Активность рынка | ~5 | 🔻 Low |
-| `top1_120`, `top5_120`, `top5_delta` | Helius T+120 snapshots | 3-5 | 🔻 Low |
-| `buy_count` | Число покупок | 2.9 | 🔻 Low |
-| `sell_count` | Число продаж | 2.8 | 🔻 Low |
-
-### Dead features (23 — в schema но не используется ни одним деревом)
-
-**Gain = 0**, безопасно удалить без потери качества. Duplicate-сигналы которые модель игнорирует в пользу других.
-
-| Feature | Смысл | Почему dead |
+| Feature | Когда | Почему |
 |---|---|---|
-| `hour_sin` / `hour_cos` | Час UTC (cyclical encoding) | Время дня не даёт signal |
-| `has_uri` | Есть ли metadata URI | ~100% токенов имеют → 0 variance |
-| `helius_snapshot_complete` | 1 если Helius snapshot получен | Duplicate с hc_30 |
-| `fast_buy_count` | Покупок в первые 5 сек | Duplicate с buy_count |
-| `fast_unique_buyers` | Уникальных в 5 сек | Duplicate с unique_buyers |
-| `median_buy_sol` | Медианная покупка | Duplicate с avg_buy_sol |
-| `sell_volume_sol` | Объём продаж | Модель выбрала buy_volume |
-| `first_half_buy_rate`, `second_half_buy_rate` | Rate по половинам | Raw halves уже в buy_velocity_trend |
-| `avg_first_half_buy_sol`, `avg_second_half_buy_sol` | Средний чек по половинам | Duplicate |
-| `creator_tokens_today` | Сколько токенов dev сегодня | 90% имеют 1-5 → слабый variance |
-| `creator_inter_token_interval_sec` | Интервал между запусками | Duplicate с age |
-| `creator_total_prior_tokens` | Всего токенов у dev'а | Correlated с age |
-| `curve_progress_at_t30/t60/t90` (3) | Форма curve в разных точках | Добавлены 2026-04-23, signal не дали |
-| `time_gap_median_first20` | Интервалы между первыми 20 trades | Добавлена 2026-04-23, signal не дала |
-| `buy_volume_first10s` | Объём SOL в первые 10 сек | Duplicate с buy_volume_sol |
-| `unique_buyers_first30s`, `unique_buyers_last30s` | Уникальные в окнах | Duplicate с unique_buyers |
-| `full_trade_count` | Общее число trades | Duplicate (buy_count+sell_count) |
+| `name_length`, `symbol_length`, `is_all_caps`, `has_numbers` | 2026-04-23 | H7 name patterns — 0 signal |
+| `market_cap_sol`, `sol_to_graduation`, `log_market_cap` | 2026-04-25 (v16) | Momentum-bias leak, dominated #1-2 gain, валил economic_backtest |
+| `token_price_sol` | 2026-04-25 (v17) | = market_cap_sol/1e9 на pump.fun (constant supply) — та же утечка |
+| `fast_score`, `total_score` | 2026-04-22 | Circular dependency на rules которые ML заменяет |
 
-### Candidate features (не добавлены — wait for data или нужна инфра)
+### История iteration'ов (entry main model)
 
-| Feature | Почему не добавили | Effort | Condition для активации |
-|---|---|---|---|
-| `launchpad` (pumpfun / letsbonk / other) | 99.6% pumpfun → 0 variance | 30 мин | Летsbonk накопит ~500+ labeled |
-| `sol_price_usd` | Capture с 2026-04-22, мало данных | 1ч | 5-7 дней накопления |
-| `sol_price_1h_change_pct` | Нужен SOL price history | 2ч | После sol_price accumulation |
-| `mint_authority_revoked` | 30/30 pump.fun auto-revoke → 0 variance | 0 (ready) | При non-pumpfun launchpad |
-| `freeze_authority_revoked` | То же | 0 (ready) | При non-pumpfun launchpad |
-| `buyers_new_wallet_pct` | Helius wallet age per buyer | 4-6ч | При N ≥ 2000 |
-| `buyers_avg_sol_balance` | Helius balance fetch | 4ч | При N ≥ 2000 |
-| `top_buyer_prior_pnl_sum` | Wallet-level PnL индексация | 40-80ч | Долгосрочно |
-| `bundled_buy_fraction` | Tx signature parsing (coord-bot) | 15-25ч | Codex flagged as fragile |
-| `pumpfun_tokens_per_minute_now` | Market heat indicator | 1ч | Future |
-| `tokens_graduated_last_hour` | Graduation heat | 2ч | Future |
-| `creator_active_tokens_now` | Co-trading context (multi-token dev) | 4ч | Future |
+| Дата | Schema | AUC | Prec@top10% | Economic backtest | Комментарий |
+|---|---|---|---|---|---|
+| 2026-04-22 | v15 | 0.74-0.82 | 43-50% | −0.29 SOL | Pre-DOA, N=528 train rows |
+| 2026-04-24 | v15+DOA | 0.98 | 41% | −0.56 SOL | DOA fix, N=47997, base rate 0.82% |
+| 2026-04-25 | v17 | 0.98 | 8% | −0.56 SOL | Removed `market_cap_sol`, `sol_to_graduation`, `log_market_cap`, `token_price_sol` (momentum-bias leak) |
+| 2026-04-25 | v18 | 0.96 | 8% | −1.96 SOL | Phase 2.5 time-aware (+13 фич): @30/@60/@90 + дельты. **Регрессия** ожидается по ROADMAP — модель overfit на noisy labels (90s обрезка) |
 
-### Removed features (пробовали, убрали)
-
-| Feature | Why removed |
-|---|---|
-| `name_length`, `symbol_length`, `is_all_caps`, `has_numbers` | H7 name patterns — 0 signal, removed 2026-04-23 |
-
-### История iteration'ов
-
-| Дата | AUC | Precision@top-10% | Комментарий |
-|---|---|---|---|
-| Initial binary | 0.735 | — | 38 features baseline |
-| +label v2 (fees в labels) | 0.822 | 43% | **Big win** — honest label |
-| +has_uri, market context | 0.740 | 43% | Marginal |
-| Remove circular fast/total_score | 0.724 | — | Codex ablation check |
-| Retroactive backfill (+19 labeled) | 0.777 | 43% | More data, slight lift |
-| +pnl_at_fast_entry_pct + trade_counts | **0.818** | **50%** | **Big lift** — trade partition matters |
-| +7 cheap features (curve/time gaps) | 0.801 | **36%** | ❌ **Overfit at N=661** — все 7 dead |
+**Целевая метрика для прибыли:** economic_backtest > +0.3 SOL/week. **Блокер:** Phase 0 data accumulation. Все текущие модели обучены на 90с-обрезанных labels — winners не успевают вырасти до +50/+100%, поэтому любая селективность даёт −EV. После накопления Phase 0 данных (2-3 нед) labels станут честными → re-train + sweep на честной EV.
 
 ### Правила feature management
 
-1. **N rows / feature ≥ 20** — нарушили когда добавили 7 cheap features (8 rows/feature) → overfit
+1. **N rows / feature ≥ 20** — нарушение → overfit (см. v18 регрессия выше)
 2. **Добавлять по 1-2 за раз** и мерить до/после
-3. **Ablation test** обязателен если features > 30 при N < 1500
-4. **Dead features удаляем** — нет смысла в schema overhead
-5. **Candidate при 0 variance** держать в infrastructure, не добавлять в `ENTRY_FEATURE_ORDER` пока variance не появится
+3. **Feature stability protocol** перед удалением: `feature_stability.py` с 5 seeds; убирать только `STABLE_DEAD` в TWO sequential schema versions
+4. **Известные leak-фичи** (KNOWN_LEAK_FEATURES в `daily_validation.py`): `market_cap_sol`, `mc_at_scoring`, `sol_to_graduation`, `v_sol_in_bonding_curve`, `v_tokens_in_bonding_curve`, `log_market_cap`, `token_price_sol`. Появление в top-10 gain = регрессия
 
 ## Документация
 
-- [Техническая спецификация](./docs/SOLANA_PULSE_BOT_SPEC.md)
+- [Roadmap 2026-05](./docs/ROADMAP_2026_05.md) — Phase 0-6 plan + status
+- [CHANGELOG](./docs/CHANGELOG.md) — журнал всех ML / behavior изменений
 - [Python Style Guide](./PYTHON_STYLE_GUIDE.md)
+- [Agent Instructions](./AGENTS.md)
 
 ## Автор
 

@@ -1,13 +1,26 @@
-# Roadmap 2026-05 — Phase 1-6
+# Roadmap 2026-05 — Phase 0-6
 
 **Дата составления:** 2026-04-24
-**Status v15 (отправная точка):** AUC 0.637, Prec@top10% 40.7%, N=1292 labels,
-full ML-only paper mode (floor=ceiling=0.5), wallet_activity materialized view +
-simulate_exit labels в продакшене.
+**Последнее обновление:** 2026-04-25 13:30
+**Status v17→v18 (текущее):** AUC 0.96, Prec@top10% 7.97%, N=74,714 scored, base rate 0.81%.
+6 ML голов готовы (entry main / entry @T+30 / entry-timing / survival / SL+TP quantile heads).
+Phase 0 deployed — бот накапливает post-scoring трейды.
 
 **Главный принцип (от кодекса):** **не добавлять ML-головы на слабую базовую
-модель (AUC 0.637).** Сначала усилить foundation (больше данных + multi-snapshot
-signal), потом advanced heads.
+модель.** Сначала усилить foundation (больше данных + multi-snapshot
+signal), потом advanced heads. ✅ Все код-фазы завершены 2026-04-25; ждём
+Phase 0 data accumulation для validation.
+
+**Quick status:**
+- ✅ Phase 0 (extended observation) — DEPLOYED, accumulating
+- ✅ Phase 4A (timer tick) — DEPLOYED default ON
+- ✅ Phase 4B (survival) — CODE READY, default OFF
+- ✅ Phase 2.5 (time-aware features) — DEPLOYED schema v18
+- ✅ Phase 3 (T+30 model) — CODE READY, default OFF
+- ✅ Phase 5 (entry-timing) — CODE READY, default OFF
+- ⏳ Phase 1 (sanity check) — blocked on N≥100 closed paper trades
+- ⏳ Phase 2 (foundation retrain) — blocked on Phase 0 data
+- ⏳ Phase 6 (TP quantile) — deferred to N≥3000
 
 ---
 
