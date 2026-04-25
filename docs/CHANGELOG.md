@@ -12,6 +12,33 @@
 
 ---
 
+## 2026-04-25 21:00 — Deploy bot to rich server (production)
+
+**Что изменилось:**
+- Полная миграция бота с Mac на server `rich` (192.168.3.118, Ubuntu, 125GB RAM, PG 16)
+- pg_dump 2.7GB Mac → scp → pg_restore на rich (4.21M trades, 79K live scores восстановлены)
+- rsync code (1458 files, 93MB), исключая .venv/.git/data/parquet
+- venv setup на rich: requirements.txt + extras (xgboost, psycopg2-binary, aiohttp, scipy, sklearn)
+- .env скопирован, добавлен `PULSE_PG_DSN=postgresql://sergeychernyakov:pulsebot@localhost/pulse_bot`
+- Bot стартован через nohup (PID 573790 на rich)
+
+**Зачем:**
+- 24/7 работа (Mac выключается, обрывает Phase 0 collection)
+- Стабильное соединение (Ethernet vs WiFi)
+- Свободные ресурсы для backfill параллельно
+
+**Результат:**
+- Bot на rich принимает события, делает Helius captures (T+30/60/120 lag=0.00s), активно пишет в БД
+- Mac бот остановлен (PID 28843 killed)
+- Resumed 2 open paper_trades без потерь
+- README обновлён с deploy инструкциями
+
+**Откат:**
+- На Mac: `nohup .venv/bin/python main.py monitor` (БД и код синхронизированы)
+- На rich: `pkill -f "main.py monitor"`
+
+---
+
 ## 2026-04-25 13:15 — Удаление exit_model + DB cleanup (300 MB)
 
 **Что изменилось:**

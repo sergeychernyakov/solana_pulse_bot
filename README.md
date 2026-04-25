@@ -189,7 +189,44 @@ python main.py verify     # replay + сравнить
 
 Все параметры конфигурируемые для grid search optimizer.
 
-## Быстрый старт
+## Production deployment — Rich server (192.168.3.118)
+
+Бот запущен на отдельном сервере `rich` для 24/7 работы. Mac остаётся dev-машиной.
+
+```bash
+# SSH alias настроен в ~/.ssh/config: Host rich → 192.168.3.118 user=sergey
+ssh rich
+
+# Bot status
+ps auxw | grep main.py | grep -v grep
+tail -f ~/www/gg/logs/bot.log
+
+# Restart with new env
+cd ~/www/gg
+pkill -f "main.py monitor"
+set -a && source .env && set +a
+nohup .venv/bin/python main.py monitor > logs/bot.log 2>&1 &
+
+# DB on rich: PG 16, user=sergeychernyakov password=pulsebot
+PGPASSWORD=pulsebot psql -U sergeychernyakov -d pulse_bot -h localhost
+```
+
+**Sync БД между Rich (production) и Mac (dev):**
+```bash
+# Mac → Rich (одноразово при первом deploy):
+pg_dump -d pulse_bot -F c -Z 9 -f /tmp/dump.dump
+scp /tmp/dump.dump rich:/tmp/
+ssh rich 'pg_restore -U sergeychernyakov -d pulse_bot /tmp/dump.dump'
+
+# Rich → Mac (для dev-анализа свежих данных):
+ssh rich 'pg_dump -U sergeychernyakov -d pulse_bot -F c -Z 9' > /tmp/rich.dump
+pg_restore --clean -d pulse_bot /tmp/rich.dump
+
+# TODO: настроить streaming replication Mac → Rich для live sync
+# (сейчас Rich = source of truth, Mac периодически забирает snapshot)
+```
+
+## Быстрый старт (dev на Mac)
 
 ```bash
 git clone <repo-url>
