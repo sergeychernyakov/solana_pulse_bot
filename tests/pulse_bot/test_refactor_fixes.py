@@ -38,7 +38,6 @@ from pulse_bot.models import CreatorStats, ScoringResult, Token, Trade
 from pulse_bot.optimizer import CachedToken, Optimizer
 from pulse_bot.sources.replay import ReplayLaunchpad
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -122,9 +121,7 @@ class TestCreatorStatsFromSnapshot:
         # Arrange — two distinct DB files with different contents.
         live_path = str(tmp_path / "empty_results.db")
         Database(live_path).init_schema()  # empty creators table in "results" DB
-        snap_path = _write_creators_only_db(
-            [("WALLET1", 7, 7, 1, 1.0, 2.0, 0)]
-        )
+        snap_path = _write_creators_only_db([("WALLET1", 7, 7, 1, 1.0, 2.0, 0)])
 
         db = Database(live_path)
 
@@ -201,11 +198,21 @@ class TestTimeoutTradeEmitted:
         cfg.portfolio_max_positions = 1
 
         token_a = Token(
-            mint="A", name="", symbol="", creator="", created_at=1000.0, uri="",
+            mint="A",
+            name="",
+            symbol="",
+            creator="",
+            created_at=1000.0,
+            uri="",
             launchpad="pumpfun",
         )
         token_b = Token(
-            mint="B", name="", symbol="", creator="", created_at=1000.0, uri="",
+            mint="B",
+            name="",
+            symbol="",
+            creator="",
+            created_at=1000.0,
+            uri="",
             launchpad="pumpfun",
         )
         cached_a = CachedToken(
@@ -232,9 +239,7 @@ class TestTimeoutTradeEmitted:
         }
 
         opt = Optimizer.__new__(Optimizer)
-        closed = opt._simulate_combo_event_driven(
-            ctx, {"A": cached_a, "B": cached_b}
-        )
+        closed = opt._simulate_combo_event_driven(ctx, {"A": cached_a, "B": cached_b})
 
         # B should be dropped because A's dead_token slot is still active.
         assert len(closed) == 1
@@ -268,10 +273,17 @@ class TestReplayDrainAllInactivity:
 
     def test_stops_on_inactivity_gap(self) -> None:
         """A gap larger than inactivity_timeout truncates the yielded stream."""
+
         async def runner() -> list[Trade]:
             launchpad = ReplayLaunchpad(db_path=":memory:")
             queue: asyncio.Queue[Trade] = asyncio.Queue()
-            for ts in (100.0, 110.0, 115.0, 300.0, 305.0):  # 185s gap between 115 and 300
+            for ts in (
+                100.0,
+                110.0,
+                115.0,
+                300.0,
+                305.0,
+            ):  # 185s gap between 115 and 300
                 await queue.put(_make_trade("M", ts))
 
             drained: list[Trade] = []
@@ -285,6 +297,7 @@ class TestReplayDrainAllInactivity:
 
     def test_zero_timeout_yields_everything(self) -> None:
         """inactivity_timeout=0 preserves the legacy behavior (no gap check)."""
+
         async def runner() -> list[Trade]:
             launchpad = ReplayLaunchpad(db_path=":memory:")
             queue: asyncio.Queue[Trade] = asyncio.Queue()
@@ -317,7 +330,7 @@ class TestDecideEntryFastBuyerCount:
         cfg.max_entry_buyer_number = 50
 
         fast = _make_fast(decision="FAST_BUY", buy_count=2)  # 2+1 = 3, below min 10
-        full = _make_full(decision="BUY", buy_count=30)      # full window later has 31
+        full = _make_full(decision="BUY", buy_count=30)  # full window later has 31
 
         should_enter, etype, _, _ = decide_entry(fast, full, cfg)
         assert should_enter is False
@@ -379,7 +392,9 @@ class TestClosePaperTradeHoldSeconds:
     that was stored in ``open_paper_trade`` — not from a caller-passed value —
     so accidental usage of ``token.created_at`` cannot inflate position hold."""
 
-    def _open_trade(self, db: Database, entry_time: float, entry_price: float = 0.001) -> int:
+    def _open_trade(
+        self, db: Database, entry_time: float, entry_price: float = 0.001
+    ) -> int:
         async def run() -> int:
             return await db.open_paper_trade(
                 {
@@ -397,7 +412,9 @@ class TestClosePaperTradeHoldSeconds:
 
         return asyncio.run(run())
 
-    def test_hold_uses_stored_entry_time_with_explicit_exit(self, tmp_path: Path) -> None:
+    def test_hold_uses_stored_entry_time_with_explicit_exit(
+        self, tmp_path: Path
+    ) -> None:
         """When an explicit ``exit_time`` is supplied, hold = exit_time - entry_time."""
         db = Database(str(tmp_path / "live.db"))
         db.init_schema()
@@ -423,7 +440,9 @@ class TestClosePaperTradeHoldSeconds:
         assert row["hold_seconds"] == pytest.approx(180.0)
         assert row["exit_reason"] == "take_profit"
 
-    def test_hold_is_clamped_to_zero_when_exit_before_entry(self, tmp_path: Path) -> None:
+    def test_hold_is_clamped_to_zero_when_exit_before_entry(
+        self, tmp_path: Path
+    ) -> None:
         """``MAX(? - entry_time, 0)`` guards against clock skew / bad replay data."""
         db = Database(str(tmp_path / "live.db"))
         db.init_schema()
@@ -597,8 +616,13 @@ class TestOptimizerLateFirstTrade:
         cfg.buy_amount_sol = 0.01
 
         token = Token(
-            mint="LATE", name="", symbol="", creator="", created_at=1000.0,
-            uri="", launchpad="pumpfun",
+            mint="LATE",
+            name="",
+            symbol="",
+            creator="",
+            created_at=1000.0,
+            uri="",
+            launchpad="pumpfun",
         )
         # One trade arrives 300s after entry — well past the 60s inactivity.
         late_trade = _scored_trade("LATE", timestamp=1350.0, sol=0.1, tokens=1e5)
@@ -611,8 +635,12 @@ class TestOptimizerLateFirstTrade:
         )
         opt = Optimizer.__new__(Optimizer)
         result = opt._simulate_trade_from(
-            cached, entry_type="full", entry_score=20,
-            entry_price=1e-6, entry_time=1050.0, cfg=cfg,
+            cached,
+            entry_type="full",
+            entry_score=20,
+            entry_price=1e-6,
+            entry_time=1050.0,
+            cfg=cfg,
         )
         assert result["exit_reason"] == "dead_token"
         assert result["exit_time"] == pytest.approx(1050.0 + 60.0)
@@ -638,17 +666,29 @@ class TestZeroInactivitySemantics:
         cfg.buy_amount_sol = 0.01
 
         token = Token(
-            mint="Z", name="", symbol="", creator="", created_at=100.0, uri="",
+            mint="Z",
+            name="",
+            symbol="",
+            creator="",
+            created_at=100.0,
+            uri="",
             launchpad="pumpfun",
         )
         cached = CachedToken(
-            token=token, monitor_trades=[], creator_snapshot=None,
-            creator_tokens_today=0, entry_price=1e-6,
+            token=token,
+            monitor_trades=[],
+            creator_snapshot=None,
+            creator_tokens_today=0,
+            entry_price=1e-6,
         )
         opt = Optimizer.__new__(Optimizer)
         result = opt._simulate_trade_from(
-            cached, entry_type="full", entry_score=20,
-            entry_price=1e-6, entry_time=200.0, cfg=cfg,
+            cached,
+            entry_type="full",
+            entry_score=20,
+            entry_price=1e-6,
+            entry_time=200.0,
+            cfg=cfg,
         )
         assert result["exit_reason"] == "timeout"
         assert result["exit_time"] == pytest.approx(200.0)
@@ -685,9 +725,7 @@ class TestOptimizerFastEntryClock:
 
         # Replicate the computation the optimizer now performs.
         entry_time = (
-            full_trades[-1].timestamp
-            if full_trades
-            else token_created_at + full_sec
+            full_trades[-1].timestamp if full_trades else token_created_at + full_sec
         )
 
         # Entry clock must lie at the END of the full window, not at 5s mark.
@@ -703,9 +741,7 @@ class TestOptimizerFastEntryClock:
         full_trades: list[Trade] = []
 
         entry_time = (
-            full_trades[-1].timestamp
-            if full_trades
-            else token_created_at + full_sec
+            full_trades[-1].timestamp if full_trades else token_created_at + full_sec
         )
         assert entry_time == pytest.approx(545.0)
 
@@ -744,8 +780,12 @@ class TestResumeLastEventTs:
             # Simulate activity via update_paper_trade, which stamps
             # price_updated_at = time.time().
             await db.update_paper_trade(
-                trade_id, current_price=2e-6, entry_price=1e-6,
-                total_buys=3, total_sells=0, mcap_sol=40.0,
+                trade_id,
+                current_price=2e-6,
+                entry_price=1e-6,
+                total_buys=3,
+                total_sells=0,
+                mcap_sol=40.0,
             )
             row = db.get_paper_trades(status="open")[0]
             return trade_id, float(row["price_updated_at"])
@@ -764,21 +804,33 @@ class TestResumeLastEventTs:
         async def seed() -> None:
             await db.open_paper_trade(
                 {
-                    "mint": "R", "symbol": "R", "entry_price": 1e-6,
-                    "entry_time": 5_000.0, "entry_mcap_sol": 30.0,
-                    "entry_buyer_number": 1, "entry_type": "fast",
-                    "entry_score": 20, "buy_amount_sol": 0.01,
+                    "mint": "R",
+                    "symbol": "R",
+                    "entry_price": 1e-6,
+                    "entry_time": 5_000.0,
+                    "entry_mcap_sol": 30.0,
+                    "entry_buyer_number": 1,
+                    "entry_type": "fast",
+                    "entry_score": 20,
+                    "buy_amount_sol": 0.01,
                 }
             )
             await db.update_paper_trade(
-                1, current_price=2e-6, entry_price=1e-6,
-                total_buys=1, total_sells=0, mcap_sol=30.0,
+                1,
+                current_price=2e-6,
+                entry_price=1e-6,
+                total_buys=1,
+                total_sells=0,
+                mcap_sol=30.0,
             )
 
         asyncio.run(seed())
 
-        import psycopg2, psycopg2.extras
+        import psycopg2
+        import psycopg2.extras
+
         from pulse_bot.db import _resolve_dsn
+
         conn = psycopg2.connect(_resolve_dsn(db.db_path))
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
             cur.execute(

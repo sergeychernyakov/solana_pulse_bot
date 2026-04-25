@@ -267,7 +267,9 @@ def test_economic_backtest_realistic_is_stricter() -> None:
     standard = check_economic_backtest(y, proba, realistic=False)
     realistic = check_economic_backtest(y, proba, realistic=True)
     assert standard.metric is not None and realistic.metric is not None
-    assert realistic.metric < standard.metric, "Realistic variant should penalize more than standard"
+    assert (
+        realistic.metric < standard.metric
+    ), "Realistic variant should penalize more than standard"
 
 
 def test_economic_backtest_no_entries() -> None:

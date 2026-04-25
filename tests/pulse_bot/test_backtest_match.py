@@ -20,7 +20,6 @@ from typing import AsyncIterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import psycopg2
-
 import pytest
 
 from pulse_bot.config import PulseBotConfig
@@ -29,7 +28,6 @@ from pulse_bot.filters.scorer import Scorer
 from pulse_bot.models import CreatorStats, ScoringResult, Token, Trade
 from pulse_bot.pipeline import Pipeline
 from pulse_bot.sources.replay import ReplayLaunchpad
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -282,18 +280,32 @@ def _populate_replay_pg(dsn: str, token: Token, trades: list[Trade]) -> None:
         cur.execute(
             "INSERT INTO tokens (mint, name, symbol, creator, created_at, uri, launchpad)"
             " VALUES (%s,%s,%s,%s,%s,%s,%s)",
-            (token.mint, token.name, token.symbol, token.creator,
-             token.created_at, token.uri or "", token.launchpad or "pumpfun"),
+            (
+                token.mint,
+                token.name,
+                token.symbol,
+                token.creator,
+                token.created_at,
+                token.uri or "",
+                token.launchpad or "pumpfun",
+            ),
         )
         for trade in trades:
             cur.execute(
                 "INSERT INTO trades (mint, wallet, tx_type, sol_amount, token_amount,"
                 " market_cap_sol, v_sol_in_bonding_curve, timestamp, is_creator)"
                 " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                (trade.mint, trade.wallet, trade.tx_type, trade.sol_amount,
-                 trade.token_amount, trade.market_cap_sol,
-                 trade.v_sol_in_bonding_curve, trade.timestamp,
-                 1 if trade.is_creator else 0),
+                (
+                    trade.mint,
+                    trade.wallet,
+                    trade.tx_type,
+                    trade.sol_amount,
+                    trade.token_amount,
+                    trade.market_cap_sol,
+                    trade.v_sol_in_bonding_curve,
+                    trade.timestamp,
+                    1 if trade.is_creator else 0,
+                ),
             )
     conn.close()
 

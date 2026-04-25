@@ -65,6 +65,56 @@ def sha256_file(path: Path, chunk_bytes: int = 65536) -> str:
     return h.hexdigest()
 
 
+def _check_config_drift(meta_path: Path, runtime_config: Any) -> None:
+    """Compare meta-recorded training config to runtime config and WARN.
+
+    Reads ``config_hash`` + ``config_values`` from ``meta.json``. If the
+    hash matches, no-op (silent). If it differs, computes a per-field
+    diff and logs WARNING listing each changed field with both values.
+
+    Older models without a recorded hash (pre-2026-04-25 training runs)
+    are tolerated silently — the WARN would fire on every startup until
+    the next retrain, which is just noise.
+
+    Never raises: drift detection must not block model loading. ``policy``
+    refuses to load only on schema/feature-order mismatch (still does).
+    """
+    try:
+        if not meta_path.exists():
+            return
+        meta = json.loads(meta_path.read_text())
+        meta_hash = meta.get("config_hash")
+        if not meta_hash:
+            # Legacy model — silently skip. Retraining will populate it.
+            return
+        from pulse_bot.ml.config_hash import (
+            compute_config_hash,
+            diff_relevant_fields_from_dict,
+        )
+
+        runtime_hash = compute_config_hash(runtime_config)
+        if runtime_hash == meta_hash:
+            return
+        meta_values = meta.get("config_values") or {}
+        diff = diff_relevant_fields_from_dict(meta_values, runtime_config)
+        diff_lines = [
+            f"    {field}: training={train_v!r} runtime={run_v!r}"
+            for field, (train_v, run_v) in sorted(diff.items())
+        ]
+        logger.warning(
+            "Runtime PulseBotConfig differs from training-time config "
+            "(meta_hash=%s runtime_hash=%s, %d field(s) drifted). Model "
+            "still loaded — operator should retrain or revert config to "
+            "match labels distribution.\n%s",
+            meta_hash[:12],
+            runtime_hash[:12],
+            len(diff),
+            "\n".join(diff_lines) if diff_lines else "    (no per-field diff)",
+        )
+    except Exception:
+        logger.debug("config_hash drift check skipped", exc_info=True)
+
+
 def _first_mismatch(expected: list[str], got: list[str]) -> str:
     """Human-readable first point where two feature-order lists diverge."""
     for i, (e, g) in enumerate(zip(expected, got)):
@@ -188,6 +238,14 @@ class EntryMLPolicy:
             from pulse_bot.config import get_config
 
             cfg = get_config()
+            # config_hash drift check (2026-04-25): compare meta-recorded
+            # training-time config against the runtime config. Any drift
+            # in label-affecting / hparam-affecting fields is logged as
+            # WARNING. We deliberately do NOT refuse to load — operators
+            # may flip cosmetic-but-tracked fields (e.g. exit_ml_active
+            # for a kill-switch) without retraining; the warning gives
+            # visibility, the operator decides.
+            _check_config_drift(meta_path, cfg)
             if cfg.entry_ml_proba_floor is not None:
                 logger.info(
                     "EntryMLPolicy: config overrides proba_floor %.3f → %.3f",

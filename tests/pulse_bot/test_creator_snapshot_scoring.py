@@ -66,18 +66,14 @@ def test_high_rug_rate_rejects() -> None:
 
 def test_low_graduation_rate_rejects() -> None:
     s = _scorer(creator_min_graduation_rate=0.10)
-    result = s.score(
-        _token(), [], creator_snapshot=_stats(graduation_rate=0.02)
-    )
+    result = s.score(_token(), [], creator_snapshot=_stats(graduation_rate=0.02))
     assert result.decision == "SKIP"
     assert "creator_grad_rate_low" in result.reasons_summary
 
 
 def test_new_creator_rejected_when_age_gate_on() -> None:
     s = _scorer(creator_min_age_days=7.0)
-    result = s.score(
-        _token(), [], creator_snapshot=_stats(creator_age_days=1.5)
-    )
+    result = s.score(_token(), [], creator_snapshot=_stats(creator_age_days=1.5))
     assert result.decision == "SKIP"
     assert "creator_too_new" in result.reasons_summary
 

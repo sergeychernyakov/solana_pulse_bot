@@ -85,9 +85,11 @@ def test_parse_invalid_base64_returns_none() -> None:
 
 def test_mint_state_defaults() -> None:
     s = MintState(
-        mint="x", observed_at=0.0,
+        mint="x",
+        observed_at=0.0,
         mint_authority_revoked=True,
         freeze_authority_revoked=True,
-        supply_raw=0, decimals=0,
+        supply_raw=0,
+        decimals=0,
     )
     assert s.parse_error is None

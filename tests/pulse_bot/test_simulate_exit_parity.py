@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from pulse_bot.config import get_config
 from pulse_bot.core import PaperTradeRunner
-from pulse_bot.ml.simulate_exit import simulate_exit
+from pulse_bot.ml.simulate_exit import simulate_exit, simulate_exit_batch
 from pulse_bot.models import Trade
 
 
@@ -46,9 +46,7 @@ def _make_trade(
     )
 
 
-def _replay_manual(
-    config, trades: list[Trade], entry_ts: float, entry_price: float
-):
+def _replay_manual(config, trades: list[Trade], entry_ts: float, entry_price: float):
     """Hand-rolled equivalent of simulate_exit for parity comparison."""
     runner = PaperTradeRunner(config, entry_price)
     last_ts = entry_ts
@@ -85,7 +83,9 @@ def test_simulate_exit_matches_manual_replay_inactivity() -> None:
     trades = [
         _make_trade("M", "W1", "buy", 1.0, 1.0, 10.0, 5.0),
         # Gap larger than config.exit_inactivity_seconds
-        _make_trade("M", "W2", "buy", 1.0, 1.0, 10.5, 5.0 + cfg.exit_inactivity_seconds + 50.0),
+        _make_trade(
+            "M", "W2", "buy", 1.0, 1.0, 10.5, 5.0 + cfg.exit_inactivity_seconds + 50.0
+        ),
     ]
     a = simulate_exit(cfg, trades, entry_ts=0.0, entry_price=1.0)
     b = _replay_manual(cfg, trades, entry_ts=0.0, entry_price=1.0)
@@ -120,6 +120,7 @@ def test_simulate_exit_preserves_exit_manager_behavior() -> None:
     ]
     # SL=15% → should fire hard_stop immediately
     from dataclasses import replace
+
     cfg_tight = replace(cfg, exit_hard_stop_loss_pct=5.0)
     cfg_loose = replace(cfg, exit_hard_stop_loss_pct=50.0)
     tight = simulate_exit(cfg_tight, trades, entry_ts=0.0, entry_price=1.0)
@@ -127,3 +128,68 @@ def test_simulate_exit_preserves_exit_manager_behavior() -> None:
     assert tight.exit_reason == "hard_stop"
     # Loose SL = 50%, only -25% drawdown → stays hold, ends in timeout.
     assert loose.exit_reason == "timeout"
+
+
+# ─────────── Batch parity (roadmap parallel-infra item) ──────────────
+
+
+def _make_dump_scenario(mint: str) -> list[Trade]:
+    """Steady price-decay scenario shared by per-token + batch."""
+    return [
+        _make_trade(mint, f"W{i}", "sell", 0.8, 1.0, max(5.0 - i * 0.1, 0.1), 1.0 + i)
+        for i in range(10)
+    ]
+
+
+def _make_pump_scenario(mint: str) -> list[Trade]:
+    """Mild upward price drift; usually exits via timeout."""
+    return [
+        _make_trade(mint, f"W{i}", "buy", 0.5, 1.0, 10.0 + i * 0.05, 1.0 + i * 0.5)
+        for i in range(8)
+    ]
+
+
+def test_simulate_exit_batch_matches_per_token() -> None:
+    """simulate_exit_batch over many mints == calling simulate_exit one
+    mint at a time. Bit-identical pnl_pct, exit_reason, exit_price."""
+    cfg = get_config()
+    trades_by_mint = {
+        "DUMP-A": _make_dump_scenario("DUMP-A"),
+        "DUMP-B": _make_dump_scenario("DUMP-B"),
+        "PUMP-C": _make_pump_scenario("PUMP-C"),
+        "PUMP-D": _make_pump_scenario("PUMP-D"),
+    }
+    entries = {
+        "DUMP-A": (0.0, 1.0),
+        "DUMP-B": (0.5, 1.5),
+        "PUMP-C": (0.0, 1.0),
+        "PUMP-D": (0.0, 2.0),
+    }
+    batch = simulate_exit_batch(cfg, trades_by_mint, entries)
+    for mint, (e_ts, e_px) in entries.items():
+        single = simulate_exit(cfg, trades_by_mint[mint], e_ts, e_px)
+        b = batch[mint]
+        assert b.exit_reason == single.exit_reason, mint
+        assert abs(b.pnl_pct - single.pnl_pct) < 1e-9, mint
+        assert abs(b.exit_price - single.exit_price) < 1e-9, mint
+        assert b.total_buys == single.total_buys, mint
+        assert b.total_sells == single.total_sells, mint
+
+
+def test_simulate_exit_batch_handles_doa_mint() -> None:
+    """A mint absent from trades_by_mint (or with empty trades) returns
+    the runner's timeout_result — same as simulate_exit() called with []."""
+    cfg = get_config()
+    entries = {"DOA": (10.0, 1.0)}
+    batch = simulate_exit_batch(cfg, {}, entries)
+    single = simulate_exit(cfg, [], entry_ts=10.0, entry_price=1.0)
+    assert "DOA" in batch
+    assert batch["DOA"].exit_reason == single.exit_reason == "timeout"
+    assert abs(batch["DOA"].pnl_pct - single.pnl_pct) < 1e-9
+    assert abs(batch["DOA"].exit_price - single.exit_price) < 1e-9
+
+
+def test_simulate_exit_batch_empty_entries_returns_empty() -> None:
+    """Defensive: empty entries map should not crash, returns empty dict."""
+    cfg = get_config()
+    assert simulate_exit_batch(cfg, {}, {}) == {}

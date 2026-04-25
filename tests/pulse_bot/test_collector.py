@@ -12,7 +12,6 @@ import pytest
 
 from pulse_bot.collector import HeliusCollector
 
-
 # ---------------------------------------------------------------------------
 # Test Helius transaction parsing
 # ---------------------------------------------------------------------------

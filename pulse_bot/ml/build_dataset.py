@@ -375,7 +375,7 @@ def build_entry_dataset(
     # skew. Using simulate_exit means any config change automatically
     # invalidates this dataset (meta.json stores config hash).
     from pulse_bot.config import get_config
-    from pulse_bot.ml.simulate_exit import simulate_exit
+    from pulse_bot.ml.simulate_exit import simulate_exit, simulate_exit_batch
     from pulse_bot.models import Trade
 
     live_config = get_config()
@@ -396,82 +396,149 @@ def build_entry_dataset(
         live_config.exit_trailing_stop_enabled,
     )
 
+    # ── Bulk-fetch trades for ALL mints in one round-trip ──────────────
+    # Previous implementation issued one SELECT per row (~60k mints →
+    # ~60k network round-trips). Roadmap parallel-infra item: pull every
+    # relevant trade once, group by mint in pandas, then loop in pure
+    # Python with zero DB I/O. The per-token simulate_exit_batch path is
+    # bit-identical to simulate_exit (see test_simulate_exit_parity).
+    mints = base["mint"].tolist()
+    scored_map = {
+        str(row["mint"]): float(row["scored_at"]) for _, row in base.iterrows()
+    }
+    all_trades_by_mint: dict[str, list[tuple]] = {m: [] for m in mints}
+    if mints:
+        # Chunked ``ANY(%s::text[])`` (500 mints/chunk). Benchmarked vs
+        # both per-mint point queries and a single giant ANY(60k) — the
+        # giant ANY drops to a Seq Scan on ``trades`` (~1.2s/query),
+        # while chunks of ~500 stay on the (mint, timestamp) BTree index
+        # and finish ~7x faster. 500 was chosen by sweep on a 5000-mint
+        # slice; 100 also works but adds round-trips.
+        cur = conn.cursor()
+        rows_fetched = 0
+        chunk_size = 500
+        for chunk_start in range(0, len(mints), chunk_size):
+            chunk = mints[chunk_start : chunk_start + chunk_size]
+            cur.execute(
+                """SELECT mint, timestamp, tx_type, sol_amount, token_amount,
+                          market_cap_sol, v_sol_in_bonding_curve, wallet
+                   FROM trades
+                   WHERE mint = ANY(%s::text[])
+                     AND market_cap_sol > 0
+                   ORDER BY mint ASC, timestamp ASC""",
+                (chunk,),
+            )
+            for tr in cur:
+                mint = tr[0]
+                scored = scored_map.get(mint)
+                if scored is None:
+                    continue
+                ts = float(tr[1] or 0.0)
+                # Same window filter as the per-token query (BETWEEN
+                # scored AND scored + window). Done client-side: one
+                # bulk query per chunk, each mint has its own ts cutoff.
+                if ts < scored or ts > scored + trade_window_sec:
+                    continue
+                all_trades_by_mint[mint].append(tr)
+                rows_fetched += 1
+        cur.close()
+        logger.info(
+            "Bulk-fetched %d trades across %d mints (chunked %d-mint queries)",
+            rows_fetched,
+            len(mints),
+            chunk_size,
+        )
+
+    # ── Build entry points + post-entry trade lists (no DB I/O) ────────
     labels: list[int | None] = []
     realized_pnls: list[float | None] = []
     exit_reasons: list[str | None] = []
+    trades_by_mint: dict[str, list[Trade]] = {}
+    entries_by_mint: dict[str, tuple[float, float]] = {}
+    # Pre-flagged DOA mints: skip the simulator entirely (label=0 / 0.0 PnL,
+    # exit_reason set explicitly so the simulator's "timeout" doesn't mask
+    # them in diagnostics).
+    doa_reasons: dict[str, str] = {}
+
     for _, row in base.iterrows():
-        scored_at = float(row["scored_at"])
-        cutoff = scored_at + trade_window_sec
-        trade_rows = _pg_exec(
-            conn,
-            """SELECT timestamp, tx_type, sol_amount, token_amount,
-                      market_cap_sol, v_sol_in_bonding_curve, wallet
-               FROM trades
-               WHERE mint = ? AND timestamp BETWEEN ? AND ?
-                 AND market_cap_sol > 0
-               ORDER BY timestamp ASC""",
-            (row["mint"], scored_at, cutoff),
-        ).fetchall()
+        mint = str(row["mint"])
+        trade_rows = all_trades_by_mint.get(mint) or []
         if not trade_rows:
-            # DOA — no post-scoring trades. 2026-04-24 codex diagnosis:
-            # dropping these caused survivor bias (model trained on 1292
-            # survivors, deployed on 96% DOA population → manifolds don't
-            # overlap → live WR collapses + anti-correlation at high
-            # proba). Fix: include DOA with label=0, realized_pnl=0 so
-            # the model learns the DOA feature signature and decision
-            # boundary at full population. Balance handled downstream via
-            # scale_pos_weight (increases naturally) + optional stratified
-            # undersample (controlled by env).
-            labels.append(0)
-            realized_pnls.append(0.0)
-            exit_reasons.append("doa_no_trades")
+            doa_reasons[mint] = "doa_no_trades"
             continue
-        # First buy after scored_at defines the entry point (same
-        # semantics the live pipeline uses: PaperTradeRunner opens on
-        # first post-scoring buy with market_cap_sol > 0).
         entry_idx = None
         entry_price = None
         entry_ts = None
         for i, t in enumerate(trade_rows):
-            ts, tx, sol_amt, tok_amt, mc, _vsol, _w = t
+            tx = t[2]
+            sol_amt = t[3]
+            tok_amt = t[4]
             if tx == "buy" and tok_amt and sol_amt:
                 entry_price = float(sol_amt) / float(tok_amt)
-                entry_ts = float(ts)
+                entry_ts = float(t[1])
                 entry_idx = i
                 break
         if entry_idx is None or not entry_price or entry_price <= 0:
-            # Had trades but no usable buy → functionally DOA for our
-            # strategy (can't enter). Treat as label=0 same as DOA.
-            labels.append(0)
-            realized_pnls.append(0.0)
-            exit_reasons.append("doa_no_entry")
+            doa_reasons[mint] = "doa_no_entry"
             continue
-        # Post-entry trades replayed through the exact exit logic.
         post_entry_trades = [
             Trade(
-                mint=row["mint"],
-                wallet=t[6] or "",
-                tx_type=t[1],
-                sol_amount=float(t[2] or 0.0),
-                token_amount=float(t[3] or 0.0),
+                mint=mint,
+                wallet=t[7] or "",
+                tx_type=t[2],
+                sol_amount=float(t[3] or 0.0),
+                token_amount=float(t[4] or 0.0),
                 new_token_balance=0.0,
                 bonding_curve_key="",
-                v_sol_in_bonding_curve=float(t[5] or 0.0),
+                v_sol_in_bonding_curve=float(t[6] or 0.0),
                 v_tokens_in_bonding_curve=0.0,
-                market_cap_sol=float(t[4] or 0.0),
-                timestamp=float(t[0]),
+                market_cap_sol=float(t[5] or 0.0),
+                timestamp=float(t[1]),
             )
             for t in trade_rows[entry_idx + 1 :]
         ]
+        trades_by_mint[mint] = post_entry_trades
+        entries_by_mint[mint] = (entry_ts, entry_price)
+
+    # ── Batch simulate (still loops per mint inside; PaperTradeRunner is
+    #    stateful and serial — but no I/O, no cursor reopens) ──────────
+    sim_results: dict[str, "object"] = {}
+    if entries_by_mint:
         try:
-            mr = simulate_exit(live_config, post_entry_trades, entry_ts, entry_price)
+            sim_results = simulate_exit_batch(
+                live_config, trades_by_mint, entries_by_mint
+            )
         except Exception as exc:
+            # Fall back to per-token path so a single bad row doesn't
+            # nuke the whole dataset. We still avoid PG round-trips here.
             logger.warning(
-                "simulate_exit failed for %s (entry_ts=%.0f): %s — dropping row",
-                row["mint"],
-                entry_ts,
+                "simulate_exit_batch raised %s — falling back to per-token loop",
                 exc,
             )
+            for mint, (e_ts, e_px) in entries_by_mint.items():
+                try:
+                    sim_results[mint] = simulate_exit(
+                        live_config, trades_by_mint[mint], e_ts, e_px
+                    )
+                except Exception as inner:
+                    logger.warning(
+                        "simulate_exit failed for %s (entry_ts=%.0f): %s — drop",
+                        mint,
+                        e_ts,
+                        inner,
+                    )
+                    sim_results[mint] = None  # type: ignore[assignment]
+
+    # ── Stitch results back in base-row order ─────────────────────────
+    for _, row in base.iterrows():
+        mint = str(row["mint"])
+        if mint in doa_reasons:
+            labels.append(0)
+            realized_pnls.append(0.0)
+            exit_reasons.append(doa_reasons[mint])
+            continue
+        mr = sim_results.get(mint)
+        if mr is None:
             labels.append(None)
             realized_pnls.append(None)
             exit_reasons.append(None)

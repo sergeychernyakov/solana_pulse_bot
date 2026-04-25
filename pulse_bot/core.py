@@ -302,6 +302,47 @@ class PaperTradeRunner:
         self._last_trade_ts = trade.timestamp
         return None
 
+    def tick(self, now: float, entry_time: float) -> MonitorResult | None:
+        """Evaluate exit rules without a new trade event (Phase 4A timer tick).
+
+        Recomputes the pulse snapshot from the existing window via
+        ``PulseMonitor.update_empty_tick`` and asks ExitManager whether
+        we should close. Used by ``Pipeline._paper_trade`` to drive a
+        periodic exit re-evaluation when the trade stream is quiet —
+        previously the bot was blocked behind ``inactivity_timeout``
+        before any exit logic could fire on a stalled token.
+
+        Hard-stop is NOT re-checked here (price has not changed without a
+        trade). ``elapsed`` uses ``now`` so timeout / max_hold can still
+        fire on quiet tokens. Returns ``None`` to keep holding, or a
+        :class:`MonitorResult` to close.
+        """
+        snapshot = self._pulse.update_empty_tick(now)
+        if not snapshot:
+            return None
+
+        elapsed = max(now - entry_time, 0.0)
+        current_leg_pnl = self._calc_leg_pnl(self._current_price)
+        signal = self._exit_mgr.decide(snapshot, current_leg_pnl, elapsed)
+
+        if signal.action == "sell_partial":
+            sell_frac = min(signal.sell_pct, self._remaining)
+            if sell_frac > 0:
+                self._partial_fills.append((sell_frac, self._current_price))
+                self._remaining = max(self._remaining - sell_frac, 0.0)
+            return None
+
+        if signal.action == "sell_all":
+            return MonitorResult(
+                exit_price=self._current_price,
+                exit_reason=signal.reason,
+                pnl_pct=self._weighted_pnl(self._current_price),
+                total_buys=self._total_buys,
+                total_sells=self._total_sells,
+            )
+
+        return None
+
     def timeout_result(self) -> MonitorResult:
         """Build result for timeout/dead_token exit."""
         return MonitorResult(

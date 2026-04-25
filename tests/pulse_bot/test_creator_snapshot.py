@@ -48,7 +48,14 @@ def _insert_score(
                 "INSERT INTO token_scores (mint, source, creator, market_cap_sol,"
                 " curve_progress_pct, created_at, scored_at)"
                 " VALUES (%s,'live',%s,%s,%s,%s,%s)",
-                (mint, creator, market_cap_sol, curve_progress_pct, created_at, created_at),
+                (
+                    mint,
+                    creator,
+                    market_cap_sol,
+                    curve_progress_pct,
+                    created_at,
+                    created_at,
+                ),
             )
 
 
@@ -73,9 +80,17 @@ class TestCreatorSnapshotsSchema:
                 )
                 cols = {r[0] for r in cur.fetchall()}
         for col in (
-            "creator", "observed_at", "computed_through_ts", "api_source",
-            "rug_rate", "graduation_rate", "total_prior_tokens",
-            "median_peak_mc_sol", "creator_age_days", "feature_version", "data_json",
+            "creator",
+            "observed_at",
+            "computed_through_ts",
+            "api_source",
+            "rug_rate",
+            "graduation_rate",
+            "total_prior_tokens",
+            "median_peak_mc_sol",
+            "creator_age_days",
+            "feature_version",
+            "data_json",
         ):
             assert col in cols, f"missing column {col}"
 
@@ -84,8 +99,11 @@ class TestSnapshotObservedAtSemantics:
     def test_future_snapshot_ignored_by_backtest_read(self, pg_test_db: str) -> None:
         db = Database()
         db.save_creator_snapshot(
-            creator="C1", observed_at=100.0, computed_through_ts=100.0,
-            api_source="local", total_prior_tokens=3,
+            creator="C1",
+            observed_at=100.0,
+            computed_through_ts=100.0,
+            api_source="local",
+            total_prior_tokens=3,
         )
         assert db.get_creator_snapshot_as_of("C1", 80.0) is None
         assert db.get_creator_snapshot_as_of("C1", 100.0) is not None
@@ -108,11 +126,18 @@ class TestSnapshotObservedAtSemantics:
         assert row is not None
         assert row["total_prior_tokens"] == 7
 
-    def test_rug_rate_and_grad_rate_persisted_from_counts(self, pg_test_db: str) -> None:
+    def test_rug_rate_and_grad_rate_persisted_from_counts(
+        self, pg_test_db: str
+    ) -> None:
         db = Database()
         db.save_creator_snapshot(
-            "C1", 100.0, 100.0, "local",
-            total_prior_tokens=10, rug_count=3, graduated_count=2,
+            "C1",
+            100.0,
+            100.0,
+            "local",
+            total_prior_tokens=10,
+            rug_count=3,
+            graduated_count=2,
         )
         row = db.get_creator_snapshot_latest("C1")
         assert row is not None
@@ -180,11 +205,17 @@ class TestLocalSnapshotSource:
 
     def test_local_source_rug_and_graduated_counts(self, pg_test_db: str) -> None:
         _insert_token(pg_test_db, "m1", "C1", 10.0)
-        _insert_score(pg_test_db, "m1", "C1", 10.0, market_cap_sol=0.5, curve_progress_pct=15.0)
+        _insert_score(
+            pg_test_db, "m1", "C1", 10.0, market_cap_sol=0.5, curve_progress_pct=15.0
+        )
         _insert_token(pg_test_db, "m2", "C1", 20.0)
-        _insert_score(pg_test_db, "m2", "C1", 20.0, market_cap_sol=30.0, curve_progress_pct=100.0)
+        _insert_score(
+            pg_test_db, "m2", "C1", 20.0, market_cap_sol=30.0, curve_progress_pct=100.0
+        )
         _insert_token(pg_test_db, "m3", "C1", 30.0)
-        _insert_score(pg_test_db, "m3", "C1", 30.0, market_cap_sol=5.0, curve_progress_pct=40.0)
+        _insert_score(
+            pg_test_db, "m3", "C1", 30.0, market_cap_sol=5.0, curve_progress_pct=40.0
+        )
 
         src = LocalSnapshotSource(pg_test_db)
         snap = asyncio.run(src.compute("C1", 100.0))
@@ -193,7 +224,9 @@ class TestLocalSnapshotSource:
         assert snap.rug_count == 1
         assert snap.graduated_count == 1
 
-    def test_local_source_returns_none_for_unknown_creator(self, pg_test_db: str) -> None:
+    def test_local_source_returns_none_for_unknown_creator(
+        self, pg_test_db: str
+    ) -> None:
         src = LocalSnapshotSource(pg_test_db)
         assert asyncio.run(src.compute("unknown_creator", 100.0)) is None
 
@@ -222,7 +255,9 @@ class TestCreatorSnapshotService:
         assert snap["total_prior_tokens"] == 2
         assert src.calls == []
 
-    def test_backtest_path_returns_none_when_no_snapshot_visible(self, pg_test_db: str) -> None:
+    def test_backtest_path_returns_none_when_no_snapshot_visible(
+        self, pg_test_db: str
+    ) -> None:
         db = Database()
         db.save_creator_snapshot("C1", 200.0, 200.0, "local", total_prior_tokens=5)
         src = _FakeSource()
@@ -233,7 +268,9 @@ class TestCreatorSnapshotService:
     def test_live_uses_fresh_cache_without_refetch(self, pg_test_db: str) -> None:
         db = Database()
         now = 1000.0
-        db.save_creator_snapshot("C1", now - 60.0, now - 60.0, "local", total_prior_tokens=3)
+        db.save_creator_snapshot(
+            "C1", now - 60.0, now - 60.0, "local", total_prior_tokens=3
+        )
         src = _FakeSource()
         svc = CreatorSnapshotService(db, src)
         snap = asyncio.run(svc.get_for_live("C1", now=now))
@@ -245,8 +282,11 @@ class TestCreatorSnapshotService:
         db = Database()
         src = _FakeSource()
         src.result = CreatorSnapshot(
-            creator="C1", observed_at=1000.0, computed_through_ts=1000.0,
-            api_source="local", total_prior_tokens=7,
+            creator="C1",
+            observed_at=1000.0,
+            computed_through_ts=1000.0,
+            api_source="local",
+            total_prior_tokens=7,
         )
         svc = CreatorSnapshotService(db, src)
         snap = asyncio.run(svc.get_for_live("C1", now=1000.0))
@@ -255,11 +295,15 @@ class TestCreatorSnapshotService:
         assert src.calls == [("C1", 1000.0)]
         assert db.get_creator_snapshot_latest("C1") is not None
 
-    def test_live_degrades_on_source_failure_returning_stale_if_any(self, pg_test_db: str) -> None:
+    def test_live_degrades_on_source_failure_returning_stale_if_any(
+        self, pg_test_db: str
+    ) -> None:
         db = Database()
         now = 100_000.0
         very_old = now - 48 * 3600.0
-        db.save_creator_snapshot("C1", very_old, very_old, "local", total_prior_tokens=2)
+        db.save_creator_snapshot(
+            "C1", very_old, very_old, "local", total_prior_tokens=2
+        )
         src = _FakeSource()
         src.raise_error = RuntimeError("helius 500")
         svc = CreatorSnapshotService(db, src)
@@ -267,7 +311,9 @@ class TestCreatorSnapshotService:
         assert snap is not None
         assert snap["total_prior_tokens"] == 2
 
-    def test_live_degrades_to_none_when_no_cache_and_source_fails(self, pg_test_db: str) -> None:
+    def test_live_degrades_to_none_when_no_cache_and_source_fails(
+        self, pg_test_db: str
+    ) -> None:
         db = Database()
         src = _FakeSource()
         src.raise_error = RuntimeError("timeout")

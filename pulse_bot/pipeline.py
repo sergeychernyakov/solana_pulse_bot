@@ -294,8 +294,9 @@ class Pipeline:
         task.add_done_callback(self._onchain_tasks.discard)
 
     def _schedule_holder_capture(self, mint: str, created_at: float) -> None:
-        """Schedule 3 holder snapshots (T+10s, T+30s, T+60s) for a new
-        token. Bounded by semaphore (max 50 concurrent RPC calls).
+        """Schedule 3 holder snapshots (T+30s, T+60s, T+120s) for a new
+        token. Bounded by semaphore (concurrent RPC cap) to prevent
+        unbounded growth when many tokens await their capture slot.
 
         Pre-capture death detection via DB trades was removed — trades
         aren't inserted until after the 45s observation window, so at
@@ -303,21 +304,73 @@ class Pipeline:
         entire dataset. Analysis instead treats a mint with 3× parse_error
         in ``holder_capture_failures`` (and zero snapshot rows) as a
         pre-capture death class.
+
+        Lag instrumentation (2026-04-25, Phase 3 prereq): logs
+        ``Helius T+N capture lag: actual=X scheduled=Y delta=Δ`` per
+        capture so we can quantify how far past the target age the
+        snapshot actually fired. Three lag sources we measure:
+
+        * ``loop_lag``  — wakeup-from-sleep jitter (asyncio scheduler).
+        * ``sem_wait``  — time queued at the concurrency semaphore.
+        * ``rpc_time``  — HTTP roundtrip itself.
+
+        Fixes vs. pre-2026-04-25 implementation:
+
+        1. Semaphore raised 50 → 100. At 200 tokens × 3 captures, a 50-
+           slot cap with ~500 ms p50 RPC time serialised T+30 bursts:
+           bursts of 100+ simultaneous wakeups had to wait ~1 RPC each
+           to acquire. Helius free tier comfortably handles 100
+           concurrent. Override via ``PULSE_HELIUS_HOLDER_CONCURRENCY``.
+        2. Use ``loop.time()`` for the semaphore wait measurement
+           (monotonic, immune to wall-clock jumps).
         """
         if self._holder_client is None:
             return
         from pulse_bot.helius_holders import CAPTURE_AGE_SECONDS
 
         if self._holder_sem is None:
-            self._holder_sem = asyncio.Semaphore(50)
+            import os as _os
+
+            sem_size = int(_os.environ.get("PULSE_HELIUS_HOLDER_CONCURRENCY", "100"))
+            self._holder_sem = asyncio.Semaphore(sem_size)
+
+        loop = asyncio.get_event_loop()
 
         async def _run_one(target_age: float) -> None:
+            t0 = time.time()
+            scheduled_at_wall = created_at + target_age
             try:
-                delay = target_age - (time.time() - created_at)
+                delay = scheduled_at_wall - t0
                 if delay > 0:
                     await asyncio.sleep(delay)
+                # loop_lag = how much later than scheduled we woke up.
+                woke_at = time.time()
+                loop_lag = max(0.0, woke_at - scheduled_at_wall)
+                # sem_wait = time queued at the semaphore (monotonic).
+                sem_wait_start = loop.time()
                 async with self._holder_sem:  # type: ignore[arg-type]
+                    sem_wait = max(0.0, loop.time() - sem_wait_start)
+                    rpc_start = time.time()
                     snap = await self._holder_client.fetch(mint, target_age)
+                    rpc_time = max(0.0, time.time() - rpc_start)
+                actual_age = (
+                    snap.observed_at - created_at if snap is not None else float("nan")
+                )
+                total_lag = (
+                    actual_age - target_age if snap is not None else float("nan")
+                )
+                logger.info(
+                    "Helius T+%.0f capture lag: actual=%.2fs scheduled=%.2fs "
+                    "delta=%+.2fs (loop=%.2fs sem=%.2fs rpc=%.2fs) mint=%s",
+                    target_age,
+                    actual_age,
+                    float(target_age),
+                    total_lag,
+                    loop_lag,
+                    sem_wait,
+                    rpc_time,
+                    mint[:12],
+                )
                 if snap is not None:
                     await asyncio.to_thread(self._db.save_holder_snapshot, snap)
             except asyncio.CancelledError:
@@ -788,6 +841,29 @@ class Pipeline:
             logger.exception("Error processing token %s (%s)", token.symbol, mint_short)
             await self._launchpad.unsubscribe_trades(token.mint)
 
+    def _resolve_tick_seconds(self) -> float:
+        """Resolve the timer-tick interval for paper trades (Phase 4A).
+
+        Precedence: ``PULSE_TICK_SECONDS`` env var > ``config.pulse_tick_seconds``
+        attr (if present) > 5.0 default. Returning 0 disables the tick task
+        entirely — same behaviour as before Phase 4A.
+
+        Reading the env var directly (rather than threading a new config
+        field) keeps this orthogonal to the in-flight ``config.py`` commit
+        so the two changes can land independently.
+        """
+        import os
+
+        raw = os.environ.get("PULSE_TICK_SECONDS")
+        if raw is not None:
+            try:
+                return float(raw)
+            except ValueError:
+                logger.warning("PULSE_TICK_SECONDS=%r is not a number; ignoring", raw)
+        # Allow tests / future config to override via attribute without
+        # requiring an env var.
+        return float(getattr(self._config, "pulse_tick_seconds", 5.0))
+
     async def _extended_observation(self, mint: str, duration_seconds: float) -> None:
         """Continue saving trades for `duration_seconds` after a SKIP decision.
 
@@ -877,18 +953,69 @@ class Pipeline:
             resume_last_event_ts if resume_last_event_ts is not None else entry_ts
         )
 
-        try:
-            deadline = self._config.exit_max_hold_seconds
-            inactivity = self._config.exit_inactivity_seconds
+        # Phase 4A timer-tick infrastructure. The tick task fires every
+        # ``pulse_tick_seconds`` and re-evaluates ExitManager against the
+        # current pulse window — so a quiet token can close on
+        # pulse_dead / no_new_blood without waiting for ``inactivity_timeout``.
+        # Set ``PULSE_TICK_SECONDS=0`` (or via config attr) to disable
+        # and fall back to the pre-Phase-4A behaviour exactly.
+        tick_seconds = self._resolve_tick_seconds()
+        # Single-flight guard so trade-stream and tick task never both
+        # close the same trade. asyncio is single-threaded but we await
+        # DB calls between the check and the close; the lock serialises
+        # those critical sections.
+        close_lock = asyncio.Lock()
+        closed = False
+        # Track the close so the trade-stream coroutine can short-circuit
+        # the post-loop timeout/dead_token branch when the tick path closed
+        # the trade first.
+        close_outcome: dict[str, object] = {}
+
+        async def _close_via_runner_result(
+            result, trade_market_cap: float, exit_time: float
+        ) -> bool:
+            """Atomic close. Returns True if this caller performed the close."""
+            nonlocal closed
+            async with close_lock:
+                if closed:
+                    return False
+                closed = True
+                close_outcome["reason"] = result.exit_reason
+            await self._db.close_paper_trade(
+                trade_id,
+                result.exit_price,
+                result.exit_reason,
+                result.total_buys + result.total_sells,
+                trade_market_cap,
+                entry_price,
+                self._config.buy_amount_sol,
+                exit_time=exit_time,
+                pnl_pct=result.pnl_pct,
+            )
+            logger.info(
+                "PAPER SELL %s: pnl=%+.1f%% reason=%s hold=%.0fs",
+                token.symbol,
+                result.pnl_pct,
+                result.exit_reason,
+                max(exit_time - entry_ts, 0.0),
+            )
+            return True
+
+        deadline = self._config.exit_max_hold_seconds
+        inactivity = self._config.exit_inactivity_seconds
+
+        async def _trade_stream_loop() -> None:
+            """Original per-trade processing path. Closes via lock-guarded helper."""
+            nonlocal last_event_ts
             async for trade in self._launchpad.stream_trades(
                 token.mint, deadline, inactivity_timeout=inactivity
             ):
+                if closed:
+                    return
                 last_event_ts = trade.timestamp
 
-                # Save monitor trades to DB so replay/optimizer can use them
                 if not is_replay:
                     await self._db.insert_trades_batch([trade])
-                    # Phase E: keep wallet_activity in sync for post-entry trades
                     try:
                         await self._db.upsert_wallet_activity_from_trades([trade])
                     except Exception as exc:
@@ -896,7 +1023,6 @@ class Pipeline:
                             "wallet_activity upsert (monitor) failed: %s", exc
                         )
 
-                # Update paper trade in DB
                 await self._db.update_paper_trade(
                     trade_id,
                     runner.current_price,
@@ -909,32 +1035,70 @@ class Pipeline:
                     token.mint, runner.current_price, entry_price
                 )
 
-                # Core exit logic — same code as optimizer
                 result = runner.process_trade(trade, entry_ts)
                 if result:
-                    await self._db.close_paper_trade(
-                        trade_id,
-                        result.exit_price,
-                        result.exit_reason,
-                        result.total_buys + result.total_sells,
-                        trade.market_cap_sol,
-                        entry_price,
-                        self._config.buy_amount_sol,
+                    await _close_via_runner_result(
+                        result,
+                        trade_market_cap=trade.market_cap_sol,
                         exit_time=trade.timestamp,
-                        pnl_pct=result.pnl_pct,
-                    )
-                    logger.info(
-                        "PAPER SELL %s: pnl=%+.1f%% reason=%s hold=%.0fs",
-                        token.symbol,
-                        result.pnl_pct,
-                        result.exit_reason,
-                        max(trade.timestamp - entry_ts, 0.0),
                     )
                     return
 
-            # Stream ended — timeout or dead token.
-            # ``inactivity == 0`` means tracking is disabled: we cannot call
-            # it a dead_token, so exit as ``timeout`` at the last event.
+        async def _tick_loop() -> None:
+            """Periodic ExitManager re-evaluation when stream is quiet.
+
+            No-op when ``tick_seconds <= 0`` (back-compat). Replay sources
+            do not have a real-time clock anyway, but we still gate on the
+            ``replay`` flag so deterministic backtests don't drift.
+            """
+            if tick_seconds <= 0 or is_replay:
+                return
+            try:
+                while not closed:
+                    await asyncio.sleep(tick_seconds)
+                    if closed:
+                        return
+                    now = time.time()
+                    result = runner.tick(now, entry_ts)
+                    if result:
+                        await _close_via_runner_result(
+                            result,
+                            trade_market_cap=0.0,
+                            exit_time=now,
+                        )
+                        return
+            except asyncio.CancelledError:
+                raise
+
+        try:
+            stream_task = asyncio.create_task(_trade_stream_loop())
+            tick_task = asyncio.create_task(_tick_loop())
+            try:
+                done, pending = await asyncio.wait(
+                    {stream_task, tick_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                # Cancel the laggard so we don't leave a dangling timer or
+                # half-consumed stream iterator behind.
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                # Surface exceptions from the completed task(s).
+                for t in done:
+                    exc = t.exception()
+                    if exc is not None:
+                        raise exc
+            finally:
+                if not stream_task.done():
+                    stream_task.cancel()
+                if not tick_task.done():
+                    tick_task.cancel()
+
+            if closed:
+                return
+
+            # Stream ended without an exit decision — timeout / dead_token.
             exit_ts: float | None
             if inactivity > 0:
                 reason = "dead_token"
@@ -946,6 +1110,10 @@ class Pipeline:
                 inactive = 0.0
 
             timeout = runner.timeout_result()
+            async with close_lock:
+                if closed:
+                    return
+                closed = True
             await self._db.close_paper_trade(
                 trade_id,
                 timeout.exit_price,
@@ -966,21 +1134,23 @@ class Pipeline:
 
         except Exception:
             logger.exception("Paper trade error for %s", token.symbol)
-            try:
-                timeout = runner.timeout_result()
-                await self._db.close_paper_trade(
-                    trade_id,
-                    timeout.exit_price,
-                    "error",
-                    timeout.total_buys + timeout.total_sells,
-                    0,
-                    entry_price,
-                    self._config.buy_amount_sol,
-                    exit_time=last_event_ts,
-                    pnl_pct=timeout.pnl_pct,
-                )
-            except Exception:
-                logger.debug("Failed to close errored trade %s", token.symbol)
+            # Don't double-close: skip if either path already finalised.
+            if not closed:
+                try:
+                    timeout = runner.timeout_result()
+                    await self._db.close_paper_trade(
+                        trade_id,
+                        timeout.exit_price,
+                        "error",
+                        timeout.total_buys + timeout.total_sells,
+                        0,
+                        entry_price,
+                        self._config.buy_amount_sol,
+                        exit_time=last_event_ts,
+                        pnl_pct=timeout.pnl_pct,
+                    )
+                except Exception:
+                    logger.debug("Failed to close errored trade %s", token.symbol)
         finally:
             # Release the portfolio slot reserved at entry time. Guard against
             # going negative in case a resumed trade was double-counted.

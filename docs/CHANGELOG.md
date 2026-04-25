@@ -12,6 +12,46 @@
 
 ---
 
+## 2026-04-25 18:00 — config_hash drift guard + Helius T+30 lag instrumentation
+
+**Что изменилось:**
+- Новый модуль `pulse_bot/ml/config_hash.py` — стабильный SHA-256 хэш по training-relevant полям `PulseBotConfig` (score_threshold_*, exit_*, entry_ml_*, entry_train_*; косметические поля исключены).
+- `train.py` пишет `config_hash` + `config_values` в `entry_model.meta.json` (оба head: classification + regression).
+- `policy.py:EntryMLPolicy.from_path` сравнивает хэш с runtime-конфигом и логирует **WARNING** с per-field diff при расхождении. Не отказывает в загрузке — оператор может намеренно флипать tracked-поле (например, exit_ml_active kill-switch). Защищает от silent Option-B-style регрессий (labels-vs-config mismatch 2026-04-22).
+- Legacy meta.json (без config_hash) — silent skip, не шумит.
+- `pipeline.py:_schedule_holder_capture` инструментирован: каждое captured snapshot логирует `Helius T+N capture lag: actual=X scheduled=Y delta=Δ (loop=… sem=… rpc=…) mint=…`. Семафор поднят 50→100 (env `PULSE_HELIUS_HOLDER_CONCURRENCY`) — на 200 токенов × 3 capture слотов burst T+30 серилизовался ~1 RPC-latency на каждый ожидающий выше cap'а.
+
+**Зачем:** parallel infrastructure из ROADMAP_2026_05.md — protect from silent regression и Phase 3 prereq (T+30 model нужен чистый snapshot timing, иначе delta-features врут).
+
+**Результат:**
+- 63 unit-теста в `tests/pulse_bot/test_config_hash.py` зелёные.
+- Регрессия: `test_features_parity` (39 passed, 1 skipped), `test_daily_validation`, `test_ml_policy` — без изменений.
+- Live бот: следующий рестарт начнёт писать lag-метрики; для дрейфа конфига ничего не изменится пока модель не переобучена с новым meta.json (legacy silent path).
+
+**Откат:** удалить три блока кода (config_hash module + meta-write в train.py + check в policy.py + lag log в pipeline.py). Хэши в meta.json игнорируются если поле отсутствует.
+
+---
+
+## 2026-04-25 12:00 — Phase 4A: timer-tick infrastructure для paper trades
+
+**Что изменилось:**
+- `PulseMonitor.update_empty_tick(now)` — пересчёт snapshot по уже накопленному окну без нового трейда (без мутации trend / peak counters).
+- `PaperTradeRunner.tick(now, entry_time)` — обёртка вокруг snapshot + `ExitManager.decide()`, возвращает `MonitorResult` если правило сработало.
+- `Pipeline._paper_trade` рефакторинг: теперь два параллельных таска — старый `stream_trades` loop и новый tick loop с интервалом `PULSE_TICK_SECONDS` (env var, default 5.0). `asyncio.Lock` гарантирует один close.
+- `PULSE_TICK_SECONDS=0` → tick-таск становится no-op, поведение точно как до Phase 4A.
+- Replay launchpad не использует tick-таск (real-time clock не подходит для детерминированных бэктестов).
+
+**Зачем:** prerequisite для Phase 4B survival model (нужен per-second state для labelling) + улучшает отзывчивость exit'а когда токен молчит. Сейчас тихий токен висит до `inactivity_timeout` (90с) прежде чем `pulse_dead`/`no_new_blood` смогут сработать.
+
+**Результат:**
+- 10 unit-тестов в `tests/pulse_bot/test_timer_tick.py` зелёные.
+- Регрессия: `test_features_parity` + `test_daily_validation` + `test_partial_exits_parity` + `test_optimizer_*` + `test_refactor_fixes` — 100/2s passed/skipped.
+- Поведение live бота **не изменено** пока `PULSE_TICK_SECONDS` не установлен и в коде осталось default=5.0 через `getattr` — это активирует tick автоматически на следующем рестарте. Если нужно временно отключить → `PULSE_TICK_SECONDS=0`.
+
+**Откат:** установить `PULSE_TICK_SECONDS=0` (отключить tick), либо `git revert` коммита.
+
+---
+
 ## 2026-04-25 09:30 — Pipeline: extended trade collection post-scoring
 
 **Что изменилось:**

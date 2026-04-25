@@ -26,6 +26,7 @@ class TestVerifyInfrastructure:
     def test_db_schema_has_source_column(self, pg_test_db) -> None:
         """token_scores must have source column for live/backtest/provider."""
         import psycopg2
+
         conn = psycopg2.connect(pg_test_db)
         with conn.cursor() as cur:
             cur.execute(
@@ -39,6 +40,7 @@ class TestVerifyInfrastructure:
     def test_db_source_values(self, pg_test_db) -> None:
         """Source column accepts live, backtest, provider."""
         import psycopg2
+
         conn = psycopg2.connect(pg_test_db)
         with conn.cursor() as cur:
             for source in ("live", "backtest", "provider"):
@@ -59,6 +61,7 @@ class TestVerifyInfrastructure:
     def test_clear_backtest_scores_keeps_live(self, pg_test_db) -> None:
         """clear_backtest_scores removes backtest but keeps live."""
         import psycopg2
+
         db = Database("pulse_bot.db")  # redirected to pg_test_db via fixture
         conn = psycopg2.connect(pg_test_db)
         with conn.cursor() as cur:
@@ -84,6 +87,7 @@ class TestVerifyInfrastructure:
     def test_paper_trades_table_exists(self, pg_test_db) -> None:
         """paper_trades table created by init_schema."""
         import psycopg2
+
         conn = psycopg2.connect(pg_test_db)
         with conn.cursor() as cur:
             cur.execute(

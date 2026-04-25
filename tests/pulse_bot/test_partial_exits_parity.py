@@ -125,7 +125,9 @@ class TestWeightedPartialPnL:
 
         # Partial #1: 30% at 2x
         r1 = _feed(
-            runner, 0.002, 10.0,
+            runner,
+            0.002,
+            10.0,
             [ExitSignal(action="sell_partial", reason="strong_profit", sell_pct=0.30)],
         )
         assert r1 is None
@@ -134,8 +136,14 @@ class TestWeightedPartialPnL:
 
         # Partial #2: 30% at 1.5x
         r2 = _feed(
-            runner, 0.0015, 20.0,
-            [ExitSignal(action="sell_partial", reason="weak_pulse_profit", sell_pct=0.30)],
+            runner,
+            0.0015,
+            20.0,
+            [
+                ExitSignal(
+                    action="sell_partial", reason="weak_pulse_profit", sell_pct=0.30
+                )
+            ],
         )
         assert r2 is None
         assert runner._remaining == pytest.approx(0.40)
@@ -143,7 +151,9 @@ class TestWeightedPartialPnL:
 
         # Final sell_all at 1x (flat)
         final = _feed(
-            runner, 0.001, 30.0,
+            runner,
+            0.001,
+            30.0,
             [ExitSignal(action="sell_all", reason="pulse_dead", sell_pct=1.0)],
         )
         assert final is not None
@@ -151,13 +161,20 @@ class TestWeightedPartialPnL:
         assert final.exit_price == pytest.approx(0.001)
 
         # Hand-derive expected weighted PnL
-        expected = 0.30 * calc_pnl_pct(0.001, 0.002, cfg.buy_amount_sol, num_sell_legs=0)
-        expected += 0.30 * calc_pnl_pct(0.001, 0.0015, cfg.buy_amount_sol, num_sell_legs=0)
-        expected += 0.40 * calc_pnl_pct(0.001, 0.001, cfg.buy_amount_sol, num_sell_legs=0)
+        expected = 0.30 * calc_pnl_pct(
+            0.001, 0.002, cfg.buy_amount_sol, num_sell_legs=0
+        )
+        expected += 0.30 * calc_pnl_pct(
+            0.001, 0.0015, cfg.buy_amount_sol, num_sell_legs=0
+        )
+        expected += 0.40 * calc_pnl_pct(
+            0.001, 0.001, cfg.buy_amount_sol, num_sell_legs=0
+        )
         # Strip per-leg zero-sell-priority offset — the helper with
         # num_sell_legs=0 still bakes in 1 priority fee (1+0 txs).
         # Re-derive without any priority:
         from pulse_bot.config import PUMPFUN_FEE_PCT, PUMPFUN_PRIORITY_FEE
+
         eff_entry = 0.001 * (1 + PUMPFUN_FEE_PCT)
 
         def leg(price: float) -> float:
@@ -176,7 +193,9 @@ class TestWeightedPartialPnL:
         cfg = _cfg()
         runner = PaperTradeRunner(cfg, entry_price=0.001)
         _feed(
-            runner, 0.003, 10.0,
+            runner,
+            0.003,
+            10.0,
             [ExitSignal(action="sell_partial", reason="strong_profit", sell_pct=0.50)],
         )
         # Now current price drifts down without signals
@@ -209,7 +228,9 @@ class TestHardStopAfterPartialUsesLegPnL:
 
         # Realize 50 % at 3x — aggregate PnL becomes strongly positive
         r1 = _feed(
-            runner, 0.003, 10.0,
+            runner,
+            0.003,
+            10.0,
             [ExitSignal(action="sell_partial", reason="strong_profit", sell_pct=0.50)],
         )
         assert r1 is None
@@ -224,9 +245,9 @@ class TestHardStopAfterPartialUsesLegPnL:
         # exit_price is entry*(1 - SL/100), independent of realized gains
         assert result.exit_price == pytest.approx(0.001 * (1 - 0.25))
         # But weighted pnl_pct includes the realized partial → overall positive
-        assert result.pnl_pct > 0, (
-            "weighted pnl should reflect the realized partial gain + remnant at stop"
-        )
+        assert (
+            result.pnl_pct > 0
+        ), "weighted pnl should reflect the realized partial gain + remnant at stop"
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +277,9 @@ def _open_trade_row(db: Database, entry_ts: float = 1_000.0) -> int:
 
 
 class TestClosePaperTradePnLParity:
-    def test_without_pnl_pct_matches_calc_pnl_pct(self, tmp_path: Path, pg_test_db: str) -> None:
+    def test_without_pnl_pct_matches_calc_pnl_pct(
+        self, tmp_path: Path, pg_test_db: str
+    ) -> None:
         db = Database(str(tmp_path / "live.db"))
         db.init_schema()
         trade_id = _open_trade_row(db)
@@ -280,7 +303,9 @@ class TestClosePaperTradePnLParity:
         # Raw (exit-entry)/entry would be +50 %; fee-adjusted is strictly less
         assert row["pnl_pct"] < 50.0
 
-    def test_with_supplied_pnl_pct_is_stored_verbatim(self, tmp_path: Path, pg_test_db: str) -> None:
+    def test_with_supplied_pnl_pct_is_stored_verbatim(
+        self, tmp_path: Path, pg_test_db: str
+    ) -> None:
         """Partial-aware caller passes a weighted pnl_pct; DB must not recompute."""
         db = Database(str(tmp_path / "live.db"))
         db.init_schema()
@@ -331,15 +356,29 @@ class TestPipelineOptimizerParityOnPartials:
         def run_once() -> MonitorResult:
             runner = PaperTradeRunner(cfg, entry_price=0.001)
             _feed(
-                runner, 0.002, 10.0,
-                [ExitSignal(action="sell_partial", reason="strong_profit", sell_pct=0.3)],
+                runner,
+                0.002,
+                10.0,
+                [
+                    ExitSignal(
+                        action="sell_partial", reason="strong_profit", sell_pct=0.3
+                    )
+                ],
             )
             _feed(
-                runner, 0.0018, 20.0,
-                [ExitSignal(action="sell_partial", reason="weak_pulse_profit", sell_pct=0.3)],
+                runner,
+                0.0018,
+                20.0,
+                [
+                    ExitSignal(
+                        action="sell_partial", reason="weak_pulse_profit", sell_pct=0.3
+                    )
+                ],
             )
             final = _feed(
-                runner, 0.0012, 30.0,
+                runner,
+                0.0012,
+                30.0,
                 [ExitSignal(action="sell_all", reason="pulse_dead", sell_pct=1.0)],
             )
             assert final is not None

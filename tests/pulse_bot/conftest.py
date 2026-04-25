@@ -57,9 +57,7 @@ def pg_test_db(monkeypatch):
 
     # Apply schema DDL.
     schema_sql = (
-        Path(__file__).parent.parent.parent
-        / "pulse_bot"
-        / "db_schema_pg.sql"
+        Path(__file__).parent.parent.parent / "pulse_bot" / "db_schema_pg.sql"
     ).read_text()
     tc = psycopg2.connect(f"dbname={db_name} user=sergeychernyakov")
     tc.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
@@ -86,9 +84,7 @@ def pg_test_db(monkeypatch):
         except Exception:
             pass
 
-    monkeypatch.setattr(
-        _pgdb, "_resolve_dsn", lambda _path=None: test_dsn_url
-    )
+    monkeypatch.setattr(_pgdb, "_resolve_dsn", lambda _path=None: test_dsn_url)
     monkeypatch.setattr(_pgdb, "_asyncpg_pool", None)
     monkeypatch.setattr(_pgdb, "_psycopg_pool", None)
 

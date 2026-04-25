@@ -258,7 +258,20 @@ def train_entry(data_path: Path, model_out: Path, split: str = "chrono") -> dict
 
     model.save_model(model_out)
     logger.info("Saved model to %s", model_out)
-    # Save feature list + thresholds + calibration alongside model
+    # Save feature list + thresholds + calibration alongside model.
+    # config_hash + config_values pin the training-time PulseBotConfig
+    # subset that affects labels/features/hparams. Live policy compares
+    # against runtime config and WARNs on drift (protects against silent
+    # Option-B style label mismatches; see config_hash.py docstring).
+    from pulse_bot.ml.config_hash import (
+        TRAIN_RELEVANT_FIELDS,
+        compute_config_hash,
+        extract_relevant_fields,
+    )
+
+    cfg_for_hash = _cfg
+    config_hash = compute_config_hash(cfg_for_hash)
+    config_values = extract_relevant_fields(cfg_for_hash)
     meta_out = model_out.with_suffix(".meta.json")
     meta_out.write_text(
         json.dumps(
@@ -276,6 +289,10 @@ def train_entry(data_path: Path, model_out: Path, split: str = "chrono") -> dict
                 "confidence_thresholds": thresholds,
                 "calibration": calib,
                 "test_gated": test_metrics,
+                "config_hash": config_hash,
+                "config_fields_version": 1,
+                "config_field_names": list(TRAIN_RELEVANT_FIELDS),
+                "config_values": config_values,
             },
             indent=2,
         )
@@ -465,6 +482,18 @@ def train_entry_regression(
 
     model.save_model(model_out)
     logger.info("Saved regression model to %s", model_out)
+    # config_hash pins training-time PulseBotConfig subset. See
+    # ``pulse_bot.ml.config_hash`` and the classification head above.
+    from pulse_bot.config import get_config as _get_cfg
+    from pulse_bot.ml.config_hash import (
+        TRAIN_RELEVANT_FIELDS,
+        compute_config_hash,
+        extract_relevant_fields,
+    )
+
+    cfg_for_hash = _get_cfg()
+    config_hash = compute_config_hash(cfg_for_hash)
+    config_values = extract_relevant_fields(cfg_for_hash)
     meta_out = model_out.with_suffix(".meta.json")
     meta_out.write_text(
         json.dumps(
@@ -486,6 +515,10 @@ def train_entry_regression(
                 "test_rows": len(test_df),
                 "confidence_thresholds": thresholds,
                 "test_gated": test_metrics,
+                "config_hash": config_hash,
+                "config_fields_version": 1,
+                "config_field_names": list(TRAIN_RELEVANT_FIELDS),
+                "config_values": config_values,
             },
             indent=2,
         )

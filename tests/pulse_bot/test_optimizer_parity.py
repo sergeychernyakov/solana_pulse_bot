@@ -54,7 +54,6 @@ from pulse_bot.config import PulseBotConfig
 from pulse_bot.db import Database
 from pulse_bot.optimizer import Optimizer
 
-
 # ---------------------------------------------------------------------------
 # Trace dataclasses
 # ---------------------------------------------------------------------------
@@ -127,9 +126,15 @@ def _populate_db(dsn: str) -> None:
                     ts = created_at + 1.0 + k
                     trade_rows.append(
                         (
-                            mint, f"W-{mint}-{k}", "buy",
-                            0.1, 100.0,   # sol, tokens → price = 0.001
-                            30.0 + k, 30.0 + k, ts, 0,
+                            mint,
+                            f"W-{mint}-{k}",
+                            "buy",
+                            0.1,
+                            100.0,  # sol, tokens → price = 0.001
+                            30.0 + k,
+                            30.0 + k,
+                            ts,
+                            0,
                         )
                     )
 
@@ -139,9 +144,15 @@ def _populate_db(dsn: str) -> None:
                 ts = 1_000.0 + 50.0 + k
                 trade_rows.append(
                     (
-                        "M0", f"P-M0-{k}", "buy",
-                        0.3, 100.0,  # price = 0.003
-                        60.0 + k, 60.0 + k, ts, 0,
+                        "M0",
+                        f"P-M0-{k}",
+                        "buy",
+                        0.3,
+                        100.0,  # price = 0.003
+                        60.0 + k,
+                        60.0 + k,
+                        ts,
+                        0,
                     )
                 )
             # M1: price 0.0004 (-60%) → forces hard_stop
@@ -149,9 +160,15 @@ def _populate_db(dsn: str) -> None:
                 ts = 2_000.0 + 50.0 + k
                 trade_rows.append(
                     (
-                        "M1", f"P-M1-{k}", "buy",
-                        0.04, 100.0,  # price = 0.0004
-                        20.0 + k, 20.0 + k, ts, 0,
+                        "M1",
+                        f"P-M1-{k}",
+                        "buy",
+                        0.04,
+                        100.0,  # price = 0.0004
+                        20.0 + k,
+                        20.0 + k,
+                        ts,
+                        0,
                     )
                 )
             # M2: one flat monitor trade at t+50 (populates recent_trades in BT
@@ -165,9 +182,15 @@ def _populate_db(dsn: str) -> None:
                 ts = 3_000.0 + ts_offset
                 trade_rows.append(
                     (
-                        "M2", f"P-M2-{k}", "buy",
-                        0.1, 100.0,  # price = 0.001 (flat vs entry → no TP/SL)
-                        30.0, 30.0, ts, 0,
+                        "M2",
+                        f"P-M2-{k}",
+                        "buy",
+                        0.1,
+                        100.0,  # price = 0.001 (flat vs entry → no TP/SL)
+                        30.0,
+                        30.0,
+                        ts,
+                        0,
                     )
                 )
 
@@ -191,18 +214,18 @@ def _cfg(db_path: str) -> PulseBotConfig:
     cfg = PulseBotConfig()
     cfg.db_path = db_path
     cfg.backtest_db_path = db_path
-    cfg.entry_mode = "full"                # see module docstring
+    cfg.entry_mode = "full"  # see module docstring
     cfg.observe_seconds = 45
     cfg.fast_observe_seconds = 5
     cfg.min_entry_buyer_number = 1
     cfg.max_entry_buyer_number = 999
-    cfg.score_threshold_buy = -999         # accept every token
+    cfg.score_threshold_buy = -999  # accept every token
     cfg.fast_score_threshold = -999
-    cfg.portfolio_max_positions = 10       # no capacity contention in this test
+    cfg.portfolio_max_positions = 10  # no capacity contention in this test
     cfg.portfolio_initial_sol = 10.0
     cfg.buy_amount_sol = 0.1
-    cfg.exit_hard_stop_loss_pct = 30.0     # M1 at −60 % triggers this
-    cfg.exit_take_profit_pct = 50.0        # M0 at +200 % triggers this
+    cfg.exit_hard_stop_loss_pct = 30.0  # M1 at −60 % triggers this
+    cfg.exit_take_profit_pct = 50.0  # M0 at +200 % triggers this
     cfg.exit_take_profit_enabled = True
     cfg.exit_max_hold_seconds = 600
     cfg.exit_inactivity_seconds = 120
@@ -215,7 +238,7 @@ def _cfg(db_path: str) -> PulseBotConfig:
     # All threshold-based pulse exits are disabled so only TP/SL/timeout
     # can possibly fire.
     cfg.pulse_min_events = 1
-    cfg.pulse_dead_buy_rate = -1.0              # buy_rate < -1 → never
+    cfg.pulse_dead_buy_rate = -1.0  # buy_rate < -1 → never
     cfg.pulse_weak_buy_rate = -1.0
     cfg.exit_no_new_wallets_events = 9_999
     cfg.exit_trend_dying_count = 9_999
@@ -327,7 +350,9 @@ class TestOptimizerReferenceParity:
             f"opt={sorted(t.mint for t in opt)}"
         )
 
-    def test_per_position_lifecycle_matches(self, tmp_path: Path, pg_test_db: str) -> None:
+    def test_per_position_lifecycle_matches(
+        self, tmp_path: Path, pg_test_db: str
+    ) -> None:
         """For each mint: entry_type, exit_reason, pnl_sign must match.
 
         ``entry_ts`` is NOT compared — see module docstring for the
@@ -347,15 +372,15 @@ class TestOptimizerReferenceParity:
         for mint in sorted(ref_by_mint):
             r = ref_by_mint[mint]
             o = opt_by_mint[mint]
-            assert r.entry_type == o.entry_type, (
-                f"{mint}: entry_type ref={r.entry_type} opt={o.entry_type}"
-            )
-            assert r.exit_reason == o.exit_reason, (
-                f"{mint}: exit_reason ref={r.exit_reason} opt={o.exit_reason}"
-            )
-            assert r.pnl_sign == o.pnl_sign, (
-                f"{mint}: pnl_sign ref={r.pnl_sign} opt={o.pnl_sign}"
-            )
+            assert (
+                r.entry_type == o.entry_type
+            ), f"{mint}: entry_type ref={r.entry_type} opt={o.entry_type}"
+            assert (
+                r.exit_reason == o.exit_reason
+            ), f"{mint}: exit_reason ref={r.exit_reason} opt={o.exit_reason}"
+            assert (
+                r.pnl_sign == o.pnl_sign
+            ), f"{mint}: pnl_sign ref={r.pnl_sign} opt={o.pnl_sign}"
 
     def test_exit_reasons_are_expected(self, tmp_path: Path, pg_test_db: str) -> None:
         """The synthetic dataset is engineered to fire specific exits. If
@@ -365,9 +390,13 @@ class TestOptimizerReferenceParity:
         cfg = _cfg(pg_test_db)
 
         ref = {t.mint: t.exit_reason for t in _reference_traces(cfg)}
-        opt = {t.mint: t.exit_reason for t in _optimizer_traces(
-            cfg, pg_test_db,
-        )}
+        opt = {
+            t.mint: t.exit_reason
+            for t in _optimizer_traces(
+                cfg,
+                pg_test_db,
+            )
+        }
 
         # M0 pumps → take_profit; M1 tanks → hard_stop;
         # M2 is silent → dead_token (inactivity tracking is on).
@@ -377,9 +406,7 @@ class TestOptimizerReferenceParity:
             "M2": "dead_token",
         }
         for mint, want in expected.items():
-            assert ref.get(mint) == want, (
-                f"reference (BacktestEngine) {mint}: {ref.get(mint)} != {want}"
-            )
-            assert opt.get(mint) == want, (
-                f"optimizer {mint}: {opt.get(mint)} != {want}"
-            )
+            assert (
+                ref.get(mint) == want
+            ), f"reference (BacktestEngine) {mint}: {ref.get(mint)} != {want}"
+            assert opt.get(mint) == want, f"optimizer {mint}: {opt.get(mint)} != {want}"

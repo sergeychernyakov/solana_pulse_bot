@@ -134,6 +134,86 @@ class PulseMonitor:
             max_sell_sol=max_sell_sol,
         )
 
+    def update_empty_tick(self, now: float) -> PulseSnapshot | None:
+        """Recompute pulse state without a new trade event.
+
+        Phase 4A timer-tick prerequisite. When the trade stream goes silent,
+        the bot would otherwise have to wait for ``inactivity_timeout``
+        before any exit logic runs. A periodic empty tick lets ExitManager
+        re-evaluate snapshot-derived rules (pulse_dead, no_new_blood, etc.)
+        on the existing window even if no fresh trade arrived.
+
+        Behaviour:
+          * Same min-events guard as ``update`` — returns None until the
+            window is warm.
+          * Does NOT mutate trend counters or peak buy_rate (no new
+            information; mutating them would create a "tick decay" that
+            silently degraded rates over time).
+          * Returns a snapshot reflecting the current window contents,
+            useful for ExitManager.decide().
+
+        ``now`` is accepted for symmetry with future time-aware variants
+        (e.g. weighted decay) but is currently unused — present-state
+        snapshot only.
+        """
+        del now  # reserved for future time-decay extensions
+        if len(self._window) < self._cfg.pulse_min_events:
+            return None
+
+        buys = [t for t in self._window if t.tx_type == "buy"]
+        sells = [t for t in self._window if t.tx_type == "sell"]
+
+        buy_rate = len(buys) / len(self._window)
+        sell_rate = len(sells) / len(self._window)
+
+        new_wallet_rate = 0.0  # all wallets in window already seen-by definition
+
+        avg_buy = sum(t.sol_amount for t in buys) / max(len(buys), 1)
+        total_sol = sum(t.sol_amount for t in buys)
+
+        creator_selling = any(
+            t.is_creator and t.tx_type == "sell" for t in self._window
+        )
+
+        max_sell_sol = max((t.sol_amount for t in sells), default=0.0)
+        whale_exit = max_sell_sol > self._cfg.pulse_whale_exit_sol
+
+        # Trend snapshot uses the LAST computed values — empty tick must
+        # not advance trend history (no new evidence of decline/rise).
+        buy_rate_trend = "stable"
+        buy_size_trend = "stable"
+
+        drop_from_peak = (
+            buy_rate / self._peak_buy_rate if self._peak_buy_rate > 0 else 1.0
+        )
+
+        curve_pct = 0.0
+        if self._window:
+            last = self._window[-1]
+            if last.v_sol_in_bonding_curve > 0:
+                curve_pct = min(
+                    (last.v_sol_in_bonding_curve / PUMPFUN_GRADUATION_SOL) * 100,
+                    100,
+                )
+
+        return PulseSnapshot(
+            buy_rate=buy_rate,
+            sell_rate=sell_rate,
+            new_wallet_rate=new_wallet_rate,
+            avg_buy_size_sol=avg_buy,
+            total_sol_in_window=total_sol,
+            creator_selling=creator_selling,
+            whale_exit=whale_exit,
+            buy_rate_trend=buy_rate_trend,
+            buy_size_trend=buy_size_trend,
+            trend_declining_count=self._trend_declining_count,
+            curve_progress_pct=curve_pct,
+            window_events=len(self._window),
+            peak_buy_rate=self._peak_buy_rate,
+            buy_rate_drop_from_peak=drop_from_peak,
+            max_sell_sol=max_sell_sol,
+        )
+
     def _compute_trend(self, current: float, previous: float | None) -> str:
         if previous is None:
             return "stable"

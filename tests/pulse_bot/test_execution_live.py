@@ -43,7 +43,9 @@ def test_is_ready_in_dry_run_without_keypair() -> None:
 
 def test_is_ready_in_live_requires_keypair_and_key() -> None:
     exe = LiveExecution(
-        helius_api_key="h", keypair_base58=None, dry_run=False,
+        helius_api_key="h",
+        keypair_base58=None,
+        dry_run=False,
     )
     assert exe.is_ready is False
 
@@ -57,6 +59,7 @@ def test_bad_keypair_returns_none_no_crash() -> None:
 def test_valid_keypair_loads(tmp_path_factory) -> None:
     # Generate a fresh random keypair for the test (no secret exposure).
     from solders.keypair import Keypair
+
     kp = Keypair()
     b58 = str(kp)  # solders encodes Keypair → base58 via __str__
     exe = LiveExecution(helius_api_key="x", keypair_base58=b58)
@@ -75,8 +78,7 @@ def test_execution_result_dataclass_defaults() -> None:
 
 
 class FakeResponse:
-    def __init__(self, status: int = 200, payload: dict | None = None,
-                 text: str = ""):
+    def __init__(self, status: int = 200, payload: dict | None = None, text: str = ""):
         self.status = status
         self._payload = payload or {}
         self._text = text or json.dumps(payload)
@@ -124,10 +126,13 @@ class FakeSession:
 async def test_dry_run_buy_returns_success_no_send() -> None:
     exe = LiveExecution(helius_api_key="x", keypair_base58=None, dry_run=True)
     fake = FakeSession()
-    fake.get_response = FakeResponse(200, {
-        "outAmount": "123456",
-        "routePlan": [{"swapInfo": {}}, {"swapInfo": {}}],
-    })
+    fake.get_response = FakeResponse(
+        200,
+        {
+            "outAmount": "123456",
+            "routePlan": [{"swapInfo": {}}, {"swapInfo": {}}],
+        },
+    )
     exe._session = fake
     result = await exe.buy("MINTxxx", amount_sol=0.1, slippage_bps=500)
     assert result.dry_run is True

@@ -31,11 +31,7 @@ from pathlib import Path
 import psycopg2
 import pytest
 
-from pulse_bot.config import (
-    PUMPFUN_FEE_PCT,
-    PUMPFUN_PRIORITY_FEE,
-    PulseBotConfig,
-)
+from pulse_bot.config import PUMPFUN_FEE_PCT, PUMPFUN_PRIORITY_FEE, PulseBotConfig
 from pulse_bot.core import PaperTradeRunner, decide_entry
 from pulse_bot.db import Database
 from pulse_bot.filters.fast import FastResult
@@ -79,14 +75,14 @@ def _mk_trade(
 def _cfg(**overrides: object) -> PulseBotConfig:
     """Config with deterministic exits — turn everything OFF by default."""
     cfg = PulseBotConfig()
-    cfg.exit_take_profit_pct = 10_000.0          # unreachable
-    cfg.exit_hard_stop_loss_pct = 99.0            # very wide — only hit deliberately
+    cfg.exit_take_profit_pct = 10_000.0  # unreachable
+    cfg.exit_hard_stop_loss_pct = 99.0  # very wide — only hit deliberately
     cfg.exit_trailing_stop_enabled = False
     cfg.exit_on_creator_dump = False
     cfg.exit_on_whale = False
     cfg.exit_inactivity_seconds = 0.0
     cfg.exit_min_hold_seconds = 0.0
-    cfg.pulse_min_events = 9_999                  # never emit snapshot → no pulse exit
+    cfg.pulse_min_events = 9_999  # never emit snapshot → no pulse exit
     cfg.pulse_dead_buy_rate = -1.0
     cfg.exit_no_new_wallets_events = 9_999
     cfg.exit_trend_dying_count = 9_999
@@ -103,8 +99,13 @@ def _cfg(**overrides: object) -> PulseBotConfig:
 
 def _token(mint: str = "M", created_at: float = 1_000.0, creator: str = "C") -> Token:
     return Token(
-        mint=mint, name="", symbol=mint, creator=creator,
-        created_at=created_at, uri="", launchpad="pumpfun",
+        mint=mint,
+        name="",
+        symbol=mint,
+        creator=creator,
+        created_at=created_at,
+        uri="",
+        launchpad="pumpfun",
     )
 
 
@@ -191,7 +192,12 @@ class TestSimulateTradeFrom:
             entry_price=0.001,
         )
         result = Optimizer._simulate_trade_from(
-            cached, "full", 25, 0.001, entry_time=500.0, cfg=cfg,
+            cached,
+            "full",
+            25,
+            0.001,
+            entry_time=500.0,
+            cfg=cfg,
         )
         assert result["exit_reason"] == "dead_token"
         assert result["exit_time"] == pytest.approx(500.0 + 120.0)
@@ -209,7 +215,12 @@ class TestSimulateTradeFrom:
             entry_price=0.001,
         )
         result = Optimizer._simulate_trade_from(
-            cached, "full", 25, 0.001, entry_time=500.0, cfg=cfg,
+            cached,
+            "full",
+            25,
+            0.001,
+            entry_time=500.0,
+            cfg=cfg,
         )
         assert result["exit_reason"] == "timeout"
         # exit_time == entry_time → hold=0, slot freed immediately in Phase 2.
@@ -229,7 +240,12 @@ class TestSimulateTradeFrom:
             entry_price=0.001,
         )
         result = Optimizer._simulate_trade_from(
-            cached, "full", 25, 0.001, entry_time=500.0, cfg=cfg,
+            cached,
+            "full",
+            25,
+            0.001,
+            entry_time=500.0,
+            cfg=cfg,
         )
         assert result["exit_reason"] == "dead_token"
         # Boundary is ``last_trade_ts + inactivity`` == 520 + 60 = 580.
@@ -253,7 +269,12 @@ class TestSimulateTradeFrom:
             entry_price=0.001,
         )
         result = Optimizer._simulate_trade_from(
-            cached, "full", 25, 0.001, entry_time=500.0, cfg=cfg,
+            cached,
+            "full",
+            25,
+            0.001,
+            entry_time=500.0,
+            cfg=cfg,
         )
         stop_price = 0.001 * (1 - 0.25)
         expected_pnl = calc_pnl_pct(0.001, stop_price, cfg.buy_amount_sol)
@@ -284,11 +305,16 @@ class TestSimulateTradeFrom:
             entry_price=0.001,
         )
         result = Optimizer._simulate_trade_from(
-            cached, "full", 25, 0.001, entry_time=500.0, cfg=cfg,
+            cached,
+            "full",
+            25,
+            0.001,
+            entry_time=500.0,
+            cfg=cfg,
         )
-        assert result["exit_reason"] == "dead_token", (
-            "stream-ended with inactivity>0 must mirror live dead_token semantics"
-        )
+        assert (
+            result["exit_reason"] == "dead_token"
+        ), "stream-ended with inactivity>0 must mirror live dead_token semantics"
         assert result["exit_time"] == pytest.approx(510.0 + 300.0)
         assert result["hold_seconds"] == pytest.approx(310.0)
 
@@ -304,7 +330,12 @@ class TestSimulateTradeFrom:
             entry_price=0.001,
         )
         result = Optimizer._simulate_trade_from(
-            cached, "full", 25, 0.001, entry_time=500.0, cfg=cfg,
+            cached,
+            "full",
+            25,
+            0.001,
+            entry_time=500.0,
+            cfg=cfg,
         )
         assert result["exit_reason"] == "timeout"
         assert result["exit_time"] == pytest.approx(510.0)  # last trade ts
@@ -317,18 +348,28 @@ class TestSimulateTradeFrom:
 
 def _fast_result(decision: str, buy_count: int, score: int = 20) -> FastResult:
     return FastResult(
-        decision=decision, score=score, reasons="",
-        buy_count=buy_count, sell_count=0, unique_buyers=buy_count,
-        volume_sol=1.0, buy_rate=1.0, sell_ratio=0.0,
-        curve_pct=10.0, elapsed=5.0,
+        decision=decision,
+        score=score,
+        reasons="",
+        buy_count=buy_count,
+        sell_count=0,
+        unique_buyers=buy_count,
+        volume_sol=1.0,
+        buy_rate=1.0,
+        sell_ratio=0.0,
+        curve_pct=10.0,
+        elapsed=5.0,
     )
 
 
-def _full_result(decision: str, buy_count: int, total_score: int = 30,
-                 exit_price: float = 0.001) -> ScoringResult:
+def _full_result(
+    decision: str, buy_count: int, total_score: int = 30, exit_price: float = 0.001
+) -> ScoringResult:
     return ScoringResult(
-        decision=decision, total_score=total_score,
-        buy_count=buy_count, exit_price=exit_price,
+        decision=decision,
+        total_score=total_score,
+        buy_count=buy_count,
+        exit_price=exit_price,
     )
 
 
@@ -356,9 +397,9 @@ class TestDecideEntryRespectsMode:
 
         should_enter, entry_type, _, _ = decide_entry(fast, full, cfg)
         assert should_enter is True
-        assert entry_type == "full", (
-            "in entry_mode=full, entry_type must reflect the mode, not fast_result"
-        )
+        assert (
+            entry_type == "full"
+        ), "in entry_mode=full, entry_type must reflect the mode, not fast_result"
 
     def test_full_mode_buyer_gate_uses_full_buy_count(self) -> None:
         """Given fast_count<min and full_count>=min, full-mode must still enter."""
@@ -373,9 +414,9 @@ class TestDecideEntryRespectsMode:
         full = _full_result("BUY", buy_count=10)
 
         should_enter, entry_type, _, _ = decide_entry(fast, full, cfg)
-        assert should_enter is True, (
-            "full-mode must apply the buyer gate against full window, not fast"
-        )
+        assert (
+            should_enter is True
+        ), "full-mode must apply the buyer gate against full window, not fast"
         assert entry_type == "full"
 
     def test_fast_mode_keeps_fast_entry_type(self) -> None:
@@ -428,12 +469,19 @@ class TestMakeTradeResult:
             entry_price=0.001,
         )
         out = Optimizer._make_trade_result(
-            cached, "full", 25,
-            exit_price=0.0015, entry_price=0.001, exit_reason="take_profit",
-            exit_ts=1_100.0, entry_time=1_000.0, pnl_pct=50.0, cfg=cfg,
+            cached,
+            "full",
+            25,
+            exit_price=0.0015,
+            entry_price=0.001,
+            exit_reason="take_profit",
+            exit_ts=1_100.0,
+            entry_time=1_000.0,
+            pnl_pct=50.0,
+            cfg=cfg,
         )
-        assert out["pnl_sol"] == pytest.approx(0.2 * 0.5)           # 0.1 SOL
-        assert out["sol_received"] == pytest.approx(0.2 + 0.1)       # 0.3 SOL
+        assert out["pnl_sol"] == pytest.approx(0.2 * 0.5)  # 0.1 SOL
+        assert out["sol_received"] == pytest.approx(0.2 + 0.1)  # 0.3 SOL
         assert out["hold_seconds"] == pytest.approx(100.0)
         assert out["mint"] == "M"
         assert out["exit_reason"] == "take_profit"
@@ -448,9 +496,16 @@ class TestMakeTradeResult:
             entry_price=0.001,
         )
         out = Optimizer._make_trade_result(
-            cached, "full", 25,
-            exit_price=0.001, entry_price=0.001, exit_reason="timeout",
-            exit_ts=100.0, entry_time=200.0, pnl_pct=0.0, cfg=cfg,  # exit before entry
+            cached,
+            "full",
+            25,
+            exit_price=0.001,
+            entry_price=0.001,
+            exit_reason="timeout",
+            exit_ts=100.0,
+            entry_time=200.0,
+            pnl_pct=0.0,
+            cfg=cfg,  # exit before entry
         )
         assert out["hold_seconds"] == 0.0
 
@@ -486,7 +541,8 @@ class TestMaxPositionsEnforcement:
         }
         opt = Optimizer.__new__(Optimizer)
         return opt._simulate_combo_event_driven(
-            {"cfg": cfg, "candidates": candidates}, kept,
+            {"cfg": cfg, "candidates": candidates},
+            kept,
         )
 
     def test_third_candidate_skipped_when_cap_is_two(self) -> None:
@@ -570,7 +626,8 @@ class TestMaxPositionsEnforcement:
         ]
         opt = Optimizer.__new__(Optimizer)
         closed = opt._simulate_combo_event_driven(
-            {"cfg": cfg, "candidates": candidates}, kept,
+            {"cfg": cfg, "candidates": candidates},
+            kept,
         )
         # A's hard_stop exit does NOT free slot at boundary → B blocked.
         assert [t["mint"] for t in closed] == ["A"], (
@@ -599,12 +656,14 @@ class TestComboGridCanonicalisation:
 
     def test_full_mode_collapses_fast_noop_dimensions(self) -> None:
         """All combos with ``entry_mode='full'`` have the SAME fast params."""
-        opt = self._opt_with_grid({
-            "entry_mode": ["full"],
-            "fast_observe_seconds": [3, 5, 8],
-            "fast_score_threshold": [10, 15, 25],
-            "score_threshold_buy": [20, 30],
-        })
+        opt = self._opt_with_grid(
+            {
+                "entry_mode": ["full"],
+                "fast_observe_seconds": [3, 5, 8],
+                "fast_score_threshold": [10, 15, 25],
+                "score_threshold_buy": [20, 30],
+            }
+        )
         combos = list(opt._iter_combos())
         # 3 x 3 fast combinations collapse to 1 → total = 1 * 1 * 1 * 2 = 2.
         assert len(combos) == 2
@@ -616,11 +675,13 @@ class TestComboGridCanonicalisation:
 
     def test_fast_mode_retains_all_dimensions(self) -> None:
         """``entry_mode='fast'`` must NOT collapse fast params (they matter)."""
-        opt = self._opt_with_grid({
-            "entry_mode": ["fast"],
-            "fast_observe_seconds": [3, 5, 8],
-            "fast_score_threshold": [10, 15, 25],
-        })
+        opt = self._opt_with_grid(
+            {
+                "entry_mode": ["fast"],
+                "fast_observe_seconds": [3, 5, 8],
+                "fast_score_threshold": [10, 15, 25],
+            }
+        )
         combos = list(opt._iter_combos())
         # No collapsing → 3 * 3 = 9.
         assert len(combos) == 9
@@ -631,18 +692,20 @@ class TestComboGridCanonicalisation:
 
     def test_mixed_modes_collapse_only_full(self) -> None:
         """When the grid spans multiple modes, only ``full`` rows collapse."""
-        opt = self._opt_with_grid({
-            "entry_mode": ["fast", "full", "both"],
-            "fast_observe_seconds": [3, 5],
-            "fast_score_threshold": [10, 15],
-        })
+        opt = self._opt_with_grid(
+            {
+                "entry_mode": ["fast", "full", "both"],
+                "fast_observe_seconds": [3, 5],
+                "fast_score_threshold": [10, 15],
+            }
+        )
         combos = list(opt._iter_combos())
         by_mode: dict[str, list[dict]] = {"fast": [], "full": [], "both": []}
         for c in combos:
             by_mode[c["entry_mode"]].append(c)
-        assert len(by_mode["fast"]) == 4   # 2 x 2 retained
-        assert len(by_mode["both"]) == 4   # 2 x 2 retained
-        assert len(by_mode["full"]) == 1   # collapsed to (3, 10)
+        assert len(by_mode["fast"]) == 4  # 2 x 2 retained
+        assert len(by_mode["both"]) == 4  # 2 x 2 retained
+        assert len(by_mode["full"]) == 1  # collapsed to (3, 10)
         assert by_mode["full"][0]["fast_observe_seconds"] == 3
         assert by_mode["full"][0]["fast_score_threshold"] == 10
 
@@ -658,12 +721,27 @@ class TestBuildResultMetrics:
         opt._session_id = "TEST"
 
         closed = [
-            {"pnl_sol": 0.20, "pnl_pct": 40.0, "exit_reason": "take_profit",
-             "entry_type": "full", "hold_seconds": 60.0},
-            {"pnl_sol": -0.05, "pnl_pct": -10.0, "exit_reason": "hard_stop",
-             "entry_type": "full", "hold_seconds": 30.0},
-            {"pnl_sol": 0.10, "pnl_pct": 20.0, "exit_reason": "take_profit",
-             "entry_type": "fast", "hold_seconds": 40.0},
+            {
+                "pnl_sol": 0.20,
+                "pnl_pct": 40.0,
+                "exit_reason": "take_profit",
+                "entry_type": "full",
+                "hold_seconds": 60.0,
+            },
+            {
+                "pnl_sol": -0.05,
+                "pnl_pct": -10.0,
+                "exit_reason": "hard_stop",
+                "entry_type": "full",
+                "hold_seconds": 30.0,
+            },
+            {
+                "pnl_sol": 0.10,
+                "pnl_pct": 20.0,
+                "exit_reason": "take_profit",
+                "entry_type": "fast",
+                "hold_seconds": 40.0,
+            },
         ]
         cfg = _cfg(portfolio_initial_sol=1.0)
         r = opt._build_result("rid", {"k": 1}, cfg, closed)
@@ -700,8 +778,15 @@ def _populate_snapshot(dsn: str, tokens: list[dict], trades: list[dict]) -> None
                 cur.execute(
                     "INSERT INTO tokens (mint, name, symbol, creator, created_at, uri, launchpad)"
                     " VALUES (%s,%s,%s,%s,%s,%s,%s)",
-                    (t["mint"], t.get("name", ""), t.get("symbol", ""),
-                     creator, t["created_at"], "", "pumpfun"),
+                    (
+                        t["mint"],
+                        t.get("name", ""),
+                        t.get("symbol", ""),
+                        creator,
+                        t["created_at"],
+                        "",
+                        "pumpfun",
+                    ),
                 )
                 if creator and creator not in seen_creators:
                     seen_creators.add(creator)
@@ -716,10 +801,17 @@ def _populate_snapshot(dsn: str, tokens: list[dict], trades: list[dict]) -> None
                     "INSERT INTO trades (mint, wallet, tx_type, sol_amount, token_amount,"
                     " v_sol_in_bonding_curve, market_cap_sol, timestamp, is_creator)"
                     " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                    (tr["mint"], tr.get("wallet", "W"), tr["tx_type"],
-                     tr["sol_amount"], tr["token_amount"],
-                     tr.get("v_sol", 30.0), tr.get("v_sol", 30.0),
-                     tr["timestamp"], int(tr.get("is_creator", 0))),
+                    (
+                        tr["mint"],
+                        tr.get("wallet", "W"),
+                        tr["tx_type"],
+                        tr["sol_amount"],
+                        tr["token_amount"],
+                        tr.get("v_sol", 30.0),
+                        tr.get("v_sol", 30.0),
+                        tr["timestamp"],
+                        int(tr.get("is_creator", 0)),
+                    ),
                 )
     finally:
         conn.close()
@@ -734,8 +826,13 @@ class TestPreloadDataset:
                 {"mint": "EMPTY", "created_at": 1000.0, "creator": "B"},
             ],
             trades=[
-                {"mint": "WITH", "tx_type": "buy", "sol_amount": 0.1,
-                 "token_amount": 100.0, "timestamp": 1001.0},
+                {
+                    "mint": "WITH",
+                    "tx_type": "buy",
+                    "sol_amount": 0.1,
+                    "token_amount": 100.0,
+                    "timestamp": 1001.0,
+                },
             ],
         )
         cfg = _cfg()
@@ -748,22 +845,44 @@ class TestPreloadDataset:
         mints = [r.token.mint for r in records]
         assert mints == ["WITH"], "zero-trade tokens must be dropped"
 
-    def test_entry_price_uses_last_buy_in_full_window(self, tmp_path: Path, pg_test_db: str) -> None:
+    def test_entry_price_uses_last_buy_in_full_window(
+        self, tmp_path: Path, pg_test_db: str
+    ) -> None:
         """Entry price = sol/token of the LAST valid buy inside the full window."""
         _populate_snapshot(
             pg_test_db,
             tokens=[{"mint": "M", "created_at": 1000.0, "creator": "A"}],
             trades=[
                 # Inside full window (≤ 1045): two buys with different prices
-                {"mint": "M", "tx_type": "buy", "sol_amount": 0.1,
-                 "token_amount": 100.0, "timestamp": 1010.0},   # price 0.001
-                {"mint": "M", "tx_type": "sell", "sol_amount": 0.05,
-                 "token_amount": 25.0, "timestamp": 1020.0},    # ignored (sell)
-                {"mint": "M", "tx_type": "buy", "sol_amount": 0.2,
-                 "token_amount": 100.0, "timestamp": 1030.0},   # price 0.002 → pick this
+                {
+                    "mint": "M",
+                    "tx_type": "buy",
+                    "sol_amount": 0.1,
+                    "token_amount": 100.0,
+                    "timestamp": 1010.0,
+                },  # price 0.001
+                {
+                    "mint": "M",
+                    "tx_type": "sell",
+                    "sol_amount": 0.05,
+                    "token_amount": 25.0,
+                    "timestamp": 1020.0,
+                },  # ignored (sell)
+                {
+                    "mint": "M",
+                    "tx_type": "buy",
+                    "sol_amount": 0.2,
+                    "token_amount": 100.0,
+                    "timestamp": 1030.0,
+                },  # price 0.002 → pick this
                 # Post-window monitor trade (> 1045)
-                {"mint": "M", "tx_type": "buy", "sol_amount": 0.5,
-                 "token_amount": 100.0, "timestamp": 1060.0},
+                {
+                    "mint": "M",
+                    "tx_type": "buy",
+                    "sol_amount": 0.5,
+                    "token_amount": 100.0,
+                    "timestamp": 1060.0,
+                },
             ],
         )
         cfg = _cfg()
@@ -787,23 +906,29 @@ class TestPreloadDataset:
 class TestWorkerSerialParity:
     """Same base config + same dataset ⇒ same candidates in both paths."""
 
-    def test_worker_matches_serial_stream(self, tmp_path: Path, pg_test_db: str) -> None:
+    def test_worker_matches_serial_stream(
+        self, tmp_path: Path, pg_test_db: str
+    ) -> None:
         # Two tokens with enough buys to trigger entry in default-permissive cfg.
-        tokens = [{"mint": f"T{i}", "created_at": 1000.0 + i * 100, "creator": f"C{i}"}
-                  for i in range(3)]
+        tokens = [
+            {"mint": f"T{i}", "created_at": 1000.0 + i * 100, "creator": f"C{i}"}
+            for i in range(3)
+        ]
         trades = []
         for i, tok in enumerate(tokens):
             # 10 buys from distinct wallets inside the full window (≤ +45s)
             for k in range(10):
-                trades.append({
-                    "mint": tok["mint"],
-                    "wallet": f"W{i}_{k}",
-                    "tx_type": "buy",
-                    "sol_amount": 0.1,
-                    "token_amount": 100.0,
-                    "timestamp": tok["created_at"] + 1 + k,
-                    "v_sol": 10.0,
-                })
+                trades.append(
+                    {
+                        "mint": tok["mint"],
+                        "wallet": f"W{i}_{k}",
+                        "tx_type": "buy",
+                        "sol_amount": 0.1,
+                        "token_amount": 100.0,
+                        "timestamp": tok["created_at"] + 1 + k,
+                        "v_sol": 10.0,
+                    }
+                )
         _populate_snapshot(pg_test_db, tokens, trades)
 
         cfg = _cfg()
@@ -811,7 +936,7 @@ class TestWorkerSerialParity:
         cfg.observe_seconds = 45
         cfg.min_entry_buyer_number = 1
         cfg.max_entry_buyer_number = 999
-        cfg.score_threshold_buy = -999        # accept any score
+        cfg.score_threshold_buy = -999  # accept any score
         cfg.fast_score_threshold = -999
         cfg.min_market_cap_sol = 0.0
 
@@ -820,10 +945,17 @@ class TestWorkerSerialParity:
 
         # Serial Phase-1
         combo_ctx = {
-            "idx": 0, "params": {}, "cfg": cfg,
-            "fast_filter": __import__("pulse_bot.filters.fast", fromlist=["FastFilter"]).FastFilter(cfg),
-            "scorer": __import__("pulse_bot.filters.scorer", fromlist=["Scorer"]).Scorer(cfg, opt._db),
-            "candidates": [], "run_id": "r",
+            "idx": 0,
+            "params": {},
+            "cfg": cfg,
+            "fast_filter": __import__(
+                "pulse_bot.filters.fast", fromlist=["FastFilter"]
+            ).FastFilter(cfg),
+            "scorer": __import__(
+                "pulse_bot.filters.scorer", fromlist=["Scorer"]
+            ).Scorer(cfg, opt._db),
+            "candidates": [],
+            "run_id": "r",
         }
         opt._stream_and_evaluate([combo_ctx])
         serial_candidates = sorted(combo_ctx["candidates"])
@@ -836,13 +968,15 @@ class TestWorkerSerialParity:
         finally:
             # Clean up module-global state so other tests see a fresh worker ctx.
             from pulse_bot import optimizer as _opt_mod
+
             _opt_mod._WORKER_DATA.clear()
 
         # Reconstruct candidates list from closed trades (entry_time + mint).
         worker_entries = sorted((t["entry_time"], t["mint"]) for t in closed)
         serial_entries = sorted((c[0], c[1]) for c in serial_candidates)
-        assert worker_entries == serial_entries, \
-            "parallel worker must choose the same entries as the serial path"
+        assert (
+            worker_entries == serial_entries
+        ), "parallel worker must choose the same entries as the serial path"
 
 
 # ---------------------------------------------------------------------------
@@ -864,23 +998,31 @@ class TestSerialVsParallelEndToEnd:
         for i, tok in enumerate(tokens):
             # full-window buys (entries will be attempted)
             for k in range(10):
-                trades.append({
-                    "mint": tok["mint"], "wallet": f"W{i}_{k}",
-                    "tx_type": "buy", "sol_amount": 0.05,
-                    "token_amount": 50.0,
-                    "timestamp": tok["created_at"] + 1 + k,
-                    "v_sol": 10.0,
-                })
+                trades.append(
+                    {
+                        "mint": tok["mint"],
+                        "wallet": f"W{i}_{k}",
+                        "tx_type": "buy",
+                        "sol_amount": 0.05,
+                        "token_amount": 50.0,
+                        "timestamp": tok["created_at"] + 1 + k,
+                        "v_sol": 10.0,
+                    }
+                )
             # monitor-window trades: two tokens pump (price doubles), two dump.
             post_price = 0.002 if i % 2 == 0 else 0.0001
             for k in range(6):
-                trades.append({
-                    "mint": tok["mint"], "wallet": f"P{i}_{k}",
-                    "tx_type": "buy", "sol_amount": 0.05,
-                    "token_amount": 0.05 / post_price,
-                    "timestamp": tok["created_at"] + 50 + k,
-                    "v_sol": 20.0,
-                })
+                trades.append(
+                    {
+                        "mint": tok["mint"],
+                        "wallet": f"P{i}_{k}",
+                        "tx_type": "buy",
+                        "sol_amount": 0.05,
+                        "token_amount": 0.05 / post_price,
+                        "timestamp": tok["created_at"] + 50 + k,
+                        "v_sol": 20.0,
+                    }
+                )
         _populate_snapshot(path, tokens, trades)
 
     def _run(self, snap: str, out_db: str, workers: int) -> list[dict]:
@@ -897,10 +1039,12 @@ class TestSerialVsParallelEndToEnd:
         opt_db.init_schema()
         opt = Optimizer(cfg, opt_db)
         # Tiny 3-combo grid so the test is fast and deterministic.
-        opt.set_grid({
-            "entry_mode": ["full"],
-            "exit_hard_stop_loss_pct": [20.0, 50.0, 99.0],
-        })
+        opt.set_grid(
+            {
+                "entry_mode": ["full"],
+                "exit_hard_stop_loss_pct": [20.0, 50.0, 99.0],
+            }
+        )
         return opt.run(max_combos=0, workers=workers)
 
     def test_parallel_matches_serial(self, tmp_path: Path, pg_test_db: str) -> None:
@@ -920,6 +1064,6 @@ class TestSerialVsParallelEndToEnd:
                 for r in results
             )
 
-        assert _fingerprint(serial) == _fingerprint(parallel), (
-            "serial and parallel paths must produce identical top-N results"
-        )
+        assert _fingerprint(serial) == _fingerprint(
+            parallel
+        ), "serial and parallel paths must produce identical top-N results"

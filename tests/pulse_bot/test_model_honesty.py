@@ -27,12 +27,12 @@ MODEL_DIR = REPO_ROOT / "data" / "ml"
 # Alerts that should ALWAYS fail the suite — they indicate a regression
 # of a known codex v9 fix or a broken model.
 CRITICAL_ALERTS: set[str] = {
-    "shuffled_labels",            # leakage
+    "shuffled_labels",  # leakage
     "feature_importance_sanity",  # known-leak feature reappeared in top
-    "prior_drift",                # train/recent class-balance mismatch
-    "economic_backtest",          # standard policy loses SOL
+    "prior_drift",  # train/recent class-balance mismatch
+    "economic_backtest",  # standard policy loses SOL
     "economic_backtest_realistic",
-    "validation_crashed",         # orchestrator crashed
+    "validation_crashed",  # orchestrator crashed
 }
 
 # Alerts that are informational / noise-dominated on small samples.
@@ -47,7 +47,9 @@ SOFT_ALERTS: set[str] = {
 def _db_has_data() -> bool:
     try:
         import psycopg2
+
         from pulse_bot.db import _DEFAULT_PG_DSN
+
         conn = psycopg2.connect(_DEFAULT_PG_DSN)
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM token_scores WHERE source='live'")
@@ -113,6 +115,6 @@ def test_exit_model_no_critical_alerts(tmp_path: Path) -> None:
     soft = alerts & SOFT_ALERTS
     if soft:
         print(f"[exit] soft alerts (non-fatal): {sorted(soft)}")
-    assert not critical, (
-        f"Exit model CRITICAL alerts: {sorted(critical)} (soft: {sorted(soft)})"
-    )
+    assert (
+        not critical
+    ), f"Exit model CRITICAL alerts: {sorted(critical)} (soft: {sorted(soft)})"

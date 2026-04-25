@@ -54,7 +54,10 @@ def _connect(db_path: str) -> _Conn:
     """Open a psycopg2 connection through the SQLite-shaped wrapper.
     ``db_path`` may be a DSN URL or legacy SQLite-path string (ignored)."""
     from pulse_bot.db import _resolve_dsn
+
     return _Conn(psycopg2.connect(_resolve_dsn(db_path)))
+
+
 import tempfile
 import time
 from pathlib import Path
@@ -62,11 +65,12 @@ from pathlib import Path
 import pytest
 
 from pulse_bot.db import Database
-from pulse_bot.ml.features import (WALLET_FEATURES,
-                                   _extract_wallet_prior_features,
-                                   compute_top3_buyer_wallets)
+from pulse_bot.ml.features import (
+    WALLET_FEATURES,
+    _extract_wallet_prior_features,
+    compute_top3_buyer_wallets,
+)
 from pulse_bot.ml.wallet_indexer import WalletIndexer
-
 
 # ── Fixture layout ──────────────────────────────────────────────────
 
@@ -139,9 +143,7 @@ def _build_fixture_db(db_path: str) -> tuple[list[str], list[str], list[str], fl
         )
         # 3 known wallets + 2 random buyers, ordered by SOL buy size
         # so the known ones become top-3.
-        top3 = [
-            known_wallets[(i * 3 + k) % len(known_wallets)] for k in range(3)
-        ]
+        top3 = [known_wallets[(i * 3 + k) % len(known_wallets)] for k in range(3)]
         # Buys at decreasing size 5, 3, 2 SOL → deterministic top-3
         for j, wallet in enumerate(top3):
             amt = 5.0 - j
@@ -200,9 +202,7 @@ def _compute_features_live_path(
     top3 = compute_top3_buyer_wallets(trades_before_scored)
     if not top3:
         return _extract_wallet_prior_features(None, None, None)
-    stats = db.get_wallet_prior_stats_sync(
-        top3, exclude_mint=mint, cutoff_ts=scored_at
-    )
+    stats = db.get_wallet_prior_stats_sync(top3, exclude_mint=mint, cutoff_ts=scored_at)
     return _extract_wallet_prior_features(stats, top3, scored_at)
 
 
@@ -219,8 +219,7 @@ def _compute_features_build_path(
         (mint, scored_at),
     ).fetchall()
     trades_as_dicts = [
-        {"tx_type": tr[0], "wallet": tr[1], "sol_amount": tr[2]}
-        for tr in trade_rows
+        {"tx_type": tr[0], "wallet": tr[1], "sol_amount": tr[2]} for tr in trade_rows
     ]
     top3 = compute_top3_buyer_wallets(trades_as_dicts)
     stats_map: dict[str, dict] = {}
@@ -350,9 +349,7 @@ def test_live_vs_build_path_parity(fixture_db):
             {"tx_type": tr[0], "wallet": tr[1], "sol_amount": tr[2]}
             for tr in trade_rows
         ]
-        live_feats = _compute_features_live_path(
-            db, mint, trades_as_dicts, scored_at
-        )
+        live_feats = _compute_features_live_path(db, mint, trades_as_dicts, scored_at)
         for feat in WALLET_FEATURES:
             if not _nan_safe_close(build_feats[feat], live_feats[feat]):
                 mismatches.append(
@@ -360,9 +357,10 @@ def test_live_vs_build_path_parity(fixture_db):
                     f"live={live_feats[feat]}"
                 )
     conn.close()
-    assert not mismatches, (
-        f"{len(mismatches)} train/serve parity mismatches:\n"
-        + "\n".join(mismatches[:10])
+    assert (
+        not mismatches
+    ), f"{len(mismatches)} train/serve parity mismatches:\n" + "\n".join(
+        mismatches[:10]
     )
 
 

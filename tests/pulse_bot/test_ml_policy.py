@@ -12,10 +12,7 @@ import pandas as pd
 import pytest
 import xgboost as xgb
 
-from pulse_bot.ml.features import (
-    ENTRY_FEATURE_ORDER,
-    FEATURE_SCHEMA_VERSION,
-)
+from pulse_bot.ml.features import ENTRY_FEATURE_ORDER, FEATURE_SCHEMA_VERSION
 from pulse_bot.ml.policy import (
     DEFAULT_ENTRY_MODEL_PATH,
     DEFAULT_ENTRY_THRESHOLD,
@@ -37,18 +34,25 @@ def _train_toy_model(tmp_path: Path) -> Path:
     # Use surviving features (fast_score + total_score removed 2026-04-22).
     y = (X["unique_buyers"] + X["buy_count"] > 0).astype(int).values
     model = xgb.XGBClassifier(
-        n_estimators=15, max_depth=2, random_state=0,
-        objective="binary:logistic", eval_metric="auc",
+        n_estimators=15,
+        max_depth=2,
+        random_state=0,
+        objective="binary:logistic",
+        eval_metric="auc",
     )
     model.fit(X, y, verbose=False)
     model_path = tmp_path / "entry_model.ubj"
     model.save_model(model_path)
     # Write meta.json that matches feature order
-    (model_path.with_suffix(".meta.json")).write_text(json.dumps({
-        "features": ENTRY_FEATURE_ORDER,
-        "auc": 0.80,
-        "base_rate": 0.5,
-    }))
+    (model_path.with_suffix(".meta.json")).write_text(
+        json.dumps(
+            {
+                "features": ENTRY_FEATURE_ORDER,
+                "auc": 0.80,
+                "base_rate": 0.5,
+            }
+        )
+    )
     return model_path
 
 
@@ -104,8 +108,13 @@ def test_dump_features_json_roundtrips(tmp_path: Path) -> None:
     policy = EntryMLPolicy.from_path(mp)
     feats_json = policy.dump_features_json(
         {"unique_buyers": 5.0, "buy_count": 3.0},
-        holder_snapshot={"top1_30": 20.0, "top5_30": 50.0, "hc_30": 100,
-                         "top1_delta": 1.0, "top5_delta": 2.0},
+        holder_snapshot={
+            "top1_30": 20.0,
+            "top5_30": 50.0,
+            "hc_30": 100,
+            "top1_delta": 1.0,
+            "top5_delta": 2.0,
+        },
     )
     feats = json.loads(feats_json)
     assert feats["unique_buyers"] == 5.0
@@ -115,7 +124,9 @@ def test_dump_features_json_roundtrips(tmp_path: Path) -> None:
         assert name in feats
 
 
-def test_get_active_policy_name_defaults_to_rules(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_active_policy_name_defaults_to_rules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.delenv("PULSE_POLICY", raising=False)
     assert get_active_policy_name() == "rules"
 
@@ -144,10 +155,14 @@ def test_policy_refuses_stale_schema(tmp_path: Path) -> None:
     skew bug masked itself. Refuse to load by default; only allow with
     explicit PULSE_ALLOW_STALE_MODEL=1 override (for forced inspection)."""
     mp = _train_toy_model(tmp_path)
-    (mp.with_suffix(".meta.json")).write_text(json.dumps({
-        "features": ["completely", "different", "feature", "order"],
-        "auc": 0.80,
-    }))
+    (mp.with_suffix(".meta.json")).write_text(
+        json.dumps(
+            {
+                "features": ["completely", "different", "feature", "order"],
+                "auc": 0.80,
+            }
+        )
+    )
     with pytest.raises(RuntimeError, match="does not match current"):
         EntryMLPolicy.from_path(mp)
 
@@ -158,10 +173,14 @@ def test_policy_stale_schema_override(
     """Explicit PULSE_ALLOW_STALE_MODEL=1 lets the model load but logs an
     ERROR — never silent."""
     mp = _train_toy_model(tmp_path)
-    (mp.with_suffix(".meta.json")).write_text(json.dumps({
-        "features": ["completely", "different", "feature", "order"],
-        "auc": 0.80,
-    }))
+    (mp.with_suffix(".meta.json")).write_text(
+        json.dumps(
+            {
+                "features": ["completely", "different", "feature", "order"],
+                "auc": 0.80,
+            }
+        )
+    )
     monkeypatch.setenv("PULSE_ALLOW_STALE_MODEL", "1")
     with caplog.at_level("ERROR"):
         EntryMLPolicy.from_path(mp)
@@ -206,16 +225,16 @@ def test_decide_with_confidence_fallback_without_meta(tmp_path: Path) -> None:
     # allows extreme proba to trigger BUY/SKIP.
     assert abs(policy.proba_floor - 0.30) < 1e-9
     assert abs(policy.proba_ceiling - 0.70) < 1e-9
-    action, _, _ = policy.decide_with_confidence(
-        {c: 0.0 for c in ENTRY_FEATURE_ORDER}
-    )
+    action, _, _ = policy.decide_with_confidence({c: 0.0 for c in ENTRY_FEATURE_ORDER})
     assert action in {"BUY", "SKIP", "RULES"}
 
 
 def test_calibration_platt_bounded() -> None:
     """_calibrate must return values in (0, 1) even for extreme inputs."""
-    from pulse_bot.ml.policy import EntryMLPolicy
     import numpy as np
+
+    from pulse_bot.ml.policy import EntryMLPolicy
+
     fake = EntryMLPolicy.__new__(EntryMLPolicy)
     fake.calibration = {"a": 100.0, "b": -50.0}  # steep logistic
     assert fake._calibrate(0.0) == pytest.approx(0.0, abs=1e-9)

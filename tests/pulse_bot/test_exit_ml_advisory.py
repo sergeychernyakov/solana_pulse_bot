@@ -19,10 +19,7 @@ import xgboost as xgb
 
 from pulse_bot.config import PulseBotConfig
 from pulse_bot.ml.features import EXIT_FEATURE_ORDER
-from pulse_bot.ml.policy import (
-    ExitMLPolicy,
-    load_exit_policy_if_available,
-)
+from pulse_bot.ml.policy import ExitMLPolicy, load_exit_policy_if_available
 from pulse_bot.pulse.exit_manager import ExitManager, ExitSignal
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -36,15 +33,24 @@ def _train_toy_exit_model(tmp_path: Path) -> Path:
     # Label depends on drawdown — strong signal so model actually learns
     y = (X["drawdown_from_peak"] > 0).astype(int).values
     m = xgb.XGBClassifier(
-        n_estimators=20, max_depth=2, random_state=0,
-        objective="binary:logistic", eval_metric="auc",
+        n_estimators=20,
+        max_depth=2,
+        random_state=0,
+        objective="binary:logistic",
+        eval_metric="auc",
     )
     m.fit(X, y, verbose=False)
     p = tmp_path / "exit_model.ubj"
     m.save_model(p)
-    (p.with_suffix(".meta.json")).write_text(json.dumps({
-        "features": EXIT_FEATURE_ORDER, "auc": 0.80, "base_rate": 0.5,
-    }))
+    (p.with_suffix(".meta.json")).write_text(
+        json.dumps(
+            {
+                "features": EXIT_FEATURE_ORDER,
+                "auc": 0.80,
+                "base_rate": 0.5,
+            }
+        )
+    )
     return p
 
 
@@ -68,23 +74,29 @@ class _FakeAdvisorBase:
     def predict_proba(self, state, pulse):
         return self._proba
 
-    def decide_with_confidence(
-        self, state, pulse, current_pnl_pct=None
-    ):
+    def decide_with_confidence(self, state, pulse, current_pnl_pct=None):
         return (self._action, self._proba)
 
 
 def _pulse(
-    buy_rate: float = 0.5, sell_rate: float = 0.0,
-    new_wallet_rate: float = 0.5, creator_selling: bool = False,
-    whale_exit: bool = False, peak_buy_rate: float = 0.5,
-    buy_rate_drop_from_peak: float = 1.0, trend_declining_count: int = 0,
-    curve_progress_pct: float = 10.0, window_events: int = 20,
+    buy_rate: float = 0.5,
+    sell_rate: float = 0.0,
+    new_wallet_rate: float = 0.5,
+    creator_selling: bool = False,
+    whale_exit: bool = False,
+    peak_buy_rate: float = 0.5,
+    buy_rate_drop_from_peak: float = 1.0,
+    trend_declining_count: int = 0,
+    curve_progress_pct: float = 10.0,
+    window_events: int = 20,
     curve_velocity: float = 0.0,
 ) -> SimpleNamespace:
     return SimpleNamespace(
-        buy_rate=buy_rate, sell_rate=sell_rate, new_wallet_rate=new_wallet_rate,
-        creator_selling=creator_selling, whale_exit=whale_exit,
+        buy_rate=buy_rate,
+        sell_rate=sell_rate,
+        new_wallet_rate=new_wallet_rate,
+        creator_selling=creator_selling,
+        whale_exit=whale_exit,
         peak_buy_rate=peak_buy_rate,
         buy_rate_drop_from_peak=buy_rate_drop_from_peak,
         trend_declining_count=trend_declining_count,
@@ -99,8 +111,12 @@ def test_exit_policy_loads(tmp_path: Path) -> None:
     pol = ExitMLPolicy.from_path(p)
     assert len(pol.model_hash) == 64
     proba = pol.predict_proba(
-        {"hold_seconds": 10, "current_pnl_pct": -5, "peak_pnl_pct": 0,
-         "drawdown_from_peak": 5},
+        {
+            "hold_seconds": 10,
+            "current_pnl_pct": -5,
+            "peak_pnl_pct": 0,
+            "drawdown_from_peak": 5,
+        },
         pulse=_pulse(),
     )
     assert 0.0 <= proba <= 1.0
@@ -153,9 +169,7 @@ def test_advisor_failure_does_not_crash(tmp_path: Path) -> None:
         def predict_proba(self, state, pulse):
             raise RuntimeError("simulated failure")
 
-        def decide_with_confidence(
-            self, state, pulse, current_pnl_pct=None
-        ):
+        def decide_with_confidence(self, state, pulse, current_pnl_pct=None):
             raise RuntimeError("simulated failure")
 
     cfg = PulseBotConfig()
@@ -171,6 +185,7 @@ def test_exit_signal_default_ml_proba_is_none() -> None:
 
 
 # ── Exit ML activation (codex Q4 Phase B, 2026-04-23) ──
+
 
 def _sell_all_advisor() -> _FakeAdvisorBase:
     return _FakeAdvisorBase("SELL_ALL", 0.95)
@@ -250,6 +265,7 @@ def test_ml_never_overrides_hard_rules_even_when_active() -> None:
 
 # ── E2 4-way + E5 sizing ladder (codex, 2026-04-23 v2) ──
 
+
 def test_ml_sell_partial_ladder_30pct() -> None:
     cfg = PulseBotConfig(exit_ml_active=True, exit_ml_min_hold_seconds=0.0)
     mgr = ExitManager(cfg, ml_advisor=_partial_advisor(proba=0.60))
@@ -311,8 +327,10 @@ def test_hold_hard_cannot_block_hard_rules() -> None:
         exit_ml_hold_hard_enabled=True,
         exit_ml_min_hold_seconds=0.0,
     )
+
     def mgr_factory() -> ExitManager:
         return ExitManager(cfg, ml_advisor=_hold_hard_advisor())
+
     # creator_dump
     s = mgr_factory().decide(
         _pulse(creator_selling=True), pnl_pct=10.0, elapsed_sec=30.0

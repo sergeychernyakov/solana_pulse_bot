@@ -38,8 +38,11 @@ def test_feature_order_is_stable() -> None:
     """ENTRY_FEATURE_ORDER must be a concatenation of the five groups
     (Phase E 2026-04-24 added WALLET_FEATURES as the fifth)."""
     assert ENTRY_FEATURE_ORDER == [
-        *SCORER_FEATURES, *DERIVED_FEATURES,
-        *HELIUS_FEATURES, *CREATOR_FEATURES, *WALLET_FEATURES,
+        *SCORER_FEATURES,
+        *DERIVED_FEATURES,
+        *HELIUS_FEATURES,
+        *CREATOR_FEATURES,
+        *WALLET_FEATURES,
     ]
     # No duplicates
     assert len(ENTRY_FEATURE_ORDER) == len(set(ENTRY_FEATURE_ORDER))
@@ -66,9 +69,9 @@ def test_extract_fills_missing_with_zero() -> None:
         assert feats[name] == 0.0, f"{name} should default to 0.0"
     assert feats["hour_cos"] == 1.0  # cos(0) = 1
     for name in WALLET_FEATURES:
-        assert math.isnan(feats[name]), (
-            f"{name} should default to NaN when wallet_prior_stats is None"
-        )
+        assert math.isnan(
+            feats[name]
+        ), f"{name} should default to NaN when wallet_prior_stats is None"
 
 
 def test_extract_reads_scorer_fields() -> None:
@@ -94,8 +97,11 @@ def test_cyclical_hour_encoding() -> None:
 
 def test_holder_snapshot_maps_fields() -> None:
     holder = {
-        "top1_30": 15.5, "top5_30": 45.0, "hc_30": 120,
-        "top1_delta": -2.3, "top5_delta": 5.1,
+        "top1_30": 15.5,
+        "top5_30": 45.0,
+        "hc_30": 120,
+        "top1_delta": -2.3,
+        "top5_delta": 5.1,
     }
     feats = extract_entry_features({}, holder_snapshot=holder)
     assert feats["top1_30"] == 15.5
@@ -123,6 +129,7 @@ def test_accepts_object_with_attributes() -> None:
     class Fake:
         unique_buyers = 3
         buy_count = 9
+
     feats = extract_entry_features(Fake(), hour_utc=12)
     assert feats["unique_buyers"] == 3.0
     assert feats["buy_count"] == 9.0
@@ -137,8 +144,7 @@ def test_nan_and_none_treated_same() -> None:
     assert feats_none["unique_buyers"] == 0.0
     # NaN → 0.0 or stays NaN (documented tradeoff; NaN policy zero-fills
     # in build_dataset before training so the skew is resolved there).
-    assert (feats_nan["unique_buyers"] == 0.0
-            or math.isnan(feats_nan["unique_buyers"]))
+    assert feats_nan["unique_buyers"] == 0.0 or math.isnan(feats_nan["unique_buyers"])
 
 
 # ── Parity with live DB ─────────────────────────────────────────────
@@ -170,7 +176,8 @@ def test_parity_with_live_token_scores() -> None:
     mismatches: list[str] = []
     for _, row in df.iterrows():
         feats = extract_entry_features(
-            row.to_dict(), hour_utc=row["hour_utc"],
+            row.to_dict(),
+            hour_utc=row["hour_utc"],
         )
         for name in SCORER_FEATURES:
             want = row[name]
@@ -184,9 +191,7 @@ def test_parity_with_live_token_scores() -> None:
                 mismatches.append(
                     f"mint={row['mint']} {name}: {want} vs extracted {got}"
                 )
-    assert not mismatches, "Feature parity broken:\n" + "\n".join(
-        mismatches[:20]
-    )
+    assert not mismatches, "Feature parity broken:\n" + "\n".join(mismatches[:20])
 
 
 def test_creator_features_live_vs_training_parity() -> None:
@@ -275,28 +280,26 @@ def test_skew_guard_fires_on_regression(caplog) -> None:
     for name in CREATOR_FEATURES:
         assert feats[name] == 0.0
     # ...but we must have screamed about each one.
-    warn_msgs = [
-        r.getMessage() for r in caplog.records if r.levelname == "WARNING"
-    ]
+    warn_msgs = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     # At least the aggregate "all zero" warning fired
-    assert any("creator-skew" in m or "CREATOR_FEATURES resolved to 0.0" in m
-               for m in warn_msgs), (
-        "Skew guard did not fire on bogus snapshot; "
-        "warnings seen: " + repr(warn_msgs)
-    )
+    assert any(
+        "creator-skew" in m or "CREATOR_FEATURES resolved to 0.0" in m
+        for m in warn_msgs
+    ), "Skew guard did not fire on bogus snapshot; " "warnings seen: " + repr(warn_msgs)
 
 
 def test_skew_guard_silent_when_snapshot_is_none(caplog) -> None:
     """Legitimately-missing snapshot (None) must NOT warn — only the
     ambiguous case (non-None but all zero) is a bug signature."""
     import logging
+
     with caplog.at_level(logging.WARNING, logger="pulse_bot.ml.features"):
         extract_entry_features({}, creator_snapshot=None)
-    warn_msgs = [r.getMessage() for r in caplog.records
-                 if r.levelname == "WARNING"]
-    assert not any("creator" in m.lower() for m in warn_msgs), (
-        "Skew guard should not fire on None snapshot; "
-        "warnings seen: " + repr(warn_msgs)
+    warn_msgs = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert not any(
+        "creator" in m.lower() for m in warn_msgs
+    ), "Skew guard should not fire on None snapshot; " "warnings seen: " + repr(
+        warn_msgs
     )
 
 
@@ -312,6 +315,6 @@ def test_parity_with_parquet_if_present() -> None:
     df_cols = set(df.columns)
     # Every feature we'd extract must exist in the parquet
     missing_in_parquet = [c for c in ENTRY_FEATURE_ORDER if c not in df_cols]
-    assert not missing_in_parquet, (
-        f"Parquet missing features the extractor expects: {missing_in_parquet}"
-    )
+    assert (
+        not missing_in_parquet
+    ), f"Parquet missing features the extractor expects: {missing_in_parquet}"
