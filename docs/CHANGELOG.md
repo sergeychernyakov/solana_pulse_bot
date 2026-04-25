@@ -12,6 +12,32 @@
 
 ---
 
+## 2026-04-25 13:15 — Удаление exit_model + DB cleanup (300 MB)
+
+**Что изменилось:**
+- Удалён файл `data/ml/exit_model.ubj` + `exit_model.meta.json` — бинарный exit классификатор exit_v3 с AUC 0.5454 (практически random, 9 фич).
+- DB cleanup:
+  - `DELETE FROM token_scores WHERE source='backtest'` — 118,674 строк (от 1ч backtest 2026-04-24, не используются ML обучением)
+  - `TRUNCATE event_log` — 350,278 строк (write-only diagnostic, нет читателей в коде)
+  - `VACUUM FULL ANALYZE` на обеих таблицах — реклейм места
+
+**Зачем:**
+- exit_model AUC 0.55 = почти random; threshold=0.80 редко срабатывает, реальный contribution к live решениям микроскопический. Теперь exits идут rules + exit_quantile_sl/tp heads + (после включения) Phase 4B survival.
+- 300 MB освобождено на диске, чище данные для будущих sweeps (без backtest noise в base).
+
+**Результат:**
+- DB size: 3056 MB → 2756 MB (−300 MB, −9.8%)
+- token_scores: 400 MB → 176 MB (118K → 75K строк)
+- event_log: 76 MB → 32 KB (350K → 3 строк)
+- Бот живой (PID 39189) — модель в памяти не затронута, изменение увидит только при рестарте
+- Pipeline graceful fallback: `load_exit_policy_if_available` возвращает None → лог `Exit ML: no model loaded (advisor disabled)`
+
+**Откат:**
+- exit_model: переобучить через `train.py --dataset exit` (parquet всё ещё на месте: data/ml/exit.parquet)
+- DB cleanup: backtest scores и event_log были write-only/stale — восстанавливать незачем. Если нужен event_log — `git revert` cleanup commit (нет — это не коммит, просто DB операции). Просто заново начнёт логировать после рестарта.
+
+---
+
 ## 2026-04-25 19:00 — Phase 2.5: time-aware (multi-snapshot) features в main entry-модели
 
 **Что изменилось:**
