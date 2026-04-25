@@ -204,7 +204,18 @@ class HeliusBackfillClient:
         if self._session is None:
             import aiohttp
 
-            self._session = aiohttp.ClientSession()
+            # TCPConnector with limit=4 (was unbounded). Helius/edge appears
+            # to drop simultaneous SYNs above 4-5 — concurrent burst gives
+            # "Server disconnected" / "Connection reset by peer" even when
+            # sequential curl works fine. Also force_close=False reuses
+            # connections, avoiding repeated TLS handshakes.
+            connector = aiohttp.TCPConnector(
+                limit=4,
+                limit_per_host=4,
+                force_close=False,
+                enable_cleanup_closed=True,
+            )
+            self._session = aiohttp.ClientSession(connector=connector)
         return self._session
 
     async def close(self) -> None:
