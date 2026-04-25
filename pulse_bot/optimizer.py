@@ -1573,9 +1573,10 @@ class Optimizer:
             t = trades or 0
             if t < 1:
                 continue  # zero-trade combos add no information
+            # Skip malformed JSON rows; continue scanning the rest.
             try:
                 params = json.loads(params_json)
-            except Exception:  # nosec B112 — skip malformed row, continue scan
+            except Exception:  # nosec B112
                 continue
             per_trade = (pnl or 0.0) / t
             combos.append((params, per_trade, t))

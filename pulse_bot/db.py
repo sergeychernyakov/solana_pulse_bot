@@ -77,11 +77,10 @@ async def _get_async_pool(dsn: str) -> asyncpg.Pool:
             pool_loop = getattr(_asyncpg_pool, "_loop", None)
             if pool_loop is not None and pool_loop is not current_loop:
                 # Stale pool from a previous asyncio.run() call.
+                # Best-effort terminate; pool is replaced below regardless.
                 try:
                     _asyncpg_pool.terminate()
-                except (
-                    Exception
-                ):  # nosec B110 — best-effort terminate, pool replaced below
+                except Exception:  # nosec B110
                     pass
                 _asyncpg_pool = None
         except RuntimeError:

@@ -1326,11 +1326,10 @@ class Pipeline:
                 # the reason — keeps the exit_price/PnL plumbing identical
                 # to the regular close path.
                 result = runner.timeout_result()
+                # Frozen dataclass may reject assignment; default reason is acceptable.
                 try:
                     result.exit_reason = "survival_predict"
-                except (
-                    Exception
-                ):  # nosec B110 — frozen dataclass guard, fall-through to default reason
+                except Exception:  # nosec B110
                     pass
                 return result
             return None
@@ -1360,13 +1359,12 @@ class Pipeline:
             "total_sells",
             "peak_price",
         ):
+            # Opportunistic feature extraction; missing/non-numeric attrs ok.
             try:
                 v = getattr(runner, attr, None)
                 if v is not None:
                     feats[attr] = float(v)
-            except (
-                Exception
-            ):  # nosec B112 — opportunistic feature extraction, missing attr ok
+            except Exception:  # nosec B112
                 continue
         return feats
 
