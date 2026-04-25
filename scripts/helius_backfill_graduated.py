@@ -159,13 +159,46 @@ class RpcStats:
 
 class HeliusBackfillClient:
     """Async client wrapping signatures + enhanced parsed transactions
-    with a single shared aiohttp session."""
+    with a single shared aiohttp session.
 
-    def __init__(self, api_key: str, concurrency: int = DEFAULT_CONCURRENCY) -> None:
-        self._api_key = api_key
+    Multi-key support: pass a list of API keys; the client rotates them
+    round-robin per request and quarantines any key that returns 429
+    for ``KEY_QUARANTINE_SEC`` seconds (cooldown). If ALL keys are
+    quarantined simultaneously, ``_post`` returns None and the caller
+    treats it as a transient failure (mint is skipped, can be re-run).
+    """
+
+    KEY_QUARANTINE_SEC = 60.0
+
+    def __init__(
+        self,
+        api_keys: str | list[str],
+        concurrency: int = DEFAULT_CONCURRENCY,
+    ) -> None:
+        if isinstance(api_keys, str):
+            api_keys = [k.strip() for k in api_keys.split(",") if k.strip()]
+        if not api_keys:
+            raise ValueError("api_keys must be non-empty")
+        self._api_keys: list[str] = list(api_keys)
+        self._key_idx = 0
+        self._key_cooldown_until: dict[str, float] = {k: 0.0 for k in api_keys}
         self._sem = asyncio.Semaphore(concurrency)
         self._session: Any | None = None
         self.stats = RpcStats()
+
+    def _next_key(self) -> str | None:
+        """Return next non-quarantined key in rotation, or None if all cooled."""
+        now = time.time()
+        n = len(self._api_keys)
+        for _ in range(n):
+            key = self._api_keys[self._key_idx % n]
+            self._key_idx += 1
+            if self._key_cooldown_until.get(key, 0.0) <= now:
+                return key
+        return None
+
+    def _quarantine_key(self, key: str) -> None:
+        self._key_cooldown_until[key] = time.time() + self.KEY_QUARANTINE_SEC
 
     async def _get_session(self) -> Any:
         if self._session is None:
@@ -185,7 +218,6 @@ class HeliusBackfillClient:
         ``until_ts`` is enforced softly: we may go slightly beyond it
         because Solana doesn't support a ts cursor — pagination uses
         ``before=<sig>``."""
-        url = RPC_URL_TEMPLATE.format(key=self._api_key)
         out: list[dict] = []
         before: str | None = None
         while True:
@@ -200,7 +232,7 @@ class HeliusBackfillClient:
             }
             async with self._sem:
                 self.stats.sig_calls += 1
-                data = await self._post(url, payload)
+                data = await self._post("rpc", payload)
             if data is None:
                 return out
             res = data.get("result") or []
@@ -219,14 +251,13 @@ class HeliusBackfillClient:
         """Batch-fetch parsed transactions in chunks of ``PARSED_TX_BATCH``."""
         if not sigs:
             return []
-        url = PARSED_URL_TEMPLATE.format(key=self._api_key)
         out: list[dict] = []
         for i in range(0, len(sigs), PARSED_TX_BATCH):
             batch = sigs[i : i + PARSED_TX_BATCH]
             async with self._sem:
                 self.stats.parsed_calls += 1
                 self.stats.parsed_sigs += len(batch)
-                data = await self._post(url, {"transactions": batch})
+                data = await self._post("parsed", {"transactions": batch})
             if isinstance(data, list):
                 out.extend(data)
             else:
@@ -235,14 +266,30 @@ class HeliusBackfillClient:
                 logger.warning("parsed-tx batch error: %s", str(data)[:200])
         return out
 
-    async def _post(self, url: str, payload: dict) -> Any:
-        """POST with retry on transient errors. Returns None on hard
-        failure so callers can decide to abort cleanly."""
+    async def _post(self, endpoint: str, payload: dict) -> Any:
+        """POST with retry + key rotation on 429.
+
+        ``endpoint`` is "rpc" or "parsed". For each attempt we pick the
+        next non-quarantined key. On 429, the offending key is
+        quarantined for ``KEY_QUARANTINE_SEC`` and we try the next one.
+        Returns None when all keys are quarantined or attempts exhausted.
+        """
         import aiohttp
 
         session = await self._get_session()
         backoff = 1.0
-        for attempt in range(5):
+        for attempt in range(8):
+            key = self._next_key()
+            if key is None:
+                logger.warning("All Helius keys quarantined; pausing %.1fs", backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+                continue
+            url = (
+                RPC_URL_TEMPLATE.format(key=key)
+                if endpoint == "rpc"
+                else PARSED_URL_TEMPLATE.format(key=key)
+            )
             try:
                 async with session.post(
                     url,
@@ -251,12 +298,33 @@ class HeliusBackfillClient:
                 ) as resp:
                     if resp.status == 429:
                         self.stats.rate_limit_hits += 1
-                        logger.warning("Helius 429; backing off %.1fs", backoff)
-                        await asyncio.sleep(backoff)
-                        backoff = min(backoff * 2, 30.0)
-                        continue
+                        self._quarantine_key(key)
+                        logger.warning(
+                            "Helius 429 on key=...%s; quarantine %.0fs (other keys left=%d)",
+                            key[-6:],
+                            self.KEY_QUARANTINE_SEC,
+                            sum(
+                                1
+                                for k in self._api_keys
+                                if self._key_cooldown_until[k] <= time.time()
+                            ),
+                        )
+                        continue  # try next key immediately
                     if resp.status != 200:
                         body = await resp.text()
+                        # max-usage-reached is permanent for the month — quarantine longer
+                        if "max usage reached" in body.lower() or resp.status in (
+                            402,
+                            403,
+                        ):
+                            self._quarantine_key(key)
+                            self._key_cooldown_until[key] = time.time() + 86400.0  # 24h
+                            logger.warning(
+                                "Helius key=...%s exhausted (status=%d); 24h quarantine",
+                                key[-6:],
+                                resp.status,
+                            )
+                            continue
                         logger.warning(
                             "Helius status=%d body=%s", resp.status, body[:200]
                         )
@@ -401,10 +469,22 @@ async def backfill_one_mint(
 
 
 async def run(args: argparse.Namespace) -> None:
-    api_key = os.environ.get("HELIUS_API_KEY")
-    if not api_key:
-        logger.error("HELIUS_API_KEY not set in env")
+    # Multi-key support: --api-keys K1,K2,K3 OR HELIUS_API_KEYS env (comma-list)
+    # OR HELIUS_API_KEY env (single legacy). Round-robin per request.
+    raw_keys = (
+        args.api_keys
+        or os.environ.get("HELIUS_API_KEYS")
+        or os.environ.get("HELIUS_API_KEY")
+    )
+    if not raw_keys:
+        logger.error(
+            "No Helius API key. Set HELIUS_API_KEY, HELIUS_API_KEYS=k1,k2,k3, or pass --api-keys"
+        )
         sys.exit(2)
+    api_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+    logger.info(
+        "Using %d Helius key(s): %s", len(api_keys), [f"...{k[-6:]}" for k in api_keys]
+    )
 
     db = Database()
     state_path = Path(args.state_file)
@@ -423,7 +503,7 @@ async def run(args: argparse.Namespace) -> None:
         logger.info("nothing to do")
         return
 
-    client = HeliusBackfillClient(api_key, concurrency=args.concurrency)
+    client = HeliusBackfillClient(api_keys, concurrency=args.concurrency)
 
     total_parsed = 0
     total_inserted = 0
@@ -530,6 +610,13 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=str(DEFAULT_STATE_PATH),
         help="Resume-state JSON file path.",
+    )
+    p.add_argument(
+        "--api-keys",
+        type=str,
+        default=None,
+        help="Comma-separated Helius API keys (round-robin pool). "
+        "Falls back to HELIUS_API_KEYS env, then HELIUS_API_KEY.",
     )
     return p.parse_args()
 
