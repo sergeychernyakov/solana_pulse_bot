@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from pulse_bot.config import PulseBotConfig
@@ -17,10 +19,14 @@ if TYPE_CHECKING:
     from pulse_bot.helius_holders import HeliusHolderClient
     from pulse_bot.helius_onchain import HeliusOnchainClient
     from pulse_bot.launchpads.base import Launchpad
-    from pulse_bot.ml.policy import EntryMLPolicy
+    from pulse_bot.ml.policy import EntryMLPolicy, EntryT30Policy
     from pulse_bot.models import CreatorStats, Token, Trade
 
-from pulse_bot.ml.policy import get_active_policy_name, load_entry_policy_if_available
+from pulse_bot.ml.policy import (
+    get_active_policy_name,
+    load_entry_policy_if_available,
+    load_entry_t30_policy_if_available,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +38,17 @@ class Pipeline:
     Phase 2 (full, 45s): Continue collecting → Scorer → BUY/SKIP/BORDERLINE
     Both results stored per token for analysis.
     """
+
+    # Phase 4B — survival hazard model is queried at most once every
+    # ``_SURVIVAL_TICK_SECONDS`` per open paper trade. XGBoost call
+    # latency is ~5 ms but log spam + DB writes add up at large open
+    # position counts; 10 s is the floor recommended by the roadmap.
+    _SURVIVAL_TICK_SECONDS: float = 10.0
+    # Phase 5 — entry-timing checkpoint cadence. Runs every 15 s
+    # starting from the first checkpoint at T+15.
+    _TIMING_CHECKPOINT_SECONDS: float = 15.0
+    _TIMING_FIRST_CHECKPOINT: float = 15.0
+    _TIMING_CONFIDENCE_FLOOR: float = 0.6
 
     def __init__(
         self,
@@ -150,6 +167,71 @@ class Pipeline:
                 "Set PULSE_EXIT_ML_ACTIVE=1 to activate.",
                 _exit_pol.model_hash[:16],
             )
+
+        # ── Phase 3 / 4B / 5 deployment switches (default: OFF) ──────
+        # All three integrations are opt-in. With env switches unset the
+        # corresponding policy is never loaded and the new code paths are
+        # short-circuited at the very top — bot behaviour is bit-for-bit
+        # identical to pre-integration. Each switch checked once at boot
+        # so a flip requires a restart (matches PULSE_POLICY semantics).
+        self._entry_t30_active: bool = (
+            os.environ.get("PULSE_ENTRY_T30_ACTIVE", "0") == "1"
+        )
+        self._survival_active: bool = (
+            os.environ.get("PULSE_SURVIVAL_ACTIVE", "0") == "1"
+        )
+        self._timing_active: bool = os.environ.get("PULSE_TIMING_ACTIVE", "0") == "1"
+        self._ml_entry_t30_policy: "EntryT30Policy | None" = None
+        if self._entry_t30_active:
+            self._ml_entry_t30_policy = load_entry_t30_policy_if_available()
+            if self._ml_entry_t30_policy is None:
+                logger.warning(
+                    "PULSE_ENTRY_T30_ACTIVE=1 but no T+30 model could be "
+                    "loaded — early-decision hook is a no-op."
+                )
+            else:
+                logger.info(
+                    "Entry T+30 ACTIVE: model_hash=%s buy_ceiling=%.3f "
+                    "skip_floor=%.3f",
+                    self._ml_entry_t30_policy.model_hash[:16],
+                    self._ml_entry_t30_policy.buy_ceiling,
+                    self._ml_entry_t30_policy.skip_floor,
+                )
+        # Survival model is loaded lazily on the first paper trade tick
+        # (the .ubj load itself is cheap, but we don't want to import
+        # xgboost at boot when the switch is off).
+        self._survival_model: tuple[Any, dict] | None = None
+        self._survival_load_attempted: bool = False
+        if self._survival_active:
+            logger.info(
+                "Survival exit ACTIVE: model will load on first paper "
+                "trade tick. min_hold=%.0fs",
+                self._config.exit_ml_min_hold_seconds,
+            )
+        # Entry-timing classifier — store as model_path so each predict
+        # call re-uses the loaded booster (predict_entry_timing reloads
+        # internally; cached in _timing_booster on first hit).
+        self._timing_model_path: Path | None = None
+        self._timing_booster_cache: tuple[Any, dict] | None = None
+        if self._timing_active:
+            from pulse_bot.ml.entry_timing import TIMING_SCHEMA_VERSION
+
+            default_path = Path("data/ml/entry_timing_model.ubj")
+            self._timing_model_path = default_path
+            if not default_path.exists():
+                logger.warning(
+                    "PULSE_TIMING_ACTIVE=1 but no entry-timing model at "
+                    "%s — checkpoint hook is a no-op.",
+                    default_path,
+                )
+                self._timing_model_path = None
+            else:
+                logger.info(
+                    "Entry-timing checkpoint ACTIVE: model=%s "
+                    "schema=%s checkpoint_every=15s confidence_floor=0.6",
+                    default_path,
+                    TIMING_SCHEMA_VERSION,
+                )
 
     async def run(self) -> None:
         """Main entry point. Connect to WS and process tokens until interrupted."""
@@ -487,10 +569,38 @@ class Pipeline:
                 0.0 if is_replay else 2.0
             )
             collected: list[Trade] = []
-            async for trade in self._launchpad.stream_trades(
-                token.mint, collect_duration
+            # Phase 3 / 5 deployment hook: when an early-decision policy
+            # is active, a parallel checkpoint task watches accumulated
+            # trades and may set a verdict (BUY_EARLY / SKIP_EARLY)
+            # mid-window. With both switches off the task is never
+            # spawned and the collection loop is identical to before.
+            checkpoint_state: dict[str, Any] = {"verdict": None}
+            checkpoint_task: asyncio.Task | None = None
+            if not is_replay and (
+                (self._entry_t30_active and self._ml_entry_t30_policy is not None)
+                or (self._timing_active and self._timing_model_path is not None)
             ):
-                collected.append(trade)
+                checkpoint_task = asyncio.create_task(
+                    self._observation_checkpoint_loop(
+                        token, collected, creator_snapshot, checkpoint_state
+                    )
+                )
+            try:
+                async for trade in self._launchpad.stream_trades(
+                    token.mint, collect_duration
+                ):
+                    collected.append(trade)
+                    if checkpoint_state["verdict"] is not None:
+                        # Checkpoint already decided — stop collecting and
+                        # let the post-loop logic act on the verdict.
+                        break
+            finally:
+                if checkpoint_task is not None and not checkpoint_task.done():
+                    checkpoint_task.cancel()
+                    try:
+                        await checkpoint_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
 
             fast_end = token.created_at + self._config.fast_observe_seconds
             full_end = token.created_at + self._config.observe_seconds
@@ -786,6 +896,41 @@ class Pipeline:
                         exc_info=True,
                     )
 
+            # ── Phase 3 / 5 early-decision override ──────────────────
+            # If the checkpoint loop set a verdict mid-window, apply it
+            # *after* the standard rules+hybrid path so the cumulative
+            # decision history is still logged. Defaults-OFF: verdict is
+            # always None (loop never spawned), this branch is a no-op.
+            cp_verdict = checkpoint_state.get("verdict")
+            if cp_verdict is not None:
+                source = checkpoint_state.get("source", "checkpoint")
+                cp_proba = checkpoint_state.get("proba")
+                if cp_verdict == "BUY_EARLY" and not should_enter:
+                    logger.warning(
+                        "EARLY OVERRIDE %s: rules=SKIP → %s=BUY (proba=%.3f)",
+                        mint_short,
+                        source,
+                        float(cp_proba) if cp_proba is not None else float("nan"),
+                    )
+                    should_enter = True
+                    entry_type = source
+                elif cp_verdict == "BUY_EARLY":
+                    logger.info(
+                        "EARLY agree %s: %s=BUY confirms rules=BUY (proba=%.3f)",
+                        mint_short,
+                        source,
+                        float(cp_proba) if cp_proba is not None else float("nan"),
+                    )
+                    entry_type = source
+                elif cp_verdict == "SKIP_EARLY" and should_enter:
+                    logger.warning(
+                        "EARLY OVERRIDE %s: rules=BUY → %s=SKIP (proba=%.3f)",
+                        mint_short,
+                        source,
+                        float(cp_proba) if cp_proba is not None else float("nan"),
+                    )
+                    should_enter = False
+
             # Reserve a portfolio slot atomically before scheduling the paper
             # trade. asyncio is single-threaded, so the check+increment below
             # is race-free against other _handle_token coroutines — unlike a
@@ -863,6 +1008,367 @@ class Pipeline:
         # Allow tests / future config to override via attribute without
         # requiring an env var.
         return float(getattr(self._config, "pulse_tick_seconds", 5.0))
+
+    async def _observation_checkpoint_loop(
+        self,
+        token: "Token",
+        collected: list["Trade"],
+        creator_snapshot: "CreatorStats | None",
+        state: dict,
+    ) -> None:
+        """Phase 3 + Phase 5 in-window early-decision checkpoint.
+
+        Runs in parallel with the trade-stream collection loop in
+        ``_handle_token``. Wakes at fixed offsets (T+15, T+30, T+45,
+        T+60, T+75) and asks the registered policies whether the bot
+        should jump to entry early or skip immediately.
+
+        Decision priority:
+          1. T+30 model (Phase 3) — wakes only at T+30.
+          2. Entry-timing classifier (Phase 5) — wakes every 15 s.
+          3. If neither fires a verdict by T+90, fall through (caller's
+             collection loop will hit its natural deadline).
+
+        Per the deployment spec, T+30 BUY supersedes a same-tick
+        timing-classifier verdict — so we evaluate T+30 first at its
+        single checkpoint and only run timing as fallback.
+
+        State communication: ``state`` dict is mutated in place with
+            ``verdict``: ``"BUY_EARLY"`` / ``"SKIP_EARLY"`` / ``None``,
+            ``source``: ``"t30"`` / ``"timing"`` for logs / db.source,
+            ``proba``:  numeric used in WARN log.
+
+        On any unhandled exception we log and exit cleanly — the
+        collection loop must continue regardless of policy errors.
+        """
+        try:
+            now_offset = self._TIMING_FIRST_CHECKPOINT
+            t30_done = False
+            window_end = float(self._config.observe_seconds)
+            while now_offset < window_end:
+                # Sleep until the next checkpoint relative to token creation.
+                target_wall = float(token.created_at) + now_offset
+                delay = target_wall - time.time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                if state.get("verdict") is not None:
+                    return  # already decided
+
+                # ── T+30 hook (Phase 3) ─────────────────────────────
+                if (
+                    not t30_done
+                    and self._entry_t30_active
+                    and self._ml_entry_t30_policy is not None
+                    and abs(now_offset - 30.0) < 1e-6
+                ):
+                    t30_done = True
+                    verdict = await self._evaluate_t30_checkpoint(
+                        token, list(collected), creator_snapshot
+                    )
+                    if verdict is not None:
+                        action, proba = verdict
+                        state["source"] = "t30"
+                        state["proba"] = proba
+                        if action == "BUY":
+                            state["verdict"] = "BUY_EARLY"
+                            return
+                        if action == "SKIP":
+                            state["verdict"] = "SKIP_EARLY"
+                            return
+
+                # ── Entry-timing hook (Phase 5) ─────────────────────
+                if self._timing_active and self._timing_model_path is not None:
+                    verdict = self._evaluate_timing_checkpoint(
+                        token, list(collected), now_offset
+                    )
+                    if verdict is not None:
+                        action, proba = verdict
+                        state["source"] = "timing"
+                        state["proba"] = proba
+                        if action == "BUY":
+                            state["verdict"] = "BUY_EARLY"
+                            return
+                        if action == "SKIP":
+                            state["verdict"] = "SKIP_EARLY"
+                            return
+
+                now_offset += self._TIMING_CHECKPOINT_SECONDS
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "checkpoint loop crashed for %s; falling back to T+90 path",
+                token.mint[:12],
+            )
+
+    async def _evaluate_t30_checkpoint(
+        self,
+        token: "Token",
+        trades_so_far: list["Trade"],
+        creator_snapshot: "CreatorStats | None",
+    ) -> tuple[str, float] | None:
+        """Run the T+30 dual-snapshot model on the partial trade stream.
+
+        Returns ``(action, proba)`` where ``action`` is ``"BUY"``,
+        ``"SKIP"`` or ``"DEFER"`` (DEFER → caller continues to T+90).
+        Returns ``None`` on any error so the rest of the pipeline keeps
+        moving — early-decision is purely additive.
+
+        Builds a partial ScoringResult by re-running the live scorer on
+        the subset of trades visible by T+30, then asks
+        :class:`EntryT30Policy` for a 3-way verdict.
+        """
+        try:
+            policy = self._ml_entry_t30_policy
+            if policy is None:
+                return None
+            t30_cutoff = token.created_at + 30.0
+            visible = [t for t in trades_so_far if t.timestamp <= t30_cutoff]
+            tokens_5min = self._db.get_tokens_last_5min_sync(ref_mint=token.mint)
+            concurrent = self._db.get_concurrent_observations_sync(
+                ref_mint=token.mint, observe_seconds=30.0
+            )
+            creator_tokens_today = self._db.get_creator_tokens_on_day_sync(
+                token.creator, ref_mint=token.mint
+            )
+            partial = self._scorer.score(
+                token,
+                visible,
+                tokens_last_5min=tokens_5min,
+                concurrent_observations=concurrent,
+                creator_snapshot=creator_snapshot,
+                creator_tokens_today=creator_tokens_today,
+            )
+            # Holder snapshot @T+30 (best-effort: capture may not have
+            # landed yet when the bot polls). We pass None on miss; the
+            # T30 policy zero-fills HELIUS_FEATURES_T30 which mirrors
+            # the training-time fallback for late captures.
+            holder_t30 = None
+            try:
+                holder_t30 = await asyncio.to_thread(
+                    self._fetch_holder_snapshot_t30, token.mint
+                )
+            except Exception:
+                logger.debug(
+                    "t30 holder fetch failed for %s", token.mint[:12], exc_info=True
+                )
+            action, proba = policy.decide_with_confidence(
+                partial,
+                holder_snapshot_t30=holder_t30,
+                creator_snapshot=creator_snapshot,
+            )
+            logger.info(
+                "T+30 decision %s: %s proba=%.3f buys=%d (ceiling=%.2f floor=%.2f)",
+                token.mint[:12],
+                action,
+                proba,
+                len(visible),
+                policy.buy_ceiling,
+                policy.skip_floor,
+            )
+            return action, proba
+        except Exception:
+            logger.exception(
+                "T+30 evaluation crashed for %s — deferring to T+90",
+                token.mint[:12],
+            )
+            return None
+
+    def _fetch_holder_snapshot_t30(self, mint: str) -> dict | None:
+        """Best-effort sync DB lookup for the @T+30 holder snapshot.
+
+        Returns a plain dict keyed by ``top1_30 / top5_30 / top10_30 /
+        hc_30`` so the T+30 feature extractor sees the names it expects.
+        Missing snapshot → ``None`` and the caller zero-fills.
+        """
+        rows = self._db._sync_query(
+            "SELECT top1_pct, top5_pct, top10_pct, holder_count "
+            "FROM holder_snapshots "
+            "WHERE mint = %s AND capture_at_age_sec = 30.0 "
+            "AND is_negative_row = FALSE LIMIT 1",
+            mint,
+        )
+        if not rows:
+            return None
+        r = rows[0]
+        return {
+            "top1_30": float(r.get("top1_pct") or 0.0),
+            "top5_30": float(r.get("top5_pct") or 0.0),
+            "top10_30": float(r.get("top10_pct") or 0.0),
+            "hc_30": float(r.get("holder_count") or 0.0),
+        }
+
+    def _evaluate_timing_checkpoint(
+        self,
+        token: "Token",
+        trades_so_far: list["Trade"],
+        snapshot_t: float,
+    ) -> tuple[str, float] | None:
+        """Run the per-snapshot entry-timing classifier (Phase 5).
+
+        Returns ``(action, proba_max)`` where ``action`` is one of
+        ``BUY`` / ``SKIP`` / ``WAIT_MORE``. Confidence is the predicted
+        probability of the argmax class — caller acts only when this
+        clears :data:`_TIMING_CONFIDENCE_FLOOR` (default 0.6).
+        """
+        try:
+            from pulse_bot.ml.entry_timing import (
+                CLASS_BUY_NOW,
+                CLASS_NAMES,
+                CLASS_SKIP,
+                extract_snapshot_features,
+                predict_entry_timing,
+            )
+
+            if self._timing_model_path is None:
+                return None
+            feats = extract_snapshot_features(
+                trades_so_far, snapshot_t, float(token.created_at)
+            )
+            pred = predict_entry_timing(feats, self._timing_model_path)
+            probs = pred.as_vector()
+            max_proba = max(probs)
+            logger.info(
+                "TIMING checkpoint %s @T+%.0f: %s (p_wait=%.2f p_buy=%.2f "
+                "p_skip=%.2f)",
+                token.mint[:12],
+                snapshot_t,
+                pred.decision,
+                probs[0],
+                probs[1],
+                probs[2],
+            )
+            if pred.decision == CLASS_NAMES[CLASS_BUY_NOW] and (
+                probs[CLASS_BUY_NOW] >= self._TIMING_CONFIDENCE_FLOOR
+            ):
+                return ("BUY", float(probs[CLASS_BUY_NOW]))
+            if pred.decision == CLASS_NAMES[CLASS_SKIP] and (
+                probs[CLASS_SKIP] >= self._TIMING_CONFIDENCE_FLOOR
+            ):
+                return ("SKIP", float(probs[CLASS_SKIP]))
+            return ("WAIT_MORE", float(max_proba))
+        except Exception:
+            logger.exception(
+                "timing-classifier checkpoint crashed for %s @T+%.0f",
+                token.mint[:12],
+                snapshot_t,
+            )
+            return None
+
+    async def _maybe_survival_exit(
+        self,
+        runner: Any,
+        entry_ts: float,
+        now: float,
+    ) -> Any:
+        """Phase 4B — query the survival model and return an early-exit
+        result if predicted remaining life is below the configured floor.
+
+        Returns the same shape as ``runner.tick()`` (a ``MonitorResult``
+        with ``exit_reason='survival_predict'`` set) so
+        ``_close_via_runner_result`` can reuse the standard close path.
+        Returns ``None`` to keep holding.
+        """
+        # Defaults-OFF gate: if the env switch is off we never even
+        # attempt to load the model. This keeps boot semantically equal
+        # to pre-Phase-4B regardless of any model file on disk.
+        if not self._survival_active:
+            return None
+        try:
+            elapsed = max(0.0, now - entry_ts)
+            min_hold = float(self._config.exit_ml_min_hold_seconds or 0.0)
+            if elapsed < min_hold:
+                return None
+            if self._survival_model is None and not self._survival_load_attempted:
+                self._survival_load_attempted = True
+                try:
+                    from pulse_bot.ml.survival import load_survival_model
+
+                    self._survival_model = load_survival_model(
+                        Path("data/ml/survival_model.ubj")
+                    )
+                    logger.info(
+                        "Survival model loaded: %d features",
+                        len(self._survival_model[1].get("features", [])),
+                    )
+                except FileNotFoundError:
+                    logger.info(
+                        "Survival ACTIVE but no model at "
+                        "data/ml/survival_model.ubj — hook is a no-op."
+                    )
+                    self._survival_model = None
+                except Exception:
+                    logger.exception("Failed to load survival model")
+                    self._survival_model = None
+            if self._survival_model is None:
+                return None
+            from pulse_bot.ml.survival import predict_remaining_life
+
+            model, meta = self._survival_model
+            features_now = self._survival_features_from_runner(runner, elapsed)
+            pred = predict_remaining_life(
+                model,
+                features_now,
+                feature_order=meta["features"],
+                bucket_seconds=float(meta.get("bucket_seconds", 5.0)),
+                max_horizon_seconds=float(meta.get("max_horizon_seconds", 180.0)),
+                now_elapsed_seconds=elapsed,
+            )
+            if pred.remaining_life_seconds < 30.0:
+                logger.warning(
+                    "Survival exit: predicted_remaining=%.0fs elapsed=%.0fs "
+                    "confidence=%.2f — closing as survival_predict",
+                    pred.remaining_life_seconds,
+                    elapsed,
+                    pred.confidence,
+                )
+                # Build a result via runner.timeout_result then override
+                # the reason — keeps the exit_price/PnL plumbing identical
+                # to the regular close path.
+                result = runner.timeout_result()
+                try:
+                    result.exit_reason = "survival_predict"
+                except (
+                    Exception
+                ):  # nosec B110 — frozen dataclass guard, fall-through to default reason
+                    pass
+                return result
+            return None
+        except Exception:
+            logger.exception("survival check crashed; continuing to hold")
+            return None
+
+    def _survival_features_from_runner(self, runner: Any, elapsed: float) -> dict:
+        """Best-effort feature dict for survival inference.
+
+        The training script writes whatever numeric columns survive
+        ``_select_feature_columns`` into ``meta['features']``. At the
+        very least it always includes ``elapsed_seconds`` and
+        ``bucket_index``; richer features (entry_score, entry_mcap_sol,
+        entry_buyer_number) come from the paper_trades row but are not
+        always reachable from the runner state. Missing keys are
+        zero-filled by ``predict_remaining_life``.
+        """
+        feats: dict[str, float] = {
+            "elapsed_seconds": float(elapsed),
+            "bucket_index": float(elapsed) / 5.0,
+        }
+        # Pull whatever numerical state is exposed on the runner.
+        for attr in (
+            "current_price",
+            "total_buys",
+            "total_sells",
+            "peak_price",
+        ):
+            try:
+                v = getattr(runner, attr, None)
+                if v is not None:
+                    feats[attr] = float(v)
+            except (
+                Exception
+            ):  # nosec B112 — opportunistic feature extraction, missing attr ok
+                continue
+        return feats
 
     async def _extended_observation(self, mint: str, duration_seconds: float) -> None:
         """Continue saving trades for `duration_seconds` after a SKIP decision.
@@ -1050,9 +1556,18 @@ class Pipeline:
             No-op when ``tick_seconds <= 0`` (back-compat). Replay sources
             do not have a real-time clock anyway, but we still gate on the
             ``replay`` flag so deterministic backtests don't drift.
+
+            Phase 4B hook: when ``PULSE_SURVIVAL_ACTIVE=1`` and a survival
+            model is loadable, every ``_SURVIVAL_TICK_SECONDS`` (10s, to
+            cap XGBoost call cost + log noise) we ask the hazard model
+            for the predicted remaining life. If it dips below 30s and
+            we've already cleared ``exit_ml_min_hold_seconds``, force a
+            ``survival_predict`` close. Defaults-OFF: model never loaded,
+            hot loop exactly matches pre-Phase-4B.
             """
             if tick_seconds <= 0 or is_replay:
                 return
+            last_survival_check_ts: float = 0.0
             try:
                 while not closed:
                     await asyncio.sleep(tick_seconds)
@@ -1067,6 +1582,28 @@ class Pipeline:
                             exit_time=now,
                         )
                         return
+                    # Survival model — Phase 4B. Throttled to once per
+                    # _SURVIVAL_TICK_SECONDS to avoid re-running XGBoost
+                    # on every tick when ``tick_seconds`` is very small
+                    # (e.g. tests use 0.05s). ``getattr`` keeps the
+                    # branch inert for tests that bypass __init__ and
+                    # never set ``_survival_active``.
+                    if getattr(self, "_survival_active", False) and (
+                        now - last_survival_check_ts >= self._SURVIVAL_TICK_SECONDS
+                    ):
+                        last_survival_check_ts = now
+                        survived = await self._maybe_survival_exit(
+                            runner=runner,
+                            entry_ts=entry_ts,
+                            now=now,
+                        )
+                        if survived is not None:
+                            await _close_via_runner_result(
+                                survived,
+                                trade_market_cap=0.0,
+                                exit_time=now,
+                            )
+                            return
             except asyncio.CancelledError:
                 raise
 
