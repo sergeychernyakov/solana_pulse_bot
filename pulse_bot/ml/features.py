@@ -86,12 +86,12 @@ SCORER_FEATURES: list[str] = [
     # v9 additions — all already populated in ScoringResult and written
     # to token_scores. No wiring-bug risk: direct attr lookup through
     # ``_get(scoring_result, name)`` matches dataclass field names
-    # literally. ``market_cap_sol`` and ``sol_to_graduation`` became
-    # the #1 and #2 highest-gain features in the expanded model.
-    "token_price_sol",
+    # literally.
+    # market_cap_sol, sol_to_graduation, token_price_sol REMOVED 2026-04-25:
+    # heavy momentum bias. token_price_sol = market_cap_sol / total_supply on
+    # pump.fun (constant 1e9 tokens) — perfectly correlated after market_cap_sol
+    # removal it jumped to #2 gain, same leakage. All three in KNOWN_LEAK_FEATURES.
     "gap_create_to_first_trade",
-    "market_cap_sol",
-    "sol_to_graduation",
     # Phase A1 2026-04-24: SOL market regime. 56% coverage on the
     # current dataset (captured since 2026-04-22). Missing values → NaN
     # so XGBoost learns a "no regime data" split path separately from
@@ -115,18 +115,18 @@ DERIVED_FEATURES: list[str] = [
     # Phase B (derived, 2026-04-24): concentration slices and volume
     # ratios. All from existing SCORER + HELIUS fields — safe to add
     # without scorer.py changes.
-    "top5_minus_top1_120",       # Mid-tier (holders #2-5) concentration
-    "top10_minus_top5_120",      # Outer tier (holders #6-10) — HIGHEST gain
-    "buy_vol_to_sell_vol_ratio", # Imbalance on SOL volume
+    "top5_minus_top1_120",  # Mid-tier (holders #2-5) concentration
+    "top10_minus_top5_120",  # Outer tier (holders #6-10) — HIGHEST gain
+    "buy_vol_to_sell_vol_ratio",  # Imbalance on SOL volume
     "buy_count_to_sell_count_ratio",  # Imbalance on trade count
-    "hc_growth_ratio",           # hc_120 / (hc_30 + 1) — growth factor
-    # Phase C (derived, 2026-04-24): ratios and log-scaled MC.
-    "buy_size_growth",           # max_buy_sol / (avg_buy_sol + 0.001)
+    "hc_growth_ratio",  # hc_120 / (hc_30 + 1) — growth factor
+    # Phase C (derived, 2026-04-24): ratios.
+    "buy_size_growth",  # max_buy_sol / (avg_buy_sol + 0.001)
     # `repeat_buyer_fraction` DROPPED: UNSTABLE nz=2/5 on first run.
-    # Keep at protocol level — doesn't add stable signal.
-    "fast_to_full_volume_ratio", # fast_volume_sol / (buy_volume_sol + 0.01)
-    "log_market_cap",            # log(market_cap_sol + 1) — skew normalisation
-    "fast_buy_rate_to_full",     # fast_buy_rate / (buy_count / 90 + 0.001)
+    # `log_market_cap` REMOVED 2026-04-25: derivative of market_cap_sol
+    # (KNOWN_LEAK). Became #1 gain and crowded out behavioural signal.
+    "fast_to_full_volume_ratio",  # fast_volume_sol / (buy_volume_sol + 0.01)
+    "fast_buy_rate_to_full",  # fast_buy_rate / (buy_count / 90 + 0.001)
 ]
 
 # Helius holder snapshot features. Captured post-discovery at T+30 and
@@ -195,6 +195,22 @@ CREATOR_FEATURES: list[str] = [
     "creator_graduated_count",
 ]
 
+# Phase E (2026-04-24): top-3 buyer prior-activity features. Computed
+# by joining wallet_activity on the top-3 buyers by SOL volume in the
+# current mint's trade window, with point-in-time filter (no future
+# leak). NaN policy: NaN when a wallet has no prior history / no closed
+# positions; XGBoost learns the missingness split directly.
+#
+# Expected lift (pre-commit): Prec@top10% +8pp (35→43). Kill criterion:
+# if <+3pp after 2 stability runs, revert the phase.
+WALLET_FEATURES: list[str] = [
+    "top3_buyer_prior_mint_count_sum",  # activity across top-3 (summed)
+    "top3_buyer_prior_total_pnl_sol",  # sum realized PnL from closed positions
+    "top3_buyer_prior_avg_wr",  # avg WR across top-3 that have any closed
+    "top3_buyer_max_prior_pnl_sol",  # best prior winner among top-3
+    "top3_buyer_wallet_age_days_avg",  # mean days since first seen
+]
+
 # Canonical feature order — this is what the model was trained against.
 # DO NOT re-order without bumping FEATURE_SCHEMA_VERSION and retraining.
 ENTRY_FEATURE_ORDER: list[str] = [
@@ -202,11 +218,17 @@ ENTRY_FEATURE_ORDER: list[str] = [
     *DERIVED_FEATURES,
     *HELIUS_FEATURES,
     *CREATOR_FEATURES,
+    *WALLET_FEATURES,
 ]
 
 # Bumped on any schema change. Prediction path refuses to load models
 # whose meta.json reports a different version.
-FEATURE_SCHEMA_VERSION: str = "entry_v13_20260424"
+FEATURE_SCHEMA_VERSION: str = "entry_v17_20260425"
+# v17: Remove token_price_sol — on pump.fun it equals market_cap_sol / 1e9
+# (constant supply), so it is perfectly correlated with the v16-removed
+# market_cap_sol and carries the same momentum-bias leakage. After v16 it
+# rose to gain-importance #2, confirming it was absorbing the same spurious
+# signal. Added to KNOWN_LEAK_FEATURES. Retrain required.
 
 
 # ── Exit classifier ────────────────────────────────────────────────
@@ -307,12 +329,94 @@ def _get(obj: Any, key: str, default: float = 0.0) -> float:
         return default
 
 
+def compute_top3_buyer_wallets(trades: Any) -> list[str]:
+    """Phase E — return top-3 buyer wallet addresses by SOL volume.
+
+    Shared between live (``pipeline.py``) and backtest (``build_dataset.py``)
+    for bit-identical feature values. Trades with tx_type != 'buy' ignored.
+    Tiebreak: wallet string ASC (deterministic). Returns <=3 addresses.
+
+    ``trades`` can be any iterable of Trade dataclasses, dicts, or rows
+    (pd.Series / sqlite3.Row) — field access is duck-typed via _get.
+    """
+    vol: dict[str, float] = {}
+    for t in trades:
+        if isinstance(t, Mapping):
+            tx = t.get("tx_type")
+            wallet = t.get("wallet")
+            amount = t.get("sol_amount")
+        else:
+            tx = getattr(t, "tx_type", None)
+            wallet = getattr(t, "wallet", None)
+            amount = getattr(t, "sol_amount", None)
+        if tx != "buy" or not wallet:
+            continue
+        try:
+            vol[wallet] = vol.get(wallet, 0.0) + float(amount or 0.0)
+        except (TypeError, ValueError):
+            continue
+    ranked = sorted(vol.items(), key=lambda x: (-x[1], x[0]))
+    return [w for w, _ in ranked[:3]]
+
+
+def _extract_wallet_prior_features(
+    wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None,
+    top3_buyer_wallets: list[str] | None,
+    cutoff_ts: float | None,
+) -> dict[str, float]:
+    """Phase E — aggregate top-3 buyer prior stats into 5 WALLET_FEATURES.
+
+    NaN-first: when no wallet has prior activity, all features return NaN
+    so XGBoost can split on missingness explicitly (same pattern as
+    creator features + SOL price — "no signal" vs "zero signal").
+    """
+    nan = float("nan")
+    out: dict[str, float] = {k: nan for k in WALLET_FEATURES}
+    if not wallet_prior_stats or not top3_buyer_wallets:
+        return out
+    mint_counts: list[float] = []
+    total_pnls: list[float] = []
+    wrs: list[float] = []
+    max_pnls: list[float] = []
+    ages_days: list[float] = []
+    for w in top3_buyer_wallets:
+        s = wallet_prior_stats.get(w)
+        if not s:
+            continue
+        mc = s.get("all_mint_count", 0) or 0
+        if mc > 0:
+            mint_counts.append(float(mc))
+            total_pnls.append(float(s.get("total_pnl_sol", 0.0) or 0.0))
+        wr = s.get("wr")
+        if wr is not None and not (isinstance(wr, float) and math.isnan(wr)):
+            wrs.append(float(wr))
+        mp = s.get("max_pnl_sol")
+        if mp is not None and not (isinstance(mp, float) and math.isnan(mp)):
+            max_pnls.append(float(mp))
+        fs = float(s.get("first_seen_ts", 0.0) or 0.0)
+        if fs > 0 and cutoff_ts is not None and cutoff_ts > fs:
+            ages_days.append((cutoff_ts - fs) / 86400.0)
+    if mint_counts:
+        out["top3_buyer_prior_mint_count_sum"] = float(sum(mint_counts))
+        out["top3_buyer_prior_total_pnl_sol"] = float(sum(total_pnls))
+    if wrs:
+        out["top3_buyer_prior_avg_wr"] = float(sum(wrs) / len(wrs))
+    if max_pnls:
+        out["top3_buyer_max_prior_pnl_sol"] = float(max(max_pnls))
+    if ages_days:
+        out["top3_buyer_wallet_age_days_avg"] = float(sum(ages_days) / len(ages_days))
+    return out
+
+
 def extract_entry_features(
     scoring_result: Any,
     holder_snapshot: Mapping[str, Any] | None = None,
     creator_snapshot: Mapping[str, Any] | None = None,
     *,
     hour_utc: float | int | None = None,
+    wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
+    top3_buyer_wallets: list[str] | None = None,
+    cutoff_ts: float | None = None,
 ) -> dict[str, float]:
     """Return the feature dict the entry model expects, in canonical order.
 
@@ -326,6 +430,13 @@ def extract_entry_features(
     with ``creator_*`` in CREATOR_FEATURES. Either None → zero-fill.
     ``hour_utc`` override is for cases where scoring_result doesn't
     carry it.
+
+    ``wallet_prior_stats`` (Phase E): dict {wallet_addr: {all_mint_count,
+    closed_mint_count, wr, total_pnl_sol, max_pnl_sol, first_seen_ts}}
+    — pre-queried for the top-3 buyer wallets at ``cutoff_ts``.
+    ``top3_buyer_wallets``: addresses in rank order.
+    ``cutoff_ts``: scored_at anchor; used to compute wallet_age_days.
+    All three None → WALLET_FEATURES all NaN.
     """
     feats: dict[str, float] = {}
     for name in SCORER_FEATURES:
@@ -351,7 +462,7 @@ def extract_entry_features(
     feats["fast_to_full_volume_ratio"] = feats["fast_volume_sol"] / (
         feats["buy_volume_sol"] + 0.01
     )
-    feats["log_market_cap"] = math.log(max(feats["market_cap_sol"], 0.0) + 1.0)
+    # log_market_cap removed v16-17: market_cap_sol not in SCORER_FEATURES
     # fast_buy_rate vs full-window average rate (buy_count / 90s)
     full_rate = feats["buy_count"] / 90.0
     feats["fast_buy_rate_to_full"] = feats["fast_buy_rate"] / (full_rate + 0.001)
@@ -389,6 +500,15 @@ def extract_entry_features(
                 type(creator_snapshot).__name__,
                 len(CREATOR_FEATURES),
             )
+    # Phase E — top-3 buyer prior stats. Both paths (pipeline.py and
+    # build_dataset.py) compute `top3_buyer_wallets` with the same helper
+    # and query the same wallet_activity table. NaN-fill when no buyers
+    # or no history so XGBoost splits on missingness.
+    feats.update(
+        _extract_wallet_prior_features(
+            wallet_prior_stats, top3_buyer_wallets, cutoff_ts
+        )
+    )
     return feats
 
 
@@ -451,6 +571,9 @@ def extract_entry_vector(
     creator_snapshot: Mapping[str, Any] | None = None,
     *,
     hour_utc: float | int | None = None,
+    wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
+    top3_buyer_wallets: list[str] | None = None,
+    cutoff_ts: float | None = None,
 ) -> list[float]:
     """Positional list in ENTRY_FEATURE_ORDER — shape predict_proba expects."""
     feats = extract_entry_features(
@@ -458,5 +581,8 @@ def extract_entry_vector(
         holder_snapshot,
         creator_snapshot,
         hour_utc=hour_utc,
+        wallet_prior_stats=wallet_prior_stats,
+        top3_buyer_wallets=top3_buyer_wallets,
+        cutoff_ts=cutoff_ts,
     )
     return [feats[k] for k in ENTRY_FEATURE_ORDER]

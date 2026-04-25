@@ -1,12 +1,19 @@
 # pulse_bot/sources/backtest.py
-"""BacktestSource — replays tokens and trades from SQLite chronologically."""
+"""BacktestSource — replays tokens and trades from Postgres chronologically.
+
+Migrated from SQLite 2026-04-24. Uses psycopg2 with DictCursor so row
+access by name (``row["mint"]``) still works.
+"""
 
 from __future__ import annotations
 
 import logging
-import sqlite3
 from typing import TYPE_CHECKING, Iterator
 
+import psycopg2
+import psycopg2.extras
+
+from pulse_bot.db import _resolve_dsn
 from pulse_bot.models import Token, Trade
 
 if TYPE_CHECKING:
@@ -16,33 +23,34 @@ logger = logging.getLogger(__name__)
 
 
 class BacktestSource:
-    """Reads historical tokens and trades from SQLite for replay.
+    """Reads historical tokens and trades from Postgres for replay.
 
     Yields tokens in chronological order. For each token, provides
     trades from the observation window split into fast and full phases.
     """
 
-    def __init__(self, db_path: str, clock: SimulatedClock) -> None:
-        self.db_path = db_path
+    def __init__(self, db_path: str, clock: "SimulatedClock") -> None:
+        self.db_path = db_path  # legacy; resolved to PG DSN
         self.clock = clock
 
     def iter_tokens(self) -> Iterator[Token]:
         """Yield all tokens ordered by created_at."""
         conn = self._conn()
         try:
-            cur = conn.execute("SELECT * FROM tokens ORDER BY created_at ASC")
-            for row in cur:
-                token = Token(
-                    mint=row["mint"],
-                    name=row["name"] or "",
-                    symbol=row["symbol"] or "",
-                    creator=row["creator"] or "",
-                    created_at=row["created_at"],
-                    uri=row["uri"] or "",
-                    launchpad=row["launchpad"] or "pumpfun",
-                )
-                self.clock.advance_to(token.created_at)
-                yield token
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute("SELECT * FROM tokens ORDER BY created_at ASC")
+                for row in cur:
+                    token = Token(
+                        mint=row["mint"],
+                        name=row["name"] or "",
+                        symbol=row["symbol"] or "",
+                        creator=row["creator"] or "",
+                        created_at=row["created_at"],
+                        uri=row["uri"] or "",
+                        launchpad=row["launchpad"] or "pumpfun",
+                    )
+                    self.clock.advance_to(token.created_at)
+                    yield token
         finally:
             conn.close()
 
@@ -50,9 +58,14 @@ class BacktestSource:
         """Yield all trades ordered by timestamp."""
         conn = self._conn()
         try:
-            cur = conn.execute("SELECT * FROM trades ORDER BY timestamp ASC, id ASC")
-            for row in cur:
-                yield self._row_to_trade(row, row["mint"])
+            with conn.cursor(
+                name="backtest_trade_stream",
+                cursor_factory=psycopg2.extras.DictCursor,
+            ) as cur:
+                cur.itersize = 10_000
+                cur.execute("SELECT * FROM trades ORDER BY timestamp ASC, id ASC")
+                for row in cur:
+                    yield self._row_to_trade(row, row["mint"])
         finally:
             conn.close()
 
@@ -60,11 +73,13 @@ class BacktestSource:
         """Get trades for a mint within a time window."""
         conn = self._conn()
         try:
-            cur = conn.execute(
-                "SELECT * FROM trades WHERE mint = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC",
-                (mint, from_ts, to_ts),
-            )
-            return [self._row_to_trade(row, mint) for row in cur]
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM trades WHERE mint = %s AND timestamp >= %s "
+                    "AND timestamp <= %s ORDER BY timestamp ASC",
+                    (mint, from_ts, to_ts),
+                )
+                return [self._row_to_trade(row, mint) for row in cur]
         finally:
             conn.close()
 
@@ -84,11 +99,13 @@ class BacktestSource:
         """Get ALL trades after a timestamp (for pulse monitoring simulation)."""
         conn = self._conn()
         try:
-            cur = conn.execute(
-                "SELECT * FROM trades WHERE mint = ? AND timestamp >= ? ORDER BY timestamp ASC",
-                (mint, from_ts),
-            )
-            return [self._row_to_trade(row, mint) for row in cur]
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM trades WHERE mint = %s AND timestamp >= %s "
+                    "ORDER BY timestamp ASC",
+                    (mint, from_ts),
+                )
+                return [self._row_to_trade(row, mint) for row in cur]
         finally:
             conn.close()
 
@@ -96,7 +113,9 @@ class BacktestSource:
         """Total tokens available for backtest."""
         conn = self._conn()
         try:
-            return conn.execute("SELECT COUNT(*) FROM tokens").fetchone()[0]
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM tokens")
+                return cur.fetchone()[0]
         finally:
             conn.close()
 
@@ -104,17 +123,17 @@ class BacktestSource:
         """Total trades available."""
         conn = self._conn()
         try:
-            return conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM trades")
+                return cur.fetchone()[0]
         finally:
             conn.close()
 
-    def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    def _conn(self):
+        return psycopg2.connect(_resolve_dsn(self.db_path))
 
     @staticmethod
-    def _row_to_trade(row: sqlite3.Row, mint: str) -> Trade:
+    def _row_to_trade(row, mint: str) -> Trade:
         return Trade(
             mint=mint,
             wallet=row["wallet"],

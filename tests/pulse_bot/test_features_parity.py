@@ -25,6 +25,7 @@ from pulse_bot.ml.features import (
     FEATURE_SCHEMA_VERSION,
     HELIUS_FEATURES,
     SCORER_FEATURES,
+    WALLET_FEATURES,
     extract_entry_features,
     extract_entry_vector,
 )
@@ -34,10 +35,11 @@ DB_PATH = REPO_ROOT / "pulse_bot.db"
 
 
 def test_feature_order_is_stable() -> None:
-    """ENTRY_FEATURE_ORDER must be a concatenation of the four groups."""
+    """ENTRY_FEATURE_ORDER must be a concatenation of the five groups
+    (Phase E 2026-04-24 added WALLET_FEATURES as the fifth)."""
     assert ENTRY_FEATURE_ORDER == [
         *SCORER_FEATURES, *DERIVED_FEATURES,
-        *HELIUS_FEATURES, *CREATOR_FEATURES,
+        *HELIUS_FEATURES, *CREATOR_FEATURES, *WALLET_FEATURES,
     ]
     # No duplicates
     assert len(ENTRY_FEATURE_ORDER) == len(set(ENTRY_FEATURE_ORDER))
@@ -51,15 +53,22 @@ def test_schema_version_non_empty() -> None:
 def test_extract_fills_missing_with_zero() -> None:
     """Missing / None scorer + helius fields → 0.0 (NaN policy v1).
 
-    ``hour_cos`` is the exception: missing hour_utc defaults to 0,
-    which via cyclical encoding yields cos=1 (midnight baseline).
-    That is the correct, stable fallback — not a skew bug.
+    Exceptions:
+    * ``hour_cos`` — missing hour_utc=0 → cos=1 (midnight baseline).
+    * ``WALLET_FEATURES`` (Phase E 2026-04-24) — NaN when no wallet stats
+      were provided, so XGBoost can split on missingness explicitly.
+      "No wallet data" is not the same as "zero wallet data".
     """
     feats = extract_entry_features({}, holder_snapshot=None)
-    zero_defaults = [f for f in ENTRY_FEATURE_ORDER if f != "hour_cos"]
+    special = {"hour_cos", *WALLET_FEATURES}
+    zero_defaults = [f for f in ENTRY_FEATURE_ORDER if f not in special]
     for name in zero_defaults:
         assert feats[name] == 0.0, f"{name} should default to 0.0"
     assert feats["hour_cos"] == 1.0  # cos(0) = 1
+    for name in WALLET_FEATURES:
+        assert math.isnan(feats[name]), (
+            f"{name} should default to NaN when wallet_prior_stats is None"
+        )
 
 
 def test_extract_reads_scorer_fields() -> None:
@@ -101,7 +110,13 @@ def test_vector_matches_dict_order() -> None:
     feats = extract_entry_features(row, hour_utc=0)
     vec = extract_entry_vector(row, hour_utc=0)
     for i, name in enumerate(ENTRY_FEATURE_ORDER):
-        assert vec[i] == feats[name], f"Mismatch at {name}"
+        v, d = vec[i], feats[name]
+        # NaN != NaN in Python — use explicit identity check for the
+        # WALLET_FEATURES NaN sentinels (Phase E NaN-first policy).
+        if isinstance(v, float) and math.isnan(v):
+            assert isinstance(d, float) and math.isnan(d), f"Mismatch at {name}"
+        else:
+            assert v == d, f"Mismatch at {name}"
 
 
 def test_accepts_object_with_attributes() -> None:

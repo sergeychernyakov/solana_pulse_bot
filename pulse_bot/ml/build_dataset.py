@@ -22,13 +22,32 @@ from __future__ import annotations
 
 import argparse
 import logging
-import sqlite3
 import sys
 from pathlib import Path
 
 import pandas as pd
+import psycopg2
+import psycopg2.extras
 
+from pulse_bot.db import _resolve_dsn
 from pulse_bot.ml.features import SCORER_FEATURES
+
+
+def _connect_pg(db_path: str):
+    """Compat wrapper: accepts legacy ``db_path`` (ignored) and returns a
+    raw psycopg2 connection to the Postgres instance. pandas read_sql
+    works with it (emits a harmless warning). Direct ``?``-placeholder
+    execute calls must use :func:`_pg_exec` instead."""
+    return psycopg2.connect(_resolve_dsn(db_path))
+
+
+def _pg_exec(conn, sql: str, params: tuple | list | None = None):
+    """Execute ``sql`` (with ``?`` placeholders) and return the cursor.
+    Translates ``?`` → ``%s`` so SQLite-style code migrates verbatim."""
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    cur.execute(sql.replace("?", "%s"), tuple(params) if params else None)
+    return cur
+
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +86,7 @@ def build_entry_dataset(
     """
     import time as _time
 
-    conn = sqlite3.connect(db_path)
+    conn = _connect_pg(db_path)
     # Exclude tokens too young to have their labeling horizon complete.
     # Default buffer = horizon + small safety margin.
     if now_buffer_sec is None:
@@ -83,7 +102,7 @@ def build_entry_dataset(
         FROM token_scores s
         JOIN tokens t ON t.mint = s.mint
         WHERE s.source IN ('live', 'backfill') AND s.scored_at IS NOT NULL
-          AND s.scored_at <= ?
+          AND s.scored_at <= %s
         """,
         conn,
         params=(cutoff_ts,),
@@ -144,15 +163,13 @@ def build_entry_dataset(
     )
     base["hc_growth_ratio"] = base["hc_120"] / (base["hc_30"] + 1.0)
     # Phase C derived — mirror extract_entry_features.
-    import numpy as _np_c
 
     base["buy_size_growth"] = base["max_buy_sol"] / (base["avg_buy_sol"] + 0.001)
     base["fast_to_full_volume_ratio"] = base["fast_volume_sol"] / (
         base["buy_volume_sol"] + 0.01
     )
-    base["log_market_cap"] = _np_c.log(
-        _np_c.maximum(base["market_cap_sol"], 0.0) + 1.0
-    )
+    # log_market_cap removed 2026-04-25 (v16): market_cap_sol no longer
+    # in SCORER_FEATURES; derivative dropped with it.
     full_rate = base["buy_count"] / 90.0
     base["fast_buy_rate_to_full"] = base["fast_buy_rate"] / (full_rate + 0.001)
 
@@ -236,6 +253,110 @@ def build_entry_dataset(
             if c in base.columns:
                 base[c] = base[c].fillna(0.0)
 
+    # Phase E — top-3 buyer wallet prior features. Same helper used
+    # by live pipeline (``compute_top3_buyer_wallets``) + same SQL
+    # semantics as ``Database.get_wallet_prior_stats_sync``. Rows with
+    # fewer than 3 distinct buyers get <3 top-N; rows whose top buyers
+    # have no prior history get NaN across the 5 features. Requires
+    # ``wallet_activity`` table to be populated — run
+    # ``python -m pulse_bot.ml.wallet_indexer --db <path>`` first.
+    from pulse_bot.ml.features import (
+        WALLET_FEATURES,
+        _extract_wallet_prior_features,
+        compute_top3_buyer_wallets,
+    )
+
+    wa_row_count = _pg_exec(conn, "SELECT COUNT(*) FROM wallet_activity").fetchone()[0]
+    if wa_row_count == 0:
+        logger.warning(
+            "wallet_activity table is empty — all %d WALLET_FEATURES "
+            "will be NaN. Run `python -m pulse_bot.ml.wallet_indexer "
+            "--db %s` first to populate.",
+            len(WALLET_FEATURES),
+            db_path,
+        )
+    else:
+        logger.info(
+            "wallet_activity has %d (wallet,mint) pairs; computing "
+            "top-3 buyer prior-stats per row...",
+            wa_row_count,
+        )
+
+    wallet_feat_rows: list[dict[str, float]] = []
+    nz_wallet_feat_count = 0
+    for _, row in base.iterrows():
+        mint = row["mint"]
+        scored_at = float(row["scored_at"])
+        trade_rows = _pg_exec(
+            conn,
+            """SELECT tx_type, wallet, sol_amount FROM trades
+               WHERE mint = ? AND timestamp <= ?
+               ORDER BY id ASC""",
+            (mint, scored_at),
+        ).fetchall()
+        trades_as_dicts = [
+            {"tx_type": tr[0], "wallet": tr[1], "sol_amount": tr[2]}
+            for tr in trade_rows
+        ]
+        top3 = compute_top3_buyer_wallets(trades_as_dicts)
+        stats_map: dict[str, dict] = {}
+        if top3 and wa_row_count > 0:
+            placeholders = ",".join("?" * len(top3))
+            stats_cur = _pg_exec(
+                conn,
+                f"""SELECT wallet,
+                           COUNT(*) AS all_mint_count,
+                           MIN(first_buy_ts) AS first_seen_ts,
+                           SUM(CASE WHEN sell_volume_sol > 0 THEN 1 ELSE 0 END)
+                               AS closed_mint_count,
+                           SUM(CASE WHEN sell_volume_sol > 0
+                                    THEN sell_volume_sol - buy_volume_sol
+                                    ELSE 0 END) AS total_pnl_sol,
+                           SUM(CASE WHEN sell_volume_sol > 0
+                                    AND sell_volume_sol - buy_volume_sol > 0
+                                    THEN 1 ELSE 0 END) AS win_count,
+                           MAX(CASE WHEN sell_volume_sol > 0
+                                    THEN sell_volume_sol - buy_volume_sol
+                                    ELSE NULL END) AS max_pnl_sol
+                    FROM wallet_activity
+                    WHERE wallet IN ({placeholders})
+                      AND mint != ?
+                      AND last_trade_ts < ?
+                    GROUP BY wallet""",
+                (*top3, mint, scored_at),
+            )
+            for srow in stats_cur.fetchall():
+                all_mc = int(srow[1] or 0)
+                closed_mc = int(srow[3] or 0)
+                wc = int(srow[5] or 0)
+                stats_map[srow[0]] = {
+                    "all_mint_count": all_mc,
+                    "closed_mint_count": closed_mc,
+                    "wr": (wc / closed_mc) if closed_mc > 0 else float("nan"),
+                    "total_pnl_sol": float(srow[4] or 0.0),
+                    "max_pnl_sol": (
+                        float(srow[6]) if srow[6] is not None else float("nan")
+                    ),
+                    "first_seen_ts": float(srow[2] or 0.0),
+                }
+        feats = _extract_wallet_prior_features(stats_map, top3, scored_at)
+        wallet_feat_rows.append(feats)
+        # Track how many rows got non-NaN features for diagnostics.
+        import math as _m
+
+        if not _m.isnan(feats["top3_buyer_prior_mint_count_sum"]):
+            nz_wallet_feat_count += 1
+
+    wallet_df = pd.DataFrame(wallet_feat_rows)
+    for col in WALLET_FEATURES:
+        base[col] = wallet_df[col].values
+    logger.info(
+        "WALLET_FEATURES: %d/%d rows have prior-stats (%.1f%% non-NaN)",
+        nz_wallet_feat_count,
+        len(base),
+        (nz_wallet_feat_count / max(len(base), 1)) * 100.0,
+    )
+
     # Label v2 (codex 2026-04-22): realized PnL % applying the SAME
     # fee+slippage math as live ``PaperTradeRunner._calc_leg_pnl``.
     # Entry = market_cap_sol at first post-scoring buy. Exit = MC at
@@ -246,61 +367,119 @@ def build_entry_dataset(
     # previous "+tp_pct / -sl_pct flat" label — old label flipped sign
     # on ~10-20% of rows near zero because fees/slippage weren't baked
     # into the threshold calculation, producing noisy labels.
-    from pulse_bot.core import calc_realized_pnl_pct
+    # Option B (2026-04-24): label via simulate_exit() — the same
+    # ExitManager + PulseMonitor + PaperTradeRunner code the LIVE bot
+    # uses. Previously labels used a fixed TP=+50%/SL=-30%/horizon=300s
+    # policy that diverged from the live config's TP=+100%/SL=-15%/
+    # max_hold=90s + trailing + inactivity rules — classic train/serve
+    # skew. Using simulate_exit means any config change automatically
+    # invalidates this dataset (meta.json stores config hash).
+    from pulse_bot.config import get_config
+    from pulse_bot.ml.simulate_exit import simulate_exit
+    from pulse_bot.models import Trade
 
-    logger.info("Computing realized-PnL labels (fees+slippage baked in)...")
+    live_config = get_config()
+    # Dataset-build horizon: widen the trade query window so simulate_exit
+    # has the full stream available. Live bot caps via exit_max_hold_seconds +
+    # inactivity — simulate_exit enforces both internally.
+    trade_window_sec = max(
+        label_horizon_sec,
+        float(live_config.exit_max_hold_seconds) + 60.0,
+    )
+    logger.info(
+        "Computing labels via simulate_exit (live config: TP=%.0f%% SL=%.0f%% "
+        "max_hold=%.0fs inactivity=%.0fs trailing=%s)",
+        live_config.exit_take_profit_pct,
+        live_config.exit_hard_stop_loss_pct,
+        live_config.exit_max_hold_seconds,
+        live_config.exit_inactivity_seconds,
+        live_config.exit_trailing_stop_enabled,
+    )
+
     labels: list[int | None] = []
     realized_pnls: list[float | None] = []
+    exit_reasons: list[str | None] = []
     for _, row in base.iterrows():
-        scored_at = row["scored_at"]
-        cutoff = scored_at + label_horizon_sec
-        trades = conn.execute(
+        scored_at = float(row["scored_at"])
+        cutoff = scored_at + trade_window_sec
+        trade_rows = _pg_exec(
+            conn,
             """SELECT timestamp, tx_type, sol_amount, token_amount,
-                      market_cap_sol
+                      market_cap_sol, v_sol_in_bonding_curve, wallet
                FROM trades
                WHERE mint = ? AND timestamp BETWEEN ? AND ?
                  AND market_cap_sol > 0
                ORDER BY timestamp ASC""",
             (row["mint"], scored_at, cutoff),
         ).fetchall()
-        if not trades:
-            # DOA — no post-scoring trades. Drop (was tried with synthetic
-            # label=0 but flooded training with 99%+ losers; model learned
-            # DOA-pattern instead of winner-pattern). Keep original drop.
+        if not trade_rows:
+            # DOA — no post-scoring trades. 2026-04-24 codex diagnosis:
+            # dropping these caused survivor bias (model trained on 1292
+            # survivors, deployed on 96% DOA population → manifolds don't
+            # overlap → live WR collapses + anti-correlation at high
+            # proba). Fix: include DOA with label=0, realized_pnl=0 so
+            # the model learns the DOA feature signature and decision
+            # boundary at full population. Balance handled downstream via
+            # scale_pos_weight (increases naturally) + optional stratified
+            # undersample (controlled by env).
+            labels.append(0)
+            realized_pnls.append(0.0)
+            exit_reasons.append("doa_no_trades")
+            continue
+        # First buy after scored_at defines the entry point (same
+        # semantics the live pipeline uses: PaperTradeRunner opens on
+        # first post-scoring buy with market_cap_sol > 0).
+        entry_idx = None
+        entry_price = None
+        entry_ts = None
+        for i, t in enumerate(trade_rows):
+            ts, tx, sol_amt, tok_amt, mc, _vsol, _w = t
+            if tx == "buy" and tok_amt and sol_amt:
+                entry_price = float(sol_amt) / float(tok_amt)
+                entry_ts = float(ts)
+                entry_idx = i
+                break
+        if entry_idx is None or not entry_price or entry_price <= 0:
+            # Had trades but no usable buy → functionally DOA for our
+            # strategy (can't enter). Treat as label=0 same as DOA.
+            labels.append(0)
+            realized_pnls.append(0.0)
+            exit_reasons.append("doa_no_entry")
+            continue
+        # Post-entry trades replayed through the exact exit logic.
+        post_entry_trades = [
+            Trade(
+                mint=row["mint"],
+                wallet=t[6] or "",
+                tx_type=t[1],
+                sol_amount=float(t[2] or 0.0),
+                token_amount=float(t[3] or 0.0),
+                new_token_balance=0.0,
+                bonding_curve_key="",
+                v_sol_in_bonding_curve=float(t[5] or 0.0),
+                v_tokens_in_bonding_curve=0.0,
+                market_cap_sol=float(t[4] or 0.0),
+                timestamp=float(t[0]),
+            )
+            for t in trade_rows[entry_idx + 1 :]
+        ]
+        try:
+            mr = simulate_exit(live_config, post_entry_trades, entry_ts, entry_price)
+        except Exception as exc:
+            logger.warning(
+                "simulate_exit failed for %s (entry_ts=%.0f): %s — dropping row",
+                row["mint"],
+                entry_ts,
+                exc,
+            )
             labels.append(None)
             realized_pnls.append(None)
+            exit_reasons.append(None)
             continue
-        entry_mc = None
-        for t in trades:
-            if t[1] == "buy" and t[3] and t[2]:
-                entry_mc = t[4]
-                break
-        if not entry_mc or entry_mc <= 0:
-            labels.append(None)
-            realized_pnls.append(None)
-            continue
-        tp_mc = entry_mc * (1.0 + label_tp_pct / 100.0)
-        sl_mc = entry_mc * (1.0 - label_sl_pct / 100.0)
-        exit_mc: float | None = None
-        for t in trades:
-            mc = t[4]
-            if not mc:
-                continue
-            if mc >= tp_mc or mc <= sl_mc:
-                exit_mc = mc
-                break
-        if exit_mc is None:
-            exit_mc = trades[-1][4] or entry_mc
-        realized_pnl = calc_realized_pnl_pct(
-            entry_price=entry_mc,
-            exit_price=exit_mc,
-            buy_amount_sol=label_buy_amount_sol,
-            buy_slip_pct=label_buy_slip,
-            sell_slip_pct=label_sell_slip,
-            num_sell_legs=1,
-        )
-        labels.append(1 if realized_pnl > 0 else 0)
-        realized_pnls.append(float(realized_pnl))
+        realized = float(mr.pnl_pct)
+        labels.append(1 if realized > 0 else 0)
+        realized_pnls.append(realized)
+        exit_reasons.append(str(mr.exit_reason))
     conn.close()
 
     base["label"] = labels
@@ -308,9 +487,16 @@ def build_entry_dataset(
     # Must be excluded from feature list in train.py — it is the label
     # magnitude and would be perfect label leakage if trained on.
     base["realized_pnl_pct"] = realized_pnls
+    base["exit_reason"] = exit_reasons
     base = base.dropna(subset=["label"])
     base["label"] = base["label"].astype(int)
     base["realized_pnl_pct"] = base["realized_pnl_pct"].astype(float)
+    # Log the exit-reason distribution so we can eyeball whether the
+    # simulator is producing realistic mixes (e.g. too many `timeout`
+    # means most trades never resolve in-window → widen trade_window_sec).
+    if not base.empty:
+        reason_counts = base["exit_reason"].value_counts()
+        logger.info("Label exit_reason distribution: %s", dict(reason_counts))
     # Cyclical hour encoding replaces raw hour_utc (codex v9 P2 fix).
     import math as _math
 
@@ -364,7 +550,7 @@ def build_exit_dataset(
     (proxy for "we would have considered buying"). For each such token,
     synthesise a held-position timeline every ``sample_every_sec``.
     """
-    conn = sqlite3.connect(db_path)
+    conn = _connect_pg(db_path)
     candidates = pd.read_sql_query(
         """
         SELECT DISTINCT s.mint, s.scored_at AS entry_ts,
@@ -389,7 +575,7 @@ def build_exit_dataset(
         trades = pd.read_sql_query(
             """SELECT timestamp, tx_type, sol_amount, token_amount,
                       market_cap_sol, v_sol_in_bonding_curve, wallet
-               FROM trades WHERE mint = ? AND timestamp >= ?
+               FROM trades WHERE mint = %s AND timestamp >= %s
                  AND market_cap_sol > 0
                ORDER BY timestamp""",
             conn,
@@ -443,9 +629,7 @@ def build_exit_dataset(
             # proxy. Looks 60 seconds ahead; if the trade stream is
             # exhausted sooner, use the final available price (no
             # lookahead leak since by then the trade stream has ended).
-            fwd_window = trades[
-                (trades.timestamp > t) & (trades.timestamp <= t + 60.0)
-            ]
+            fwd_window = trades[(trades.timestamp > t) & (trades.timestamp <= t + 60.0)]
             if fwd_window.empty:
                 # fall back to the final price if nothing in 60s window
                 fwd_price = trades.price.iloc[-1]

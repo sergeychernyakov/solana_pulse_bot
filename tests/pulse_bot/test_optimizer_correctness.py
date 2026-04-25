@@ -25,10 +25,10 @@ expected output is derivable by hand. Together they cover:
 from __future__ import annotations
 
 import json
-import sqlite3
 import tempfile
 from pathlib import Path
 
+import psycopg2
 import pytest
 
 from pulse_bot.config import (
@@ -688,48 +688,47 @@ class TestBuildResultMetrics:
 # ---------------------------------------------------------------------------
 
 
-def _populate_snapshot(path: str, tokens: list[dict], trades: list[dict]) -> None:
-    """Populate a fresh pulse_bot.db-style SQLite file with minimal schema."""
-    Database(path).init_schema()
-    conn = sqlite3.connect(path)
+def _populate_snapshot(dsn: str, tokens: list[dict], trades: list[dict]) -> None:
+    """Populate a PostgreSQL test database with minimal token/trade data."""
+    conn = psycopg2.connect(dsn)
+    conn.autocommit = True
     try:
         seen_creators: set[str] = set()
-        for t in tokens:
-            creator = t.get("creator", "")
-            conn.execute(
-                "INSERT INTO tokens (mint, name, symbol, creator, created_at, uri, launchpad)"
-                " VALUES (?,?,?,?,?,?,?)",
-                (t["mint"], t.get("name", ""), t.get("symbol", ""),
-                 creator, t["created_at"], "", "pumpfun"),
-            )
-            if creator and creator not in seen_creators:
-                seen_creators.add(creator)
-                conn.execute(
-                    "INSERT INTO creators (wallet, total_tokens_created, times_seen,"
-                    " tokens_where_creator_sold_early, first_seen_at, last_seen_at, blacklisted)"
-                    " VALUES (?,?,?,?,?,?,?)",
-                    (creator, 1, 1, 0, t["created_at"], t["created_at"], 0),
+        with conn.cursor() as cur:
+            for t in tokens:
+                creator = t.get("creator", "")
+                cur.execute(
+                    "INSERT INTO tokens (mint, name, symbol, creator, created_at, uri, launchpad)"
+                    " VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                    (t["mint"], t.get("name", ""), t.get("symbol", ""),
+                     creator, t["created_at"], "", "pumpfun"),
                 )
-        for tr in trades:
-            conn.execute(
-                "INSERT INTO trades (mint, wallet, tx_type, sol_amount, token_amount,"
-                " v_sol_in_bonding_curve, market_cap_sol, timestamp, is_creator)"
-                " VALUES (?,?,?,?,?,?,?,?,?)",
-                (tr["mint"], tr.get("wallet", "W"), tr["tx_type"],
-                 tr["sol_amount"], tr["token_amount"],
-                 tr.get("v_sol", 30.0), tr.get("v_sol", 30.0),
-                 tr["timestamp"], int(tr.get("is_creator", 0))),
-            )
-        conn.commit()
+                if creator and creator not in seen_creators:
+                    seen_creators.add(creator)
+                    cur.execute(
+                        "INSERT INTO creators (wallet, total_tokens_created, times_seen,"
+                        " tokens_where_creator_sold_early, first_seen_at, last_seen_at, blacklisted)"
+                        " VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                        (creator, 1, 1, 0, t["created_at"], t["created_at"], 0),
+                    )
+            for tr in trades:
+                cur.execute(
+                    "INSERT INTO trades (mint, wallet, tx_type, sol_amount, token_amount,"
+                    " v_sol_in_bonding_curve, market_cap_sol, timestamp, is_creator)"
+                    " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (tr["mint"], tr.get("wallet", "W"), tr["tx_type"],
+                     tr["sol_amount"], tr["token_amount"],
+                     tr.get("v_sol", 30.0), tr.get("v_sol", 30.0),
+                     tr["timestamp"], int(tr.get("is_creator", 0))),
+                )
     finally:
         conn.close()
 
 
 class TestPreloadDataset:
-    def test_drops_tokens_with_no_trades(self, tmp_path: Path) -> None:
-        snap = str(tmp_path / "snap.db")
+    def test_drops_tokens_with_no_trades(self, tmp_path: Path, pg_test_db: str) -> None:
         _populate_snapshot(
-            snap,
+            pg_test_db,
             tokens=[
                 {"mint": "WITH", "created_at": 1000.0, "creator": "A"},
                 {"mint": "EMPTY", "created_at": 1000.0, "creator": "B"},
@@ -740,20 +739,19 @@ class TestPreloadDataset:
             ],
         )
         cfg = _cfg()
-        cfg.db_path = snap
+        cfg.db_path = pg_test_db
         cfg.observe_seconds = 45
-        opt = Optimizer(cfg, Database(snap))
-        opt._snapshot_path = snap  # pretend the snapshot is already built
+        opt = Optimizer(cfg, Database(pg_test_db))
+        opt._snapshot_path = pg_test_db  # pretend the snapshot is already built
 
         records = opt._preload_dataset()
         mints = [r.token.mint for r in records]
         assert mints == ["WITH"], "zero-trade tokens must be dropped"
 
-    def test_entry_price_uses_last_buy_in_full_window(self, tmp_path: Path) -> None:
+    def test_entry_price_uses_last_buy_in_full_window(self, tmp_path: Path, pg_test_db: str) -> None:
         """Entry price = sol/token of the LAST valid buy inside the full window."""
-        snap = str(tmp_path / "snap.db")
         _populate_snapshot(
-            snap,
+            pg_test_db,
             tokens=[{"mint": "M", "created_at": 1000.0, "creator": "A"}],
             trades=[
                 # Inside full window (≤ 1045): two buys with different prices
@@ -769,10 +767,10 @@ class TestPreloadDataset:
             ],
         )
         cfg = _cfg()
-        cfg.db_path = snap
+        cfg.db_path = pg_test_db
         cfg.observe_seconds = 45
-        opt = Optimizer(cfg, Database(snap))
-        opt._snapshot_path = snap
+        opt = Optimizer(cfg, Database(pg_test_db))
+        opt._snapshot_path = pg_test_db
 
         [rec] = opt._preload_dataset()
         assert rec.entry_price == pytest.approx(0.002)
@@ -789,8 +787,7 @@ class TestPreloadDataset:
 class TestWorkerSerialParity:
     """Same base config + same dataset ⇒ same candidates in both paths."""
 
-    def test_worker_matches_serial_stream(self, tmp_path: Path) -> None:
-        snap = str(tmp_path / "snap.db")
+    def test_worker_matches_serial_stream(self, tmp_path: Path, pg_test_db: str) -> None:
         # Two tokens with enough buys to trigger entry in default-permissive cfg.
         tokens = [{"mint": f"T{i}", "created_at": 1000.0 + i * 100, "creator": f"C{i}"}
                   for i in range(3)]
@@ -807,10 +804,10 @@ class TestWorkerSerialParity:
                     "timestamp": tok["created_at"] + 1 + k,
                     "v_sol": 10.0,
                 })
-        _populate_snapshot(snap, tokens, trades)
+        _populate_snapshot(pg_test_db, tokens, trades)
 
         cfg = _cfg()
-        cfg.db_path = snap
+        cfg.db_path = pg_test_db
         cfg.observe_seconds = 45
         cfg.min_entry_buyer_number = 1
         cfg.max_entry_buyer_number = 999
@@ -818,8 +815,8 @@ class TestWorkerSerialParity:
         cfg.fast_score_threshold = -999
         cfg.min_market_cap_sol = 0.0
 
-        opt = Optimizer(cfg, Database(snap))
-        opt._snapshot_path = snap
+        opt = Optimizer(cfg, Database(pg_test_db))
+        opt._snapshot_path = pg_test_db
 
         # Serial Phase-1
         combo_ctx = {
@@ -906,12 +903,11 @@ class TestSerialVsParallelEndToEnd:
         })
         return opt.run(max_combos=0, workers=workers)
 
-    def test_parallel_matches_serial(self, tmp_path: Path) -> None:
-        snap = str(tmp_path / "snap.db")
-        self._build_db(snap)
+    def test_parallel_matches_serial(self, tmp_path: Path, pg_test_db: str) -> None:
+        self._build_db(pg_test_db)
 
-        serial = self._run(snap, str(tmp_path / "serial.db"), workers=1)
-        parallel = self._run(snap, str(tmp_path / "parallel.db"), workers=2)
+        serial = self._run(pg_test_db, pg_test_db, workers=1)
+        parallel = self._run(pg_test_db, pg_test_db, workers=2)
 
         def _fingerprint(results: list[dict]) -> list[tuple]:
             return sorted(

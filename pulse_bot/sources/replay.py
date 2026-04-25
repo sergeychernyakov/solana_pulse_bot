@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sqlite3
 from typing import AsyncIterator
 
+import psycopg2
+import psycopg2.extras
+
+from pulse_bot.db import _resolve_dsn
 from pulse_bot.launchpads.base import Launchpad
 from pulse_bot.models import Token, Trade
 
@@ -51,10 +54,10 @@ class ReplayLaunchpad(Launchpad):
 
     async def stream_new_tokens(self) -> AsyncIterator[Token]:
         """Yield tokens from DB in chronological order."""
-        conn = sqlite3.connect(self._db_path)
-        conn.row_factory = sqlite3.Row
+        conn = psycopg2.connect(_resolve_dsn(self._db_path))
         try:
-            cur = conn.execute("SELECT * FROM tokens ORDER BY created_at ASC")
+            cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+            cur.execute("SELECT * FROM tokens ORDER BY created_at ASC")
             prev_ts = 0.0
             for row in cur:
                 if not self._running:
@@ -91,11 +94,11 @@ class ReplayLaunchpad(Launchpad):
 
     async def _preload_all_trades(self, mint: str) -> None:
         """Load every trade for this mint, in timestamp order, into the queue."""
-        conn = sqlite3.connect(self._db_path)
-        conn.row_factory = sqlite3.Row
+        conn = psycopg2.connect(_resolve_dsn(self._db_path))
         try:
-            cur = conn.execute(
-                "SELECT * FROM trades WHERE mint = ? ORDER BY timestamp ASC, id ASC",
+            cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+            cur.execute(
+                "SELECT * FROM trades WHERE mint = %s ORDER BY timestamp ASC, id ASC",
                 (mint,),
             )
             creator = self._token_creators.get(mint, "")
@@ -200,7 +203,7 @@ class ReplayLaunchpad(Launchpad):
     def compute_curve_progress(self, v_sol_in_bonding_curve: float) -> float:
         return min((v_sol_in_bonding_curve / 85.0) * 100.0, 100.0)
 
-    def _row_to_trade(self, row: sqlite3.Row, mint: str, creator: str) -> Trade:
+    def _row_to_trade(self, row, mint: str, creator: str) -> Trade:
         """Convert a DB row to a Trade object."""
         trade = Trade(
             mint=mint,

@@ -43,10 +43,10 @@ Known non-parity:
 from __future__ import annotations
 
 import json
-import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+import psycopg2
 import pytest
 
 from pulse_bot.backtest import BacktestEngine
@@ -86,7 +86,7 @@ def _pnl_sign(pnl_sol: float) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _populate_db(path: str) -> None:
+def _populate_db(dsn: str) -> None:
     """Build a deterministic DB with three tokens designed for unambiguous
     exits within the stream (so neither BT's ``backtest_end`` finale nor
     optimizer's no-monitor-trade fallback can contaminate the comparison):
@@ -96,88 +96,88 @@ def _populate_db(path: str) -> None:
         M2: one flat trade, then a long inactivity gap with one trade after
             it → dead_token fires via the inactivity rule
     """
-    Database(path).init_schema()
-    conn = sqlite3.connect(path)
+    conn = psycopg2.connect(dsn)
+    conn.autocommit = True
     try:
         tokens = [
             ("M0", "PUMP0", 1_000.0),
             ("M1", "DUMP1", 2_000.0),
             ("M2", "FLAT2", 3_000.0),
         ]
-        for mint, sym, created_at in tokens:
-            conn.execute(
-                "INSERT INTO tokens (mint, name, symbol, creator, created_at,"
-                " uri, launchpad) VALUES (?,?,?,?,?,?,?)",
-                (mint, sym, sym, f"C-{mint}", created_at, "", "pumpfun"),
-            )
-            conn.execute(
-                "INSERT INTO creators (wallet, total_tokens_created, times_seen,"
-                " tokens_where_creator_sold_early, first_seen_at, last_seen_at,"
-                " blacklisted) VALUES (?,?,?,?,?,?,?)",
-                (f"C-{mint}", 1, 1, 0, created_at, created_at, 0),
-            )
+        with conn.cursor() as cur:
+            for mint, sym, created_at in tokens:
+                cur.execute(
+                    "INSERT INTO tokens (mint, name, symbol, creator, created_at,"
+                    " uri, launchpad) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                    (mint, sym, sym, f"C-{mint}", created_at, "", "pumpfun"),
+                )
+                cur.execute(
+                    "INSERT INTO creators (wallet, total_tokens_created, times_seen,"
+                    " tokens_where_creator_sold_early, first_seen_at, last_seen_at,"
+                    " blacklisted) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                    (f"C-{mint}", 1, 1, 0, created_at, created_at, 0),
+                )
 
-        trade_rows: list[tuple] = []
+            trade_rows: list[tuple] = []
 
-        # Full-window buys for each token — 6 distinct wallets, price 0.001.
-        # With observe_seconds=45, these land in the scoring window.
-        for mint, _sym, created_at in tokens:
-            for k in range(6):
-                ts = created_at + 1.0 + k
+            # Full-window buys for each token — 6 distinct wallets, price 0.001.
+            # With observe_seconds=45, these land in the scoring window.
+            for mint, _sym, created_at in tokens:
+                for k in range(6):
+                    ts = created_at + 1.0 + k
+                    trade_rows.append(
+                        (
+                            mint, f"W-{mint}-{k}", "buy",
+                            0.1, 100.0,   # sol, tokens → price = 0.001
+                            30.0 + k, 30.0 + k, ts, 0,
+                        )
+                    )
+
+            # Post-entry monitor trades.
+            # M0: price 0.003 (3x = +200%) across 5 trades → forces take_profit
+            for k in range(5):
+                ts = 1_000.0 + 50.0 + k
                 trade_rows.append(
                     (
-                        mint, f"W-{mint}-{k}", "buy",
-                        0.1, 100.0,   # sol, tokens → price = 0.001
-                        30.0 + k, 30.0 + k, ts, 0,
+                        "M0", f"P-M0-{k}", "buy",
+                        0.3, 100.0,  # price = 0.003
+                        60.0 + k, 60.0 + k, ts, 0,
+                    )
+                )
+            # M1: price 0.0004 (-60%) → forces hard_stop
+            for k in range(5):
+                ts = 2_000.0 + 50.0 + k
+                trade_rows.append(
+                    (
+                        "M1", f"P-M1-{k}", "buy",
+                        0.04, 100.0,  # price = 0.0004
+                        20.0 + k, 20.0 + k, ts, 0,
+                    )
+                )
+            # M2: one flat monitor trade at t+50 (populates recent_trades in BT
+            # and last_trade_ts in optimizer), then a second trade at t+250 with
+            # a 200s gap (> inactivity=120s). When the second M2 trade arrives:
+            #   - BT's ``_close_expired_positions`` detects inactivity on M2 and
+            #     closes it as ``dead_token`` before re-entry checks.
+            #   - Optimizer's in-loop gap check in ``_simulate_trade_from`` fires
+            #     ``dead_token`` at ``last_trade_ts + inactivity``.
+            for k, ts_offset in enumerate((50.0, 250.0)):
+                ts = 3_000.0 + ts_offset
+                trade_rows.append(
+                    (
+                        "M2", f"P-M2-{k}", "buy",
+                        0.1, 100.0,  # price = 0.001 (flat vs entry → no TP/SL)
+                        30.0, 30.0, ts, 0,
                     )
                 )
 
-        # Post-entry monitor trades.
-        # M0: price 0.003 (3x = +200%) across 5 trades → forces take_profit
-        for k in range(5):
-            ts = 1_000.0 + 50.0 + k
-            trade_rows.append(
-                (
-                    "M0", f"P-M0-{k}", "buy",
-                    0.3, 100.0,  # price = 0.003
-                    60.0 + k, 60.0 + k, ts, 0,
+            for row in trade_rows:
+                cur.execute(
+                    "INSERT INTO trades (mint, wallet, tx_type, sol_amount,"
+                    " token_amount, v_sol_in_bonding_curve, market_cap_sol,"
+                    " timestamp, is_creator) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    row,
                 )
-            )
-        # M1: price 0.0004 (-60%) → forces hard_stop
-        for k in range(5):
-            ts = 2_000.0 + 50.0 + k
-            trade_rows.append(
-                (
-                    "M1", f"P-M1-{k}", "buy",
-                    0.04, 100.0,  # price = 0.0004
-                    20.0 + k, 20.0 + k, ts, 0,
-                )
-            )
-        # M2: one flat monitor trade at t+50 (populates recent_trades in BT
-        # and last_trade_ts in optimizer), then a second trade at t+250 with
-        # a 200s gap (> inactivity=120s). When the second M2 trade arrives:
-        #   - BT's ``_close_expired_positions`` detects inactivity on M2 and
-        #     closes it as ``dead_token`` before re-entry checks.
-        #   - Optimizer's in-loop gap check in ``_simulate_trade_from`` fires
-        #     ``dead_token`` at ``last_trade_ts + inactivity``.
-        for k, ts_offset in enumerate((50.0, 250.0)):
-            ts = 3_000.0 + ts_offset
-            trade_rows.append(
-                (
-                    "M2", f"P-M2-{k}", "buy",
-                    0.1, 100.0,  # price = 0.001 (flat vs entry → no TP/SL)
-                    30.0, 30.0, ts, 0,
-                )
-            )
-
-        for row in trade_rows:
-            conn.execute(
-                "INSERT INTO trades (mint, wallet, tx_type, sol_amount,"
-                " token_amount, v_sol_in_bonding_curve, market_cap_sol,"
-                " timestamp, is_creator) VALUES (?,?,?,?,?,?,?,?,?)",
-                row,
-            )
-        conn.commit()
     finally:
         conn.close()
 
@@ -278,12 +278,15 @@ def _optimizer_traces(cfg: PulseBotConfig, out_db: str) -> list[PositionTrace]:
     results = opt.run(max_combos=0, workers=1)
     assert len(results) == 1, "single-combo grid must produce exactly one run"
 
-    conn = sqlite3.connect(out_db)
+    conn = psycopg2.connect(out_db)
+    conn.autocommit = True
     try:
-        row = conn.execute(
-            "SELECT trades_json FROM optimization_runs WHERE run_id = ?",
-            (results[0]["run_id"],),
-        ).fetchone()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT trades_json FROM optimization_runs WHERE run_id = %s",
+                (results[0]["run_id"],),
+            )
+            row = cur.fetchone()
     finally:
         conn.close()
     assert row is not None, "optimizer did not persist the run"
@@ -311,33 +314,31 @@ def _optimizer_traces(cfg: PulseBotConfig, out_db: str) -> list[PositionTrace]:
 class TestOptimizerReferenceParity:
     """Differential parity: BacktestEngine vs Optimizer on the same dataset."""
 
-    def test_entry_set_matches(self, tmp_path: Path) -> None:
+    def test_entry_set_matches(self, tmp_path: Path, pg_test_db: str) -> None:
         """Both orchestrators must enter the same set of tokens."""
-        snap = str(tmp_path / "snap.db")
-        _populate_db(snap)
-        cfg = _cfg(snap)
+        _populate_db(pg_test_db)
+        cfg = _cfg(pg_test_db)
 
         ref = _reference_traces(cfg)
-        opt = _optimizer_traces(cfg, str(tmp_path / "opt.db"))
+        opt = _optimizer_traces(cfg, pg_test_db)
 
         assert {t.mint for t in ref} == {t.mint for t in opt}, (
             f"Entry set divergence: ref={sorted(t.mint for t in ref)}, "
             f"opt={sorted(t.mint for t in opt)}"
         )
 
-    def test_per_position_lifecycle_matches(self, tmp_path: Path) -> None:
+    def test_per_position_lifecycle_matches(self, tmp_path: Path, pg_test_db: str) -> None:
         """For each mint: entry_type, exit_reason, pnl_sign must match.
 
         ``entry_ts`` is NOT compared — see module docstring for the
         intentional wall-clock-vs-event-time divergence between BT and
         optimizer.
         """
-        snap = str(tmp_path / "snap.db")
-        _populate_db(snap)
-        cfg = _cfg(snap)
+        _populate_db(pg_test_db)
+        cfg = _cfg(pg_test_db)
 
         ref = _reference_traces(cfg)
-        opt = _optimizer_traces(cfg, str(tmp_path / "opt.db"))
+        opt = _optimizer_traces(cfg, pg_test_db)
 
         ref_by_mint = {t.mint: t for t in ref}
         opt_by_mint = {t.mint: t for t in opt}
@@ -356,17 +357,16 @@ class TestOptimizerReferenceParity:
                 f"{mint}: pnl_sign ref={r.pnl_sign} opt={o.pnl_sign}"
             )
 
-    def test_exit_reasons_are_expected(self, tmp_path: Path) -> None:
+    def test_exit_reasons_are_expected(self, tmp_path: Path, pg_test_db: str) -> None:
         """The synthetic dataset is engineered to fire specific exits. If
         either path produces a different reason the test data has drifted
         or orchestration regressed."""
-        snap = str(tmp_path / "snap.db")
-        _populate_db(snap)
-        cfg = _cfg(snap)
+        _populate_db(pg_test_db)
+        cfg = _cfg(pg_test_db)
 
         ref = {t.mint: t.exit_reason for t in _reference_traces(cfg)}
         opt = {t.mint: t.exit_reason for t in _optimizer_traces(
-            cfg, str(tmp_path / "opt.db"),
+            cfg, pg_test_db,
         )}
 
         # M0 pumps → take_profit; M1 tanks → hard_stop;

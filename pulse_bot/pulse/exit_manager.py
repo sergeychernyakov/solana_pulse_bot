@@ -40,21 +40,38 @@ if TYPE_CHECKING:
     from pulse_bot.pulse.monitor import PulseSnapshot
 
 
-# E5 confidence-sized partial ladder. Hardcoded per codex — val-tuning
-# these on the same N≈3700 already used for sell_ceiling/partial_floor
-# selection is double-dipping. Revisit when N_paper_trades ≥ 300.
-_SIZING_LADDER: tuple[tuple[float, float], ...] = (
-    (0.55, 0.30),  # 30% at proba ≥ 0.55
-    (0.65, 0.50),  # 50% at proba ≥ 0.65
-    (0.75, 0.70),  # 70% at proba ≥ 0.75
-    # ≥ sell_ceiling (0.80) handled as SELL_ALL — not on this ladder.
-)
+# E5 confidence-sized partial ladder. Config-backed since 2026-04-24 so
+# optimizer can sweep these. Defaults preserve old hardcoded values
+# (0.55→30%, 0.65→50%, 0.75→70%). `proba ≥ exit_ml_sell_threshold`
+# (0.80) is SELL_ALL — not on this ladder.
 
 
-def _sizing_from_proba(p: float) -> float:
-    """Pick the partial-exit fraction for a given proba using the ladder."""
-    frac = 0.30
-    for threshold, f in _SIZING_LADDER:
+def _sizing_ladder_from_config(
+    cfg: "PulseBotConfig",
+) -> tuple[tuple[float, float], ...]:
+    """Build the 3-step ladder from config fields. Order-enforced by
+    sorting on proba threshold so a misconfigured `probe_3 < probe_1`
+    still yields a monotone ladder."""
+    raw = (
+        (cfg.ml_sizing_proba_1, cfg.ml_sizing_frac_1),
+        (cfg.ml_sizing_proba_2, cfg.ml_sizing_frac_2),
+        (cfg.ml_sizing_proba_3, cfg.ml_sizing_frac_3),
+    )
+    return tuple(sorted(raw, key=lambda x: x[0]))
+
+
+def _sizing_from_proba(p: float, cfg: "PulseBotConfig | None" = None) -> float:
+    """Pick the partial-exit fraction for a given proba using the ladder.
+
+    ``cfg`` optional for call-site back-compat (tests); when None we fall
+    back to the historical hardcoded ladder.
+    """
+    if cfg is not None:
+        ladder = _sizing_ladder_from_config(cfg)
+    else:
+        ladder = ((0.55, 0.30), (0.65, 0.50), (0.75, 0.70))
+    frac = ladder[0][1] if ladder else 0.30
+    for threshold, f in ladder:
         if p >= threshold:
             frac = f
     return frac
@@ -198,7 +215,8 @@ class ExitManager:
             ):
                 self.ml_counters["ml_hold_hard_count"] += 1
                 return self._hold(
-                    ml_proba, ml_action,
+                    ml_proba,
+                    ml_action,
                     reason="ml_hold_hard_blocked_take_profit",
                 )
             return self._sell_all("take_profit", ml_proba, ml_action)
@@ -217,17 +235,13 @@ class ExitManager:
 
         available = self._remaining_pct - cfg.exit_moonbag_pct
         if available <= 0.01:
-            return self._maybe_ml_escalate(
-                pnl_pct, elapsed_sec, ml_proba, ml_action
-            )
+            return self._maybe_ml_escalate(pnl_pct, elapsed_sec, ml_proba, ml_action)
 
         # Strong profit → take partial (NOT blockable by HOLD_HARD)
         if pnl_pct > cfg.exit_profit_threshold_pct and not self._has_taken_profit:
             sell_pct = min(cfg.exit_partial_on_profit_pct, available)
             self._has_taken_profit = True
-            return self._sell_partial(
-                sell_pct, "strong_profit", ml_proba, ml_action
-            )
+            return self._sell_partial(sell_pct, "strong_profit", ml_proba, ml_action)
 
         # Weak pulse + profit → partial sell.
         # BLOCKABLE by ML HOLD_HARD when entry was high-confidence and PnL
@@ -311,7 +325,7 @@ class ExitManager:
         if ml_action == "SELL_PARTIAL" and ml_proba is not None:
             available = self._remaining_pct - cfg.exit_moonbag_pct
             if available > 0.01:
-                frac = _sizing_from_proba(ml_proba)
+                frac = _sizing_from_proba(ml_proba, cfg)
                 sell_pct = min(frac, available)
                 self.ml_counters["ml_partial_count"] += 1
                 return self._sell_partial(

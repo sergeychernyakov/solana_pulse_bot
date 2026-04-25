@@ -1,5 +1,10 @@
 # tests/pulse_bot/test_verify300.py
-"""Tests for verify300 infrastructure — ensures the verification pipeline works correctly."""
+"""Tests for verify300 infrastructure.
+
+2026-04-24 PG migration: ``pg_test_db`` fixture isolates each test in
+its own Postgres DB. Legacy ``Database(tmp.name)`` calls transparently
+route to the isolated DB via ``_resolve_dsn`` monkey-patch.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +14,8 @@ import tempfile
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("pg_test_db")
+
 from pulse_bot.config import PulseBotConfig, get_config
 from pulse_bot.db import Database
 
@@ -16,95 +23,75 @@ from pulse_bot.db import Database
 class TestVerifyInfrastructure:
     """Tests that verify300 components work independently."""
 
-    def test_db_schema_has_source_column(self) -> None:
+    def test_db_schema_has_source_column(self, pg_test_db) -> None:
         """token_scores must have source column for live/backtest/provider."""
-        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        tmp.close()
-        db = Database(tmp.name)
-        db.init_schema()
-
-        conn = sqlite3.connect(tmp.name)
-        cols = [
-            r[1] for r in conn.execute("PRAGMA table_info(token_scores)").fetchall()
-        ]
+        import psycopg2
+        conn = psycopg2.connect(pg_test_db)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='token_scores'"
+            )
+            cols = [r[0] for r in cur.fetchall()]
         conn.close()
-        os.unlink(tmp.name)
-
         assert "source" in cols
 
-    def test_db_source_values(self) -> None:
+    def test_db_source_values(self, pg_test_db) -> None:
         """Source column accepts live, backtest, provider."""
-        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        tmp.close()
-        db = Database(tmp.name)
-        db.init_schema()
-
-        conn = sqlite3.connect(tmp.name)
-        for source in ("live", "backtest", "provider"):
-            conn.execute(
-                "INSERT INTO token_scores (mint, source, total_score) VALUES (?, ?, ?)",
-                (f"mint_{source}", source, 0),
-            )
-        conn.commit()
-
-        for source in ("live", "backtest", "provider"):
-            row = conn.execute(
-                "SELECT source FROM token_scores WHERE mint = ?", (f"mint_{source}",)
-            ).fetchone()
-            assert row[0] == source
-
+        import psycopg2
+        conn = psycopg2.connect(pg_test_db)
+        with conn.cursor() as cur:
+            for source in ("live", "backtest", "provider"):
+                cur.execute(
+                    "INSERT INTO token_scores (mint, source, total_score) "
+                    "VALUES (%s, %s, %s)",
+                    (f"mint_{source}", source, 0),
+                )
+            conn.commit()
+            for source in ("live", "backtest", "provider"):
+                cur.execute(
+                    "SELECT source FROM token_scores WHERE mint = %s",
+                    (f"mint_{source}",),
+                )
+                assert cur.fetchone()[0] == source
         conn.close()
-        os.unlink(tmp.name)
 
-    def test_clear_backtest_scores_keeps_live(self) -> None:
+    def test_clear_backtest_scores_keeps_live(self, pg_test_db) -> None:
         """clear_backtest_scores removes backtest but keeps live."""
-        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        tmp.close()
-        db = Database(tmp.name)
-        db.init_schema()
-
-        conn = sqlite3.connect(tmp.name)
-        conn.execute(
-            "INSERT INTO token_scores (mint, source, total_score) VALUES ('a', 'live', 10)"
-        )
-        conn.execute(
-            "INSERT INTO token_scores (mint, source, total_score) VALUES ('a', 'backtest', 10)"
-        )
-        conn.commit()
-        conn.close()
-
+        import psycopg2
+        db = Database("pulse_bot.db")  # redirected to pg_test_db via fixture
+        conn = psycopg2.connect(pg_test_db)
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO token_scores (mint, source, total_score) "
+                "VALUES ('a', 'live', 10)"
+            )
+            cur.execute(
+                "INSERT INTO token_scores (mint, source, total_score) "
+                "VALUES ('a', 'backtest', 10)"
+            )
+            conn.commit()
         db.clear_backtest_scores()
-
-        conn = sqlite3.connect(tmp.name)
-        live = conn.execute(
-            "SELECT COUNT(*) FROM token_scores WHERE source='live'"
-        ).fetchone()[0]
-        bt = conn.execute(
-            "SELECT COUNT(*) FROM token_scores WHERE source='backtest'"
-        ).fetchone()[0]
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM token_scores WHERE source='live'")
+            live = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM token_scores WHERE source='backtest'")
+            bt = cur.fetchone()[0]
         conn.close()
-        os.unlink(tmp.name)
-
         assert live == 1
         assert bt == 0
 
-    def test_paper_trades_table_exists(self) -> None:
+    def test_paper_trades_table_exists(self, pg_test_db) -> None:
         """paper_trades table created by init_schema."""
-        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        tmp.close()
-        db = Database(tmp.name)
-        db.init_schema()
-
-        conn = sqlite3.connect(tmp.name)
-        tables = [
-            r[0]
-            for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        ]
+        import psycopg2
+        conn = psycopg2.connect(pg_test_db)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema='public'"
+            )
+            tables = [r[0] for r in cur.fetchall()]
         conn.close()
-        os.unlink(tmp.name)
-
         assert "paper_trades" in tables
 
     def test_entry_buyer_number_in_config(self) -> None:

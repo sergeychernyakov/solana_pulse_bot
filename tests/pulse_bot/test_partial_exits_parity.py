@@ -256,7 +256,7 @@ def _open_trade_row(db: Database, entry_ts: float = 1_000.0) -> int:
 
 
 class TestClosePaperTradePnLParity:
-    def test_without_pnl_pct_matches_calc_pnl_pct(self, tmp_path: Path) -> None:
+    def test_without_pnl_pct_matches_calc_pnl_pct(self, tmp_path: Path, pg_test_db: str) -> None:
         db = Database(str(tmp_path / "live.db"))
         db.init_schema()
         trade_id = _open_trade_row(db)
@@ -280,7 +280,7 @@ class TestClosePaperTradePnLParity:
         # Raw (exit-entry)/entry would be +50 %; fee-adjusted is strictly less
         assert row["pnl_pct"] < 50.0
 
-    def test_with_supplied_pnl_pct_is_stored_verbatim(self, tmp_path: Path) -> None:
+    def test_with_supplied_pnl_pct_is_stored_verbatim(self, tmp_path: Path, pg_test_db: str) -> None:
         """Partial-aware caller passes a weighted pnl_pct; DB must not recompute."""
         db = Database(str(tmp_path / "live.db"))
         db.init_schema()

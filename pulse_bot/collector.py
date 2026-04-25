@@ -106,28 +106,32 @@ class HeliusCollector:
 
         Returns total trades downloaded.
         """
-        import sqlite3
+        import psycopg2
 
-        conn = sqlite3.connect(db_path)
+        from pulse_bot.db import _resolve_dsn
+
+        conn = psycopg2.connect(_resolve_dsn(db_path))
         total = 0
 
         for i, mint in enumerate(mints):
             trades = await self.get_trades_for_mint(mint)
-            for t in trades:
-                conn.execute(
-                    """INSERT OR IGNORE INTO trades
-                    (mint, wallet, tx_type, sol_amount, token_amount,
-                     market_cap_sol, v_sol_in_bonding_curve, timestamp, is_creator)
-                    VALUES (?, ?, ?, ?, ?, 0, 0, ?, 0)""",
-                    (
-                        t["mint"],
-                        t["wallet"],
-                        t["tx_type"],
-                        t["sol_amount"],
-                        t["token_amount"],
-                        t["timestamp"],
-                    ),
-                )
+            with conn.cursor() as cur:
+                for t in trades:
+                    cur.execute(
+                        """INSERT INTO trades
+                        (mint, wallet, tx_type, sol_amount, token_amount,
+                         market_cap_sol, v_sol_in_bonding_curve, timestamp, is_creator)
+                        VALUES (%s, %s, %s, %s, %s, 0, 0, %s, 0)
+                        ON CONFLICT DO NOTHING""",
+                        (
+                            t["mint"],
+                            t["wallet"],
+                            t["tx_type"],
+                            t["sol_amount"],
+                            t["token_amount"],
+                            t["timestamp"],
+                        ),
+                    )
             conn.commit()
             total += len(trades)
 

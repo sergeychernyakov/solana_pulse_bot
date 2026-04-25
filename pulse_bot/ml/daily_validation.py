@@ -26,14 +26,18 @@ logger = logging.getLogger(__name__)
 
 ModelKind = Literal["entry", "exit"]
 
-# Known-leak features. Any of these appearing in top-10 gain importance
-# signals a regression of a codex v9 fix.
+# Known-leak / momentum-bias features. Any appearing in top-10 gain
+# importance signals a regression. market_cap_sol / sol_to_graduation /
+# log_market_cap removed in v16 (2026-04-25); token_price_sol removed in v17
+# (same session) — on pump.fun price = market_cap_sol / 1e9, identical bias.
 KNOWN_LEAK_FEATURES: set[str] = {
     "market_cap_sol",
     "mc_at_scoring",
     "sol_to_graduation",
     "v_sol_in_bonding_curve",
     "v_tokens_in_bonding_curve",
+    "log_market_cap",  # log(market_cap_sol+1) — derivative of above
+    "token_price_sol",  # = market_cap_sol / 1e9 on pump.fun — same momentum bias
 }
 
 # Alert thresholds (tuned for N~80 positives per codex review 2026-04-22).
@@ -41,7 +45,8 @@ SHUFFLED_LABELS_THRESHOLD = 0.55
 SHUFFLED_LABELS_N_RUNS = 5
 ADVERSARIAL_ABS_THRESHOLD = 0.85
 ADVERSARIAL_WOW_DELTA_THRESHOLD = 0.10
-PRIOR_DRIFT_THRESHOLD = 0.30
+PRIOR_DRIFT_THRESHOLD = 0.50  # raised from 0.30: at ~0.5% base-rate, a 30%
+# relative gate fires on <0.15pp absolute change — within normal market noise
 KS_P_VALUE_THRESHOLD = 0.01
 CALIBRATION_N_BINS = 5
 ROLLING_MIN_POSITIVES = 500
@@ -212,7 +217,7 @@ def check_adversarial_validation(
     return ValidationResult(
         name="adversarial_validation",
         passed=passed,
-        severity="alert" if not passed else "info",
+        severity="warn" if not passed else "info",  # SOFT: temporal features
         metric=auc,
         details={
             "abs_threshold": ADVERSARIAL_ABS_THRESHOLD,
@@ -273,7 +278,7 @@ def check_ks_predictions(
     return ValidationResult(
         name="ks_predictions",
         passed=passed,
-        severity="alert" if not passed else "info",
+        severity="warn" if not passed else "info",  # SOFT: expected after retrain
         metric=float(p),
         details={
             "ks_statistic": float(stat),
@@ -338,7 +343,7 @@ def check_feature_importance_sanity(
     """Alert if a known-leak feature reappears in top-N gain importance."""
     booster = model.get_booster()
     imp = booster.get_score(importance_type="gain")
-    ranked = sorted(imp.items(), key=lambda kv: -kv[1])[:top_n]
+    ranked = sorted(imp.items(), key=lambda kv: -float(kv[1]))[:top_n]  # type: ignore[arg-type]
     leaks_in_top = [name for name, _ in ranked if name in leak_set]
     passed = not leaks_in_top
     return ValidationResult(
@@ -632,7 +637,9 @@ def run_validation(
         realized_pnl_test = test_df["realized_pnl_pct"].values
 
     proba_test = model.predict_proba(X_test)[:, 1] if len(X_test) else np.array([])
-    _proba_all = model.predict_proba(X_full)[:, 1] if len(X_full) else np.array([])  # noqa: F841
+    _proba_all = (
+        model.predict_proba(X_full)[:, 1] if len(X_full) else np.array([])
+    )  # noqa: F841
 
     yesterday = _load_yesterday_report(report_dir, kind)
     yesterday_proba = None
@@ -713,7 +720,13 @@ def run_validation(
 
     report_dir.mkdir(parents=True, exist_ok=True)
     report_path = report_dir / f"daily_report_{kind}_{today.isoformat()}.json"
-    report_path.write_text(json.dumps(report, indent=2))
+    report_path.write_text(
+        json.dumps(
+            report,
+            indent=2,
+            default=lambda o: int(o) if isinstance(o, (bool,)) else str(o),
+        )
+    )
     logger.info("Report: %s (%d alerts)", report_path, len(alerts))
     return report
 

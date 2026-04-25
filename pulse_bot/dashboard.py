@@ -586,24 +586,16 @@ def render_token_table(rows: list[dict], db: Database | None = None) -> None:
 
 def _load_scores_for_mints(db: Database, mints: list[str]) -> dict[str, dict]:
     """Load token_scores for a list of mints. Returns {mint: score_dict}."""
-    import sqlite3
-
     if not mints:
         return {}
-    conn = sqlite3.connect(db.db_path)
-    conn.row_factory = sqlite3.Row
-    result: dict[str, dict] = {}
-    for mint in mints:
-        row = conn.execute(
-            "SELECT fast_decision, fast_score, decision, total_score, "
-            "unique_buyers, buy_volume_sol, curve_progress_pct, sell_pressure "
-            "FROM token_scores WHERE mint=? AND source='live' LIMIT 1",
-            (mint,),
-        ).fetchone()
-        if row:
-            result[mint] = dict(row)
-    conn.close()
-    return result
+    placeholders = ",".join(["?"] * len(mints))
+    rows = db._sync_query(
+        f"SELECT mint, fast_decision, fast_score, decision, total_score, "
+        f"unique_buyers, buy_volume_sol, curve_progress_pct, sell_pressure "
+        f"FROM token_scores WHERE mint IN ({placeholders}) AND source='live'",
+        tuple(mints),
+    )
+    return {r["mint"]: r for r in rows}
 
 
 def format_ts(ts: float) -> str:

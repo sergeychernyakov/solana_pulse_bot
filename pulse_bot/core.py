@@ -9,9 +9,8 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pulse_bot.config import PUMPFUN_FEE_PCT, PUMPFUN_PRIORITY_FEE
 from pulse_bot.pulse.exit_manager import ExitManager
@@ -193,8 +192,10 @@ class PaperTradeRunner:
         # when task #123 fires. Pipeline already computes ml_proba at
         # entry time, so reviving is a local change here + a param on
         # ExitManager + one line in extract_exit_features.
-        from pulse_bot.ml.policy import (load_exit_policy_if_available,
-                                         load_exit_quantile_if_available)
+        from pulse_bot.ml.policy import (
+            load_exit_policy_if_available,
+            load_exit_quantile_if_available,
+        )
 
         quantile_sl = None
         if getattr(config, "exit_regression_active", False):

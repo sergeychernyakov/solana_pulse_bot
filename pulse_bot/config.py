@@ -54,6 +54,14 @@ class PulseBotConfig:
     score_threshold_buy: int = 50  # strict defaults from volume-cliff sweep 2026-04-22
     score_threshold_borderline: int = 10
 
+    # Post-scoring trade collection window for SKIP/RULES tokens. Default
+    # 0 = current behavior (unsubscribe immediately after decision). Set
+    # to 600+ to keep collecting trades for ML label horizon — required
+    # to enable max_hold > observe_seconds in label / sweep pipelines.
+    # Enable via PULSE_EXTENDED_OBSERVE_SECONDS=600. Cost: extra WS
+    # bandwidth + DB writes for every non-DOA SKIP token.
+    pulse_extended_observe_seconds: float = 0.0
+
     # ── HARD ENTRY FILTERS (reject before scoring) ─────────
     min_market_cap_sol: float = 0.0  # min MCap to consider (0 = no filter)
     max_sell_pressure_for_entry: float = (
@@ -248,6 +256,38 @@ class PulseBotConfig:
     # User directive 2026-04-23: activated by default in paper-trading.
     exit_regression_active: bool = True
 
+    # ── ENTRY ML gating + sizing (moved from hardcoded 2026-04-24) ──
+    # Confidence-gating thresholds. None → use val-tuned values baked
+    # into the model's meta.json. Set via env to force override at
+    # startup (e.g. `PULSE_ENTRY_PROBA_FLOOR=0.5 PULSE_ENTRY_PROBA_CEILING=0.5`
+    # for full ML-only mode). Values apply to raw (pre-Platt) proba.
+    entry_ml_proba_floor: float | None = None
+    entry_ml_proba_ceiling: float | None = None
+
+    # Sizing ladder (E5 confidence-weighted partials). Three (proba,
+    # fraction) breakpoints. As proba crosses each threshold, position
+    # size steps up. Previously hardcoded in exit_manager.py; moved here
+    # so optimizer can sweep. `proba ≥ exit_ml_sell_threshold` (0.80) is
+    # SELL_ALL — not on this ladder.
+    ml_sizing_proba_1: float = 0.55
+    ml_sizing_frac_1: float = 0.30
+    ml_sizing_proba_2: float = 0.65
+    ml_sizing_frac_2: float = 0.50
+    ml_sizing_proba_3: float = 0.75
+    ml_sizing_frac_3: float = 0.70
+
+    # ── ENTRY ML training hyperparameters (moved from train.py 2026-04-24) ──
+    # XGBoost classifier capacity. Defaults from codex v9: depth=3 +
+    # min_child_weight=5 give ~16 leaves across a tree, safe at N_pos≈250.
+    # When N_pos grows (Phase 2 N≥500), can widen depth=4 and eventually
+    # n_estimators=200+. Optimizer sweep tunes within constraints.
+    entry_train_n_estimators: int = 150
+    entry_train_max_depth: int = 3
+    entry_train_learning_rate: float = 0.05
+    entry_train_min_child_weight: int = 5
+    entry_train_subsample: float = 0.8
+    entry_train_colsample_bytree: float = 0.8
+
     # ── BACKTEST ───────────────────────────────────────────
     # Source DB for `main.py backtest` replay; defaults to live DB.
     backtest_db_path: str = "pulse_bot.db"
@@ -294,6 +334,26 @@ def get_config() -> PulseBotConfig:
             "exit_regression_active",
             lambda v: v.lower() in ("1", "true", "yes"),
         ),
+        "PULSE_ENTRY_PROBA_FLOOR": ("entry_ml_proba_floor", float),
+        "PULSE_ENTRY_PROBA_CEILING": ("entry_ml_proba_ceiling", float),
+        "PULSE_ML_SIZING_PROBA_1": ("ml_sizing_proba_1", float),
+        "PULSE_ML_SIZING_FRAC_1": ("ml_sizing_frac_1", float),
+        "PULSE_ML_SIZING_PROBA_2": ("ml_sizing_proba_2", float),
+        "PULSE_ML_SIZING_FRAC_2": ("ml_sizing_frac_2", float),
+        "PULSE_ML_SIZING_PROBA_3": ("ml_sizing_proba_3", float),
+        "PULSE_ML_SIZING_FRAC_3": ("ml_sizing_frac_3", float),
+        "PULSE_ENTRY_N_ESTIMATORS": ("entry_train_n_estimators", int),
+        "PULSE_ENTRY_MAX_DEPTH": ("entry_train_max_depth", int),
+        "PULSE_ENTRY_LEARNING_RATE": ("entry_train_learning_rate", float),
+        "PULSE_ENTRY_MIN_CHILD_WEIGHT": ("entry_train_min_child_weight", int),
+        "PULSE_ENTRY_SUBSAMPLE": ("entry_train_subsample", float),
+        "PULSE_ENTRY_COLSAMPLE_BYTREE": ("entry_train_colsample_bytree", float),
+        # Exit-param overrides for sweep scripts (relabel → retrain experiments)
+        "PULSE_EXIT_HARD_STOP_LOSS_PCT": ("exit_hard_stop_loss_pct", float),
+        "PULSE_EXIT_TAKE_PROFIT_PCT": ("exit_take_profit_pct", float),
+        "PULSE_EXIT_MAX_HOLD_SECONDS": ("exit_max_hold_seconds", float),
+        "PULSE_EXIT_INACTIVITY_SECONDS": ("exit_inactivity_seconds", float),
+        "PULSE_EXTENDED_OBSERVE_SECONDS": ("pulse_extended_observe_seconds", float),
     }
     for env_key, target in env_map.items():
         val = os.environ.get(env_key)

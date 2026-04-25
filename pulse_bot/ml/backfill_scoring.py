@@ -19,12 +19,14 @@ from __future__ import annotations
 
 import argparse
 import logging
-import sqlite3
 import sys
 import time
 
+import psycopg2
+import psycopg2.extras
+
 from pulse_bot.config import get_config
-from pulse_bot.db import Database
+from pulse_bot.db import Database, _resolve_dsn
 from pulse_bot.filters.metrics import MetricsCalculator
 from pulse_bot.filters.scorer import Scorer
 from pulse_bot.models import Token, Trade
@@ -32,7 +34,7 @@ from pulse_bot.models import Token, Trade
 logger = logging.getLogger(__name__)
 
 
-def _row_to_token(row: sqlite3.Row) -> Token:
+def _row_to_token(row) -> Token:
     return Token(
         mint=row["mint"],
         name=row["name"] or "",
@@ -44,7 +46,7 @@ def _row_to_token(row: sqlite3.Row) -> Token:
     )
 
 
-def _row_to_trade(row: sqlite3.Row) -> Trade:
+def _row_to_trade(row) -> Trade:
     # The DB schema omits some live-stream fields (new_token_balance,
     # bonding_curve_key, v_tokens_in_bonding_curve) — fill defaults.
     # Scorer/MetricsCalculator only use the fields present in DB, so the
@@ -66,34 +68,30 @@ def _row_to_trade(row: sqlite3.Row) -> Trade:
 
 
 def _save_backfill_score(
-    conn: sqlite3.Connection,
+    conn,
     result,
     fast_trade_count: int,
     full_trade_count: int,
 ) -> None:
-    """Insert minimal ScoringResult into token_scores as source='backfill'.
-
-    We reuse the same ``INSERT OR REPLACE`` path as upsert_scoring_result
-    — without duplicating that method's 50+ columns — by writing directly
-    with a subset that covers the ML feature list. Remaining columns
-    default to 0.0/0 (all have DEFAULT clauses).
-    """
+    """Insert minimal ScoringResult into token_scores as source='backfill' (PG)."""
     result.source = "backfill"
     result.fast_trade_count = fast_trade_count
     result.full_trade_count = full_trade_count
-    # Re-use Database.upsert_scoring_result via a synchronous path — the
-    # async version uses aiosqlite but we're in sync context. Build
-    # equivalent INSERT OR REPLACE directly.
     from pulse_bot.db import _SCORE_COLUMNS
     from pulse_bot.db import Database as _DB
 
     cols = ", ".join(_SCORE_COLUMNS)
-    placeholders = ", ".join(["?"] * len(_SCORE_COLUMNS))
-    values = tuple(_DB._get_score_value(result, col) for col in _SCORE_COLUMNS)
-    conn.execute(
-        f"INSERT OR REPLACE INTO token_scores ({cols}) VALUES ({placeholders})",
-        values,
+    placeholders = ", ".join(["%s"] * len(_SCORE_COLUMNS))
+    updates = ", ".join(
+        f"{c} = EXCLUDED.{c}" for c in _SCORE_COLUMNS if c not in ("mint", "source")
     )
+    values = tuple(_DB._get_score_value(result, col) for col in _SCORE_COLUMNS)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"INSERT INTO token_scores ({cols}) VALUES ({placeholders}) "
+            f"ON CONFLICT (mint, source) DO UPDATE SET {updates}",
+            values,
+        )
 
 
 def run_backfill(
@@ -114,31 +112,32 @@ def run_backfill(
     """
     config = get_config()
     db = Database(db_path)
-    _metrics = MetricsCalculator(graduation_sol=85.0)  # noqa: F841 reserved for future replay use
+    _metrics = MetricsCalculator(
+        graduation_sol=85.0
+    )  # noqa: F841 reserved for future replay use
     scorer = Scorer(config, db)
 
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout = 5000")
+    conn = psycopg2.connect(_resolve_dsn(db_path))
 
     # Candidate mints: in tokens but not in (live) token_scores.
-    if skip_existing:
-        rows = conn.execute(
-            """
-            SELECT mint, name, symbol, creator, created_at, uri, launchpad
-            FROM tokens
-            WHERE mint NOT IN (
-                SELECT mint FROM token_scores WHERE source='live'
+    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+        if skip_existing:
+            cur.execute(
+                """
+                SELECT mint, name, symbol, creator, created_at, uri, launchpad
+                FROM tokens
+                WHERE mint NOT IN (
+                    SELECT mint FROM token_scores WHERE source='live'
+                )
+                ORDER BY created_at ASC
+                """
             )
-            ORDER BY created_at ASC
-            """
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """SELECT mint, name, symbol, creator, created_at, uri, launchpad
-               FROM tokens ORDER BY created_at ASC"""
-        ).fetchall()
+        else:
+            cur.execute(
+                """SELECT mint, name, symbol, creator, created_at, uri, launchpad
+                   FROM tokens ORDER BY created_at ASC"""
+            )
+        rows = cur.fetchall()
     logger.info("Candidate tokens: %d", len(rows))
 
     if limit is not None:

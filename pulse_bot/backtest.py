@@ -207,22 +207,29 @@ class BacktestEngine:
         return None
 
     def _save_score_sync(self, result: ScoringResult) -> None:
-        """Write scoring result to DB synchronously."""
-        import sqlite3
+        """Write scoring result to DB synchronously (Postgres)."""
+        import psycopg2
 
-        from pulse_bot.db import _SCORE_COLUMNS, Database
+        from pulse_bot.db import _SCORE_COLUMNS, Database, _resolve_dsn
 
-        conn = sqlite3.connect(self._cfg.backtest_db_path)
+        conn = psycopg2.connect(_resolve_dsn(self._cfg.backtest_db_path))
         try:
-            placeholders = ", ".join(["?"] * len(_SCORE_COLUMNS))
+            placeholders = ", ".join(["%s"] * len(_SCORE_COLUMNS))
             cols = ", ".join(_SCORE_COLUMNS)
+            updates = ", ".join(
+                f"{c} = EXCLUDED.{c}"
+                for c in _SCORE_COLUMNS
+                if c not in ("mint", "source")
+            )
             values = tuple(
                 Database._get_score_value(result, col) for col in _SCORE_COLUMNS
             )
-            conn.execute(
-                f"INSERT OR REPLACE INTO token_scores ({cols}) VALUES ({placeholders})",
-                values,
-            )
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"INSERT INTO token_scores ({cols}) VALUES ({placeholders}) "
+                    f"ON CONFLICT (mint, source) DO UPDATE SET {updates}",
+                    values,
+                )
             conn.commit()
         finally:
             conn.close()

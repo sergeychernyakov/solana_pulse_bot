@@ -19,19 +19,36 @@ import logging
 import multiprocessing as mp
 import os
 import random
-import sqlite3
-import tempfile
 import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any
 
+import psycopg2
+import psycopg2.extras
+
 from pulse_bot.config import PUMPFUN_GRADUATION_SOL
+from pulse_bot.db import _resolve_dsn
 from pulse_bot.filters.fast import FastFilter
 from pulse_bot.filters.metrics import MetricsCalculator
 from pulse_bot.filters.scorer import Scorer
 from pulse_bot.models import CreatorStats, Token, Trade
+
+
+def _pg_conn(path_or_dsn: str):
+    """Open a psycopg2 connection. Legacy SQLite paths map to the
+    canonical PG DSN; real ``postgresql://`` strings pass through."""
+    return psycopg2.connect(_resolve_dsn(path_or_dsn))
+
+
+def _pg_exec(conn, sql: str, params: tuple | list | None = None):
+    """SQLite-style ``conn.execute(sql, params).fetchall()`` adapter for
+    psycopg2. Translates ``?`` placeholders to ``%s`` at call time."""
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    cur.execute(sql.replace("?", "%s"), tuple(params) if params else None)
+    return cur
+
 
 if TYPE_CHECKING:
     from pulse_bot.config import PulseBotConfig
@@ -443,10 +460,11 @@ class Optimizer:
         tokens strictly below it — used to split train/holdout chronologically.
         """
         assert self._snapshot_path is not None
-        conn = sqlite3.connect(self._snapshot_path)
+        conn = _pg_conn(self._snapshot_path)
         try:
-            rows = conn.execute(
-                "SELECT created_at FROM tokens " "ORDER BY created_at ASC, mint ASC"
+            rows = _pg_exec(
+                conn,
+                "SELECT created_at FROM tokens " "ORDER BY created_at ASC, mint ASC",
             ).fetchall()
         finally:
             conn.close()
@@ -764,24 +782,19 @@ class Optimizer:
     # ── Snapshot helpers ─────────────────────────────────────
 
     def _create_snapshot(self) -> str:
-        """Copy live DB into a temp snapshot via sqlite3 backup API.
+        """PG migration 2026-04-24: snapshot is a no-op. PostgreSQL MVCC
+        provides read-consistency without needing a file-level backup.
+        Returns the canonical DSN so downstream ``_pg_conn`` calls work.
+
+        Copy live DB into a temp snapshot via sqlite3 backup API.
 
         Reading from a snapshot decouples the optimizer from the live
         collector — no long-held read transactions on the writer's DB.
         """
-        src = self._base_cfg.db_path
-        fd, path = tempfile.mkstemp(prefix="opt_snapshot_", suffix=".db")
-        os.close(fd)
-        t0 = time.time()
-        src_conn = sqlite3.connect(src)
-        dst_conn = sqlite3.connect(path)
-        try:
-            src_conn.backup(dst_conn)
-        finally:
-            dst_conn.close()
-            src_conn.close()
-        logger.info("Snapshot ready in %.1fs (%s → %s)", time.time() - t0, src, path)
-        return path
+        # PG: no snapshot needed. Use the canonical DSN directly; MVCC
+        # gives optimizer workers consistent reads even as the live
+        # pipeline writes.
+        return _resolve_dsn(self._base_cfg.db_path)
 
     def _cleanup_snapshot(self) -> None:
         path = self._snapshot_path
@@ -813,12 +826,13 @@ class Optimizer:
         split_ts = self._split_ts
 
         records: list[_TokenRecord] = []
-        conn = sqlite3.connect(snap)
-        conn.row_factory = sqlite3.Row
+        conn = _pg_conn(snap)
+        # row_factory equivalent: DictCursor is used by _pg_exec
         try:
-            token_cursor = conn.execute(
+            token_cursor = _pg_exec(
+                conn,
                 "SELECT mint, name, symbol, creator, created_at, uri "
-                "FROM tokens ORDER BY created_at ASC, mint ASC"
+                "FROM tokens ORDER BY created_at ASC, mint ASC",
             )
             processed = 0
             for trow in token_cursor:
@@ -841,7 +855,8 @@ class Optimizer:
                     uri=trow["uri"] or "",
                     launchpad="pumpfun",
                 )
-                trade_rows = conn.execute(
+                trade_rows = _pg_exec(
+                    conn,
                     "SELECT wallet, tx_type, sol_amount, token_amount, "
                     "v_sol_in_bonding_curve, market_cap_sol, timestamp, is_creator "
                     "FROM trades WHERE mint = ? ORDER BY timestamp ASC",
@@ -901,7 +916,8 @@ class Optimizer:
                 # Holder snapshots: pull T+30 and T+120 for delta signal
                 # (codex v8 audit recommendation — derivative separates
                 # "still concentrated" from "distributing").
-                h30 = conn.execute(
+                h30 = _pg_exec(
+                    conn,
                     """SELECT top1_pct, top5_pct, top10_pct, holder_count
                        FROM token_holders_snapshots
                        WHERE mint=? AND capture_at_age_sec=30.0
@@ -909,7 +925,8 @@ class Optimizer:
                        LIMIT 1""",
                     (token.mint,),
                 ).fetchone()
-                h120 = conn.execute(
+                h120 = _pg_exec(
+                    conn,
                     """SELECT top1_pct, top5_pct
                        FROM token_holders_snapshots
                        WHERE mint=? AND capture_at_age_sec=120.0
@@ -971,12 +988,13 @@ class Optimizer:
         from pulse_bot.core import decide_entry
 
         kept: dict[str, CachedToken] = {}
-        conn = sqlite3.connect(snap)
-        conn.row_factory = sqlite3.Row
+        conn = _pg_conn(snap)
+        # row_factory equivalent: DictCursor is used by _pg_exec
         try:
-            token_cursor = conn.execute(
+            token_cursor = _pg_exec(
+                conn,
                 "SELECT mint, name, symbol, creator, created_at, uri "
-                "FROM tokens ORDER BY created_at ASC, mint ASC"
+                "FROM tokens ORDER BY created_at ASC, mint ASC",
             )
             processed = 0
             for trow in token_cursor:
@@ -999,7 +1017,8 @@ class Optimizer:
                     uri=trow["uri"] or "",
                     launchpad="pumpfun",
                 )
-                trade_rows = conn.execute(
+                trade_rows = _pg_exec(
+                    conn,
                     "SELECT wallet, tx_type, sol_amount, token_amount, "
                     "v_sol_in_bonding_curve, market_cap_sol, timestamp, is_creator "
                     "FROM trades WHERE mint = ? ORDER BY timestamp ASC",
@@ -1463,8 +1482,9 @@ class Optimizer:
         Runs once at start of ``run()``. Non-fatal — purely advisory.
         """
         try:
-            conn = sqlite3.connect(self._base_cfg.db_path)
-            rows = conn.execute(
+            conn = _pg_conn(self._base_cfg.db_path)
+            rows = _pg_exec(
+                conn,
                 """SELECT fast_decision, decision,
                           COUNT(*) n,
                           AVG(pnl_100th_pct) avg_pnl,
@@ -1472,7 +1492,7 @@ class Optimizer:
                    FROM token_scores
                    WHERE source='live'
                      AND fast_decision IS NOT NULL AND decision IS NOT NULL
-                   GROUP BY fast_decision, decision"""
+                   GROUP BY fast_decision, decision""",
             ).fetchall()
             conn.close()
         except Exception as exc:
@@ -1528,8 +1548,9 @@ class Optimizer:
         from collections import defaultdict
 
         try:
-            conn = sqlite3.connect(self._base_cfg.optimizer_db_path)
-            rows = conn.execute(
+            conn = _pg_conn(self._base_cfg.optimizer_db_path)
+            rows = _pg_exec(
+                conn,
                 """SELECT params, total_pnl_sol, total_trades
                    FROM optimization_runs WHERE optimizer_session = ?""",
                 (self._session_id,),
@@ -1590,7 +1611,8 @@ class Optimizer:
             boots: list[float] = []
             n = len(pairs)
             for _ in range(n_boot):
-                sample = [pairs[_rnd.randrange(n)] for _ in range(n)]  # nosec B311 — bootstrap, not crypto
+                # bootstrap resample, not security-sensitive
+                sample = [pairs[_rnd.randrange(n)] for _ in range(n)]  # nosec B311
                 bn = sum(p * t for p, t in sample)
                 bd = sum(t for _, t in sample) or 1
                 boots.append(bn / bd)
@@ -1776,9 +1798,9 @@ class Optimizer:
         if not top_results or self._snapshot_path is None:
             return
         try:
-            conn = sqlite3.connect(self._snapshot_path)
-            ts_rows = conn.execute(
-                "SELECT created_at FROM tokens ORDER BY created_at ASC"
+            conn = _pg_conn(self._snapshot_path)
+            ts_rows = _pg_exec(
+                conn, "SELECT created_at FROM tokens ORDER BY created_at ASC"
             ).fetchall()
             conn.close()
         except Exception as exc:

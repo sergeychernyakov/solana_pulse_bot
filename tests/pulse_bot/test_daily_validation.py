@@ -91,10 +91,8 @@ def test_shuffled_labels_skipped_on_tiny_sample() -> None:
 
 def test_adversarial_passes_on_same_distribution() -> None:
     rng = np.random.default_rng(42)
-    X_train = pd.DataFrame(rng.standard_normal((200, 4)),
-                           columns=list("abcd"))
-    X_test = pd.DataFrame(rng.standard_normal((100, 4)),
-                          columns=list("abcd"))
+    X_train = pd.DataFrame(rng.standard_normal((200, 4)), columns=list("abcd"))
+    X_test = pd.DataFrame(rng.standard_normal((100, 4)), columns=list("abcd"))
     r = check_adversarial_validation(X_train, X_test)
     assert r.passed
     assert r.metric is not None
@@ -103,25 +101,25 @@ def test_adversarial_passes_on_same_distribution() -> None:
 
 def test_adversarial_detects_distribution_shift() -> None:
     rng = np.random.default_rng(42)
-    X_train = pd.DataFrame(rng.standard_normal((200, 4)),
-                           columns=list("abcd"))
+    X_train = pd.DataFrame(rng.standard_normal((200, 4)), columns=list("abcd"))
     # Huge mean shift — trivially separable
     X_test = pd.DataFrame(
-        rng.standard_normal((100, 4)) + 10.0, columns=list("abcd"),
+        rng.standard_normal((100, 4)) + 10.0,
+        columns=list("abcd"),
     )
     r = check_adversarial_validation(X_train, X_test)
     assert not r.passed
-    assert r.severity == "alert"
+    assert r.severity == "warn"  # downgraded: temporal drift is soft signal
     assert r.metric is not None and r.metric > ADVERSARIAL_ABS_THRESHOLD
 
 
 def test_adversarial_wow_delta_alert() -> None:
     rng = np.random.default_rng(42)
-    X_train = pd.DataFrame(rng.standard_normal((200, 4)),
-                           columns=list("abcd"))
+    X_train = pd.DataFrame(rng.standard_normal((200, 4)), columns=list("abcd"))
     # Small shift — abs AUC modest, but much higher than "previous" run
     X_test = pd.DataFrame(
-        rng.standard_normal((100, 4)) + 2.0, columns=list("abcd"),
+        rng.standard_normal((100, 4)) + 2.0,
+        columns=list("abcd"),
     )
     r = check_adversarial_validation(X_train, X_test, previous_auc=0.55)
     # Either abs or wow should fire
@@ -201,8 +199,11 @@ def _fit_toy_model(features: list[str], seed: int = 42) -> xgb.XGBClassifier:
     # Label depends on first feature — ensures importance is not empty
     y = (X[features[0]] > 0).astype(int).values
     m = xgb.XGBClassifier(
-        n_estimators=20, max_depth=2, random_state=seed,
-        objective="binary:logistic", eval_metric="auc",
+        n_estimators=20,
+        max_depth=2,
+        random_state=seed,
+        objective="binary:logistic",
+        eval_metric="auc",
     )
     m.fit(X, y, verbose=False)
     return m
@@ -232,7 +233,11 @@ def test_economic_backtest_positive_pnl_when_model_is_good() -> None:
     y = np.array([1] * 60 + [0] * 40)
     proba = y.astype(float) * 0.9 + 0.05  # positives ~0.95, negatives ~0.05
     r = check_economic_backtest(
-        y, proba, tp_pct=50, sl_pct=30, proba_threshold=0.5,
+        y,
+        proba,
+        tp_pct=50,
+        sl_pct=30,
+        proba_threshold=0.5,
     )
     assert r.passed
     assert r.metric is not None and r.metric > 0
@@ -243,7 +248,11 @@ def test_economic_backtest_negative_pnl_when_random() -> None:
     y = (rng.random(100) < 0.2).astype(int)
     proba = rng.uniform(0, 1, 100)  # random signal
     r = check_economic_backtest(
-        y, proba, tp_pct=50, sl_pct=80, proba_threshold=0.3,
+        y,
+        proba,
+        tp_pct=50,
+        sl_pct=80,
+        proba_threshold=0.3,
     )
     # With 20% base rate and 50/80 asymmetric payoff, random model is
     # expected to lose money on average. Any single run is noisy but seed
@@ -258,9 +267,7 @@ def test_economic_backtest_realistic_is_stricter() -> None:
     standard = check_economic_backtest(y, proba, realistic=False)
     realistic = check_economic_backtest(y, proba, realistic=True)
     assert standard.metric is not None and realistic.metric is not None
-    assert realistic.metric < standard.metric, (
-        "Realistic variant should penalize more than standard"
-    )
+    assert realistic.metric < standard.metric, "Realistic variant should penalize more than standard"
 
 
 def test_economic_backtest_no_entries() -> None:
@@ -285,10 +292,12 @@ def test_rolling_walk_forward_skipped_on_small_sample() -> None:
 
 
 def test_split_chrono_entry_80_20() -> None:
-    df = pd.DataFrame({
-        "scored_at": list(range(100)),
-        "label": [0] * 80 + [1] * 20,
-    })
+    df = pd.DataFrame(
+        {
+            "scored_at": list(range(100)),
+            "label": [0] * 80 + [1] * 20,
+        }
+    )
     tr, te = _split_chrono(df, "scored_at")
     assert len(tr) == 80 and len(te) == 20
     # Chronological: test is the later portion
@@ -301,18 +310,20 @@ def test_split_chrono_exit_groups_by_mint() -> None:
     for i, m in enumerate(["A", "B", "C", "D", "E"]):
         entry_ts = i * 100.0
         for j in range(3):
-            rows.append({
-                "mint": m, "entry_ts": entry_ts,
-                "sample_ts": entry_ts + j, "label": 0,
-            })
+            rows.append(
+                {
+                    "mint": m,
+                    "entry_ts": entry_ts,
+                    "sample_ts": entry_ts + j,
+                    "label": 0,
+                }
+            )
     df = pd.DataFrame(rows)
     tr, te = _split_chrono_exit(df)
     # No mint may straddle the split
     tr_mints = set(tr.mint)
     te_mints = set(te.mint)
-    assert not tr_mints & te_mints, (
-        f"Mint leaked across split: {tr_mints & te_mints}"
-    )
+    assert not tr_mints & te_mints, f"Mint leaked across split: {tr_mints & te_mints}"
 
 
 # ── orchestrator helpers ────────────────────────────────────────────
@@ -320,6 +331,7 @@ def test_split_chrono_exit_groups_by_mint() -> None:
 
 def test_load_yesterday_report_finds_recent(tmp_path: Path) -> None:
     from datetime import date, timedelta
+
     yesterday = date.today() - timedelta(days=1)
     p = tmp_path / f"daily_report_entry_{yesterday.isoformat()}.json"
     p.write_text(json.dumps({"kind": "entry", "hello": "world"}))
@@ -335,6 +347,7 @@ def test_load_yesterday_report_returns_none_if_missing(tmp_path: Path) -> None:
 
 def test_load_yesterday_report_skips_corrupt(tmp_path: Path) -> None:
     from datetime import date, timedelta
+
     y = date.today() - timedelta(days=1)
     (tmp_path / f"daily_report_entry_{y.isoformat()}.json").write_text("{invalid")
     assert _load_yesterday_report(tmp_path, "entry") is None

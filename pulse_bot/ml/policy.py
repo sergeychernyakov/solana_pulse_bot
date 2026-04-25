@@ -23,11 +23,15 @@ from typing import Any, Mapping
 import numpy as np
 import xgboost as xgb
 
-from pulse_bot.ml.features import (ENTRY_FEATURE_ORDER, EXIT_FEATURE_ORDER,
-                                   EXIT_FEATURE_SCHEMA_VERSION,
-                                   FEATURE_SCHEMA_VERSION,
-                                   extract_entry_features,
-                                   extract_entry_vector, extract_exit_vector)
+from pulse_bot.ml.features import (
+    ENTRY_FEATURE_ORDER,
+    EXIT_FEATURE_ORDER,
+    EXIT_FEATURE_SCHEMA_VERSION,
+    FEATURE_SCHEMA_VERSION,
+    extract_entry_features,
+    extract_entry_vector,
+    extract_exit_vector,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +181,29 @@ class EntryMLPolicy:
                 proba_floor = conf.get("floor")
                 proba_ceiling = conf.get("ceiling")
             calibration = meta.get("calibration")
+        # 2026-04-24: config can override meta.json thresholds at startup
+        # (optimizer uses this to sweep proba gating without retraining).
+        # Precedence: config override > meta.json > hardcoded default.
+        try:
+            from pulse_bot.config import get_config
+
+            cfg = get_config()
+            if cfg.entry_ml_proba_floor is not None:
+                logger.info(
+                    "EntryMLPolicy: config overrides proba_floor %.3f → %.3f",
+                    proba_floor if proba_floor is not None else float("nan"),
+                    cfg.entry_ml_proba_floor,
+                )
+                proba_floor = cfg.entry_ml_proba_floor
+            if cfg.entry_ml_proba_ceiling is not None:
+                logger.info(
+                    "EntryMLPolicy: config overrides proba_ceiling %.3f → %.3f",
+                    proba_ceiling if proba_ceiling is not None else float("nan"),
+                    cfg.entry_ml_proba_ceiling,
+                )
+                proba_ceiling = cfg.entry_ml_proba_ceiling
+        except Exception as exc:
+            logger.debug("EntryMLPolicy config override skipped: %s", exc)
         return cls(
             model,
             model_hash,
@@ -193,6 +220,10 @@ class EntryMLPolicy:
         scoring_result: Any,
         holder_snapshot: Mapping[str, Any] | None = None,
         creator_snapshot: Any = None,
+        *,
+        wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
+        top3_buyer_wallets: list[str] | None = None,
+        cutoff_ts: float | None = None,
     ) -> float:
         """Raw model score.
 
@@ -201,19 +232,32 @@ class EntryMLPolicy:
 
         Same skew-guards apply to both — a zero feature slice with a
         non-None snapshot is a bug in either objective.
+
+        Phase E: ``wallet_prior_stats`` + ``top3_buyer_wallets`` + ``cutoff_ts``
+        feed top-3-buyer features. Callers pre-query via
+        ``Database.get_wallet_prior_stats_sync``.
         """
-        vec = extract_entry_vector(scoring_result, holder_snapshot, creator_snapshot)
-        # 2026-04-23 skew guard (codex-tightened): the original 20%
-        # global threshold (≥10 non-zero of 51) would NOT have caught
-        # the creator skew bug, because only 3-4 of 51 features were
-        # affected. Fix: also verify *per-feature-group* coverage. A
-        # legitimate non-None snapshot should produce at least one
-        # non-zero feature in its group (creator / holder). An all-zero
-        # group when its snapshot was passed means lookup broke.
+        vec = extract_entry_vector(
+            scoring_result,
+            holder_snapshot,
+            creator_snapshot,
+            wallet_prior_stats=wallet_prior_stats,
+            top3_buyer_wallets=top3_buyer_wallets,
+            cutoff_ts=cutoff_ts,
+        )
+        # 2026-04-23 skew guard (codex-tightened): per-feature-group
+        # coverage. A legitimate non-None snapshot should produce at least
+        # one non-zero feature in its group (creator / holder). An all-zero
+        # group when its snapshot was passed means the lookup broke.
+        #
+        # 2026-04-24 (Phase E): rebuilt by NAME lookup using
+        # ENTRY_FEATURE_ORDER, no longer by positional slicing. Adding
+        # DERIVED/WALLET_FEATURES was silently mis-slicing the old code;
+        # by-name is immune to group re-ordering.
         from pulse_bot.ml.features import (
             CREATOR_FEATURES,
+            ENTRY_FEATURE_ORDER,
             HELIUS_FEATURES,
-            SCORER_FEATURES,
         )
 
         nz = sum(1 for v in vec if v != 0.0)
@@ -228,26 +272,26 @@ class EntryMLPolicy:
                 type(creator_snapshot).__name__ if creator_snapshot else "None",
                 type(holder_snapshot).__name__ if holder_snapshot else "None",
             )
-        # Per-group coverage — catches the creator skew class directly:
-        # if snapshot was provided (non-None) but every feature in that
-        # group is still 0, a lookup path is broken.
-        n_scorer = len(SCORER_FEATURES)
-        n_helius = len(HELIUS_FEATURES)
-        n_creator = len(CREATOR_FEATURES)
-        # SCORER_FEATURES + DERIVED (2 hour_sin/cos) + HELIUS + CREATOR — slice indices
-        helius_slice = vec[n_scorer + 2 : n_scorer + 2 + n_helius]
-        creator_slice = vec[n_scorer + 2 + n_helius :]
-        if holder_snapshot is not None and not any(v != 0.0 for v in helius_slice):
+
+        def _group_values(group_names: list[str]) -> list[float]:
+            idx = [ENTRY_FEATURE_ORDER.index(n) for n in group_names]
+            return [vec[i] for i in idx]
+
+        if holder_snapshot is not None and not any(
+            v != 0.0 for v in _group_values(HELIUS_FEATURES)
+        ):
             logger.warning(
                 "predict_proba: holder_snapshot provided but all %d "
                 "HELIUS_FEATURES resolved to 0.0 — possible lookup regression",
-                n_helius,
+                len(HELIUS_FEATURES),
             )
-        if creator_snapshot is not None and not any(v != 0.0 for v in creator_slice):
+        if creator_snapshot is not None and not any(
+            v != 0.0 for v in _group_values(CREATOR_FEATURES)
+        ):
             logger.warning(
                 "predict_proba: creator_snapshot provided but all %d "
                 "CREATOR_FEATURES resolved to 0.0 — creator skew fingerprint",
-                n_creator,
+                len(CREATOR_FEATURES),
             )
         arr = np.asarray([vec], dtype=float)
         if self.objective == "reg:squarederror":
@@ -261,6 +305,10 @@ class EntryMLPolicy:
         scoring_result: Any,
         holder_snapshot: Mapping[str, Any] | None = None,
         creator_snapshot: Any = None,
+        *,
+        wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
+        top3_buyer_wallets: list[str] | None = None,
+        cutoff_ts: float | None = None,
     ) -> float:
         """Back-compat alias. For classification returns P(profitable).
 
@@ -269,13 +317,24 @@ class EntryMLPolicy:
         ``predict_score``. Shadow-logging paths are the main affected
         callers — they log the raw score either way.
         """
-        return self.predict_score(scoring_result, holder_snapshot, creator_snapshot)
+        return self.predict_score(
+            scoring_result,
+            holder_snapshot,
+            creator_snapshot,
+            wallet_prior_stats=wallet_prior_stats,
+            top3_buyer_wallets=top3_buyer_wallets,
+            cutoff_ts=cutoff_ts,
+        )
 
     def decide(
         self,
         scoring_result: Any,
         holder_snapshot: Mapping[str, Any] | None = None,
         creator_snapshot: Any = None,
+        *,
+        wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
+        top3_buyer_wallets: list[str] | None = None,
+        cutoff_ts: float | None = None,
     ) -> tuple[bool, float]:
         """Return (should_buy, score). ``score`` is proba for classification,
         predicted PnL% for regression.
@@ -283,7 +342,14 @@ class EntryMLPolicy:
         The calling code keeps the rule-based hard rejects (sell pressure,
         curve progress, creator blacklist) as a safety layer *before*
         calling this — ML decides only among tokens that pass those."""
-        s = self.predict_score(scoring_result, holder_snapshot, creator_snapshot)
+        s = self.predict_score(
+            scoring_result,
+            holder_snapshot,
+            creator_snapshot,
+            wallet_prior_stats=wallet_prior_stats,
+            top3_buyer_wallets=top3_buyer_wallets,
+            cutoff_ts=cutoff_ts,
+        )
         # For regression, threshold semantics differ: a PnL > 0 is the
         # natural "buy" signal. For classification, >= threshold (0.5
         # default) remains.
@@ -296,6 +362,10 @@ class EntryMLPolicy:
         scoring_result: Any,
         holder_snapshot: Mapping[str, Any] | None = None,
         creator_snapshot: Any = None,
+        *,
+        wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
+        top3_buyer_wallets: list[str] | None = None,
+        cutoff_ts: float | None = None,
     ) -> tuple[str, float, float]:
         """Confidence-gated three-way decision.
 
@@ -311,7 +381,14 @@ class EntryMLPolicy:
         physical units — no logit remap needed) and ``score_raw`` ==
         ``score_calibrated``.
         """
-        s_raw = self.predict_score(scoring_result, holder_snapshot, creator_snapshot)
+        s_raw = self.predict_score(
+            scoring_result,
+            holder_snapshot,
+            creator_snapshot,
+            wallet_prior_stats=wallet_prior_stats,
+            top3_buyer_wallets=top3_buyer_wallets,
+            cutoff_ts=cutoff_ts,
+        )
         s_cal = self._calibrate(s_raw)
         if s_raw >= self.proba_ceiling:
             action = "BUY"
@@ -343,9 +420,18 @@ class EntryMLPolicy:
         scoring_result: Any,
         holder_snapshot: Mapping[str, Any] | None = None,
         creator_snapshot: Any = None,
+        *,
+        wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
+        top3_buyer_wallets: list[str] | None = None,
+        cutoff_ts: float | None = None,
     ) -> str:
         feats = extract_entry_features(
-            scoring_result, holder_snapshot, creator_snapshot
+            scoring_result,
+            holder_snapshot,
+            creator_snapshot,
+            wallet_prior_stats=wallet_prior_stats,
+            top3_buyer_wallets=top3_buyer_wallets,
+            cutoff_ts=cutoff_ts,
         )
         return json.dumps(feats, separators=(",", ":"))
 
@@ -396,10 +482,13 @@ class ExitMLPolicy:
         self.threshold = float(threshold)
         self.schema_version = schema_version
         self.sell_ceiling = (
-            float(sell_ceiling) if sell_ceiling is not None else self.DEFAULT_SELL_CEILING
+            float(sell_ceiling)
+            if sell_ceiling is not None
+            else self.DEFAULT_SELL_CEILING
         )
         self.partial_floor = (
-            float(partial_floor) if partial_floor is not None
+            float(partial_floor)
+            if partial_floor is not None
             else self.DEFAULT_PARTIAL_FLOOR
         )
         self.entry_model_hash = entry_model_hash
@@ -431,7 +520,8 @@ class ExitMLPolicy:
                 if os.environ.get("PULSE_ALLOW_STALE_MODEL") == "1":
                     logger.error(
                         "Loading STALE-SCHEMA exit model "
-                        "(PULSE_ALLOW_STALE_MODEL=1): %s", detail,
+                        "(PULSE_ALLOW_STALE_MODEL=1): %s",
+                        detail,
                     )
                 else:
                     raise RuntimeError(detail)
@@ -486,10 +576,8 @@ class ExitMLPolicy:
             return ("SELL_ALL", p)
         if p >= self.partial_floor:
             return ("SELL_PARTIAL", p)
-        if (
-            p < self.HOLD_HARD_THRESHOLD
-            and (current_pnl_pct is None
-                 or current_pnl_pct >= self.HOLD_HARD_MIN_PNL_PCT)
+        if p < self.HOLD_HARD_THRESHOLD and (
+            current_pnl_pct is None or current_pnl_pct >= self.HOLD_HARD_MIN_PNL_PCT
         ):
             return ("HOLD_HARD", p)
         return ("RULES", p)
@@ -566,9 +654,7 @@ def load_exit_quantile_if_available(
     """Return None when the quantile model is missing or meta is bad."""
     p = Path(path)
     if not p.exists():
-        logger.info(
-            "No quantile model at %s — dynamic SL override disabled.", p
-        )
+        logger.info("No quantile model at %s — dynamic SL override disabled.", p)
         return None
     try:
         return ExitQuantilePolicy.from_path(p)

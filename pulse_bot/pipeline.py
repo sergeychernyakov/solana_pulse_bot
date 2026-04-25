@@ -20,8 +20,7 @@ if TYPE_CHECKING:
     from pulse_bot.ml.policy import EntryMLPolicy
     from pulse_bot.models import CreatorStats, Token, Trade
 
-from pulse_bot.ml.policy import (get_active_policy_name,
-                                 load_entry_policy_if_available)
+from pulse_bot.ml.policy import get_active_policy_name, load_entry_policy_if_available
 
 logger = logging.getLogger(__name__)
 
@@ -333,14 +332,7 @@ class Pipeline:
 
     def _count_open_trades(self) -> int:
         """Count open paper trades from DB — the single source of truth."""
-        import sqlite3
-
-        conn = sqlite3.connect(self._config.db_path)
-        count = conn.execute(
-            "SELECT COUNT(*) FROM paper_trades WHERE status='open'"
-        ).fetchone()[0]
-        conn.close()
-        return count
+        return self._db.count_open_paper_trades()
 
     async def _resume_open_trades(self) -> None:
         """Resume monitoring open paper trades from a previous pipeline run.
@@ -348,13 +340,9 @@ class Pipeline:
         Re-subscribes to WS and restarts _paper_trade tasks so positions
         are managed the same way as freshly opened ones.
         """
-        import sqlite3
-
         from pulse_bot.models import Token
 
-        conn = sqlite3.connect(self._config.db_path)
-        conn.row_factory = sqlite3.Row
-        open_trades = conn.execute(
+        open_trades = self._db._sync_query(
             """SELECT p.id, p.mint, p.symbol, p.entry_price, p.entry_time,
                       p.entry_mcap_sol, p.entry_buyer_number, p.entry_type,
                       p.entry_score, p.buy_amount_sol, p.price_updated_at,
@@ -362,8 +350,7 @@ class Pipeline:
                FROM paper_trades p
                LEFT JOIN tokens t ON t.mint = p.mint
                WHERE p.status='open'"""
-        ).fetchall()
-        conn.close()
+        )
 
         if not open_trades:
             return
@@ -484,6 +471,14 @@ class Pipeline:
             # Store all trades and get DB IDs (skip in replay — trades already in DB)
             if not is_replay:
                 trade_ids = await self._db.insert_trades_batch(all_trades)
+                # Phase E: keep wallet_activity materialized view fresh for
+                # top-3 buyer prior-stats features. Running here (after trade
+                # insert, before scoring) guarantees the aggregate reflects
+                # everything the scorer will see.
+                try:
+                    await self._db.upsert_wallet_activity_from_trades(all_trades)
+                except Exception as exc:
+                    logger.warning("wallet_activity upsert failed (non-fatal): %s", exc)
             else:
                 trade_ids = [getattr(t, "_db_id", 0) for t in all_trades]
             fast_ids = trade_ids[: len(fast_trades)] if trade_ids else []
@@ -545,6 +540,33 @@ class Pipeline:
                 except Exception:
                     logger.debug("save_sol_price failed", exc_info=True)
 
+            # Phase E — top-3 buyer prior stats computed once per scoring
+            # and reused by the shadow-logging + decide_with_confidence
+            # call sites below. Both paths call the same features.py
+            # helpers so train/serve parity is enforced by construction.
+            try:
+                from pulse_bot.ml.features import compute_top3_buyer_wallets
+
+                top3_wallets = compute_top3_buyer_wallets(all_trades)
+                wallet_prior_stats = (
+                    self._db.get_wallet_prior_stats_sync(
+                        top3_wallets,
+                        exclude_mint=token.mint,
+                        cutoff_ts=float(result.scored_at or 0.0),
+                    )
+                    if top3_wallets
+                    else {}
+                )
+            except Exception as exc:
+                logger.warning(
+                    "wallet_prior_stats lookup failed for %s: %s",
+                    token.mint[:12],
+                    exc,
+                )
+                top3_wallets = []
+                wallet_prior_stats = {}
+            scoring_cutoff_ts = float(result.scored_at or 0.0)
+
             # Shadow ML logging — never drives live decisions; writes
             # ml_entry_proba + feature vector alongside rules output so
             # we can post-hoc compare ML-vs-rules without trading risk.
@@ -555,10 +577,18 @@ class Pipeline:
             if self._ml_entry_policy is not None:
                 try:
                     proba = self._ml_entry_policy.predict_proba(
-                        result, creator_snapshot=creator_snapshot
+                        result,
+                        creator_snapshot=creator_snapshot,
+                        wallet_prior_stats=wallet_prior_stats,
+                        top3_buyer_wallets=top3_wallets,
+                        cutoff_ts=scoring_cutoff_ts,
                     )
                     feat_json = self._ml_entry_policy.dump_features_json(
-                        result, creator_snapshot=creator_snapshot
+                        result,
+                        creator_snapshot=creator_snapshot,
+                        wallet_prior_stats=wallet_prior_stats,
+                        top3_buyer_wallets=top3_wallets,
+                        cutoff_ts=scoring_cutoff_ts,
                     )
                     await self._db.save_ml_prediction(
                         mint=token.mint,
@@ -665,6 +695,9 @@ class Pipeline:
                         self._ml_entry_policy.decide_with_confidence(
                             result,
                             creator_snapshot=creator_snapshot,
+                            wallet_prior_stats=wallet_prior_stats,
+                            top3_buyer_wallets=top3_wallets,
+                            cutoff_ts=scoring_cutoff_ts,
                         )
                     )
                     if ml_action == "BUY" and not should_enter:
@@ -742,11 +775,40 @@ class Pipeline:
                     )
                 )
             else:
-                await self._launchpad.unsubscribe_trades(token.mint)
+                # SKIP/RULES path: optionally keep collecting trades post-
+                # scoring so ML label/sweep pipelines see >observe_seconds
+                # of activity. Background task; does not delay decisions.
+                extra = float(self._config.pulse_extended_observe_seconds)
+                if extra > 0 and not is_replay:
+                    asyncio.create_task(self._extended_observation(token.mint, extra))
+                else:
+                    await self._launchpad.unsubscribe_trades(token.mint)
 
         except Exception:
             logger.exception("Error processing token %s (%s)", token.symbol, mint_short)
             await self._launchpad.unsubscribe_trades(token.mint)
+
+    async def _extended_observation(self, mint: str, duration_seconds: float) -> None:
+        """Continue saving trades for `duration_seconds` after a SKIP decision.
+
+        Lets ML label / sweep pipelines extend beyond the scoring window
+        without changing live entry behavior. Runs as a background task,
+        unsubscribes when done. Inactivity bound matches ``exit_inactivity_seconds``
+        so a token going silent stops the WS subscription early.
+        """
+        inactivity = float(self._config.exit_inactivity_seconds or 0.0)
+        try:
+            async for trade in self._launchpad.stream_trades(
+                mint, duration_seconds, inactivity_timeout=inactivity
+            ):
+                try:
+                    await self._db.insert_trades_batch([trade])
+                except Exception as exc:
+                    logger.debug(
+                        "extended observation insert failed (non-fatal): %s", exc
+                    )
+        finally:
+            await self._launchpad.unsubscribe_trades(mint)
 
     async def _paper_trade(
         self,
@@ -826,6 +888,13 @@ class Pipeline:
                 # Save monitor trades to DB so replay/optimizer can use them
                 if not is_replay:
                     await self._db.insert_trades_batch([trade])
+                    # Phase E: keep wallet_activity in sync for post-entry trades
+                    try:
+                        await self._db.upsert_wallet_activity_from_trades([trade])
+                    except Exception as exc:
+                        logger.warning(
+                            "wallet_activity upsert (monitor) failed: %s", exc
+                        )
 
                 # Update paper trade in DB
                 await self._db.update_paper_trade(

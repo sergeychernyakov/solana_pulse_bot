@@ -17,7 +17,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import sqlite3
 import statistics
 import time
 from dataclasses import asdict, dataclass
@@ -91,35 +90,30 @@ class LocalSnapshotSource:
         return await asyncio.to_thread(self._compute_sync, creator, ref_ts)
 
     def _compute_sync(self, creator: str, ref_ts: float) -> CreatorSnapshot | None:
-        conn = sqlite3.connect(self._db_path)
-        conn.row_factory = sqlite3.Row
-        try:
-            # Per-token TTL = last observed trade minus created_at. Proxy
-            # for "how long did this token stay alive?". 0 = no trades ever
-            # (rug before any volume). Subquery is cheap — trades are
-            # indexed by mint.
-            rows = conn.execute(
-                """
-                SELECT t.mint, t.created_at,
-                       COALESCE(ts.market_cap_sol, 0.0)     AS mc_at_score,
-                       COALESCE(ts.curve_progress_pct, 0.0) AS curve_pct,
-                       COALESCE(
-                         (SELECT MAX(tr.timestamp) FROM trades tr
-                          WHERE tr.mint = t.mint),
-                         t.created_at
-                       ) AS last_trade_ts
-                FROM tokens t
-                LEFT JOIN token_scores ts
-                       ON ts.mint = t.mint AND ts.source = 'live'
-                WHERE t.creator = ?
-                  AND t.created_at IS NOT NULL
-                  AND t.created_at < ?
-                ORDER BY t.created_at ASC
-                """,
-                (creator, ref_ts),
-            ).fetchall()
-        finally:
-            conn.close()
+        # 2026-04-24: migrated from sqlite3 to psycopg2 via Database class.
+        from pulse_bot.db import Database
+
+        db = Database(self._db_path)
+        rows = db._sync_query(
+            """
+            SELECT t.mint, t.created_at,
+                   COALESCE(ts.market_cap_sol, 0.0)     AS mc_at_score,
+                   COALESCE(ts.curve_progress_pct, 0.0) AS curve_pct,
+                   COALESCE(
+                     (SELECT MAX(tr.timestamp) FROM trades tr
+                      WHERE tr.mint = t.mint),
+                     t.created_at
+                   ) AS last_trade_ts
+            FROM tokens t
+            LEFT JOIN token_scores ts
+                   ON ts.mint = t.mint AND ts.source = 'live'
+            WHERE t.creator = ?
+              AND t.created_at IS NOT NULL
+              AND t.created_at < ?
+            ORDER BY t.created_at ASC
+            """,
+            (creator, ref_ts),
+        )
 
         if not rows:
             return None

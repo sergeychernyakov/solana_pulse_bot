@@ -19,6 +19,8 @@ import time
 from typing import AsyncIterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import psycopg2
+
 import pytest
 
 from pulse_bot.config import PulseBotConfig
@@ -270,6 +272,30 @@ def _make_replay_db(
     conn.commit()
     conn.close()
     return path
+
+
+def _populate_replay_pg(dsn: str, token: Token, trades: list[Trade]) -> None:
+    """Insert token and trades into an existing PostgreSQL test database."""
+    conn = psycopg2.connect(dsn)
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO tokens (mint, name, symbol, creator, created_at, uri, launchpad)"
+            " VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            (token.mint, token.name, token.symbol, token.creator,
+             token.created_at, token.uri or "", token.launchpad or "pumpfun"),
+        )
+        for trade in trades:
+            cur.execute(
+                "INSERT INTO trades (mint, wallet, tx_type, sol_amount, token_amount,"
+                " market_cap_sol, v_sol_in_bonding_curve, timestamp, is_creator)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (trade.mint, trade.wallet, trade.tx_type, trade.sol_amount,
+                 trade.token_amount, trade.market_cap_sol,
+                 trade.v_sol_in_bonding_curve, trade.timestamp,
+                 1 if trade.is_creator else 0),
+            )
+    conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -547,12 +573,13 @@ class TestReplayStreamTradesUsesIds:
         self,
         sample_token: Token,
         sample_trades: list[Trade],
+        pg_test_db: str,
     ) -> None:
         """Phase 0 yields trades in (created_at, created_at+fast]; phase 1 in the next window."""
         # Arrange -- sample_trades timestamps are created_at+1 through created_at+5
-        db_path = _make_replay_db(sample_token, sample_trades)
+        _populate_replay_pg(pg_test_db, sample_token, sample_trades)
 
-        replay = ReplayLaunchpad(db_path, speed=0.0)
+        replay = ReplayLaunchpad(pg_test_db, speed=0.0)
         replay._running = True
         replay._token_created_at[sample_token.mint] = sample_token.created_at
         replay._token_creators[sample_token.mint] = sample_token.creator
@@ -598,12 +625,13 @@ class TestReplayFastZeroTrades:
         self,
         sample_token: Token,
         sample_trades: list[Trade],
+        pg_test_db: str,
     ) -> None:
         """Fast window shorter than the first trade's delay yields nothing, full picks up all 6."""
         # Arrange -- first trade arrives at created_at+1.0; fast=0.5 cuts before it.
-        db_path = _make_replay_db(sample_token, sample_trades)
+        _populate_replay_pg(pg_test_db, sample_token, sample_trades)
 
-        replay = ReplayLaunchpad(db_path, speed=0.0)
+        replay = ReplayLaunchpad(pg_test_db, speed=0.0)
         replay._running = True
         replay._token_created_at[sample_token.mint] = sample_token.created_at
         replay._token_creators[sample_token.mint] = sample_token.creator

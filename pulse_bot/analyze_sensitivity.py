@@ -26,13 +26,22 @@ from __future__ import annotations
 
 import json
 import logging
-import sqlite3
 import statistics
 import sys
 from collections import defaultdict
 from typing import Any
 
+import psycopg2
+import psycopg2.extras
+
 from pulse_bot.config import get_config
+from pulse_bot.db import _resolve_dsn
+
+
+def _pg_conn(db_path: str):
+    """Legacy path → PG DSN."""
+    return psycopg2.connect(_resolve_dsn(db_path))
+
 
 logger = logging.getLogger(__name__)
 
@@ -47,12 +56,14 @@ def _sort_key(v: Any) -> tuple[int, Any]:
 
 
 def _latest_session(db_path: str) -> str | None:
-    conn = sqlite3.connect(db_path)
+    conn = _pg_conn(db_path)
     try:
-        row = conn.execute(
-            "SELECT optimizer_session FROM optimization_runs "
-            "ORDER BY created_at DESC LIMIT 1"
-        ).fetchone()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT optimizer_session FROM optimization_runs "
+                "ORDER BY created_at DESC LIMIT 1"
+            )
+            row = cur.fetchone()
         return row[0] if row else None
     finally:
         conn.close()
@@ -60,15 +71,16 @@ def _latest_session(db_path: str) -> str | None:
 
 def _load_all_runs(db_path: str, session: str) -> list[dict[str, Any]]:
     """Load ALL runs for a session (no filtering). Filtering is applied later."""
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
+    conn = _pg_conn(db_path)
     try:
-        rows = conn.execute(
-            "SELECT params, total_trades, total_pnl_sol, win_rate, "
-            "profit_factor, roi_pct FROM optimization_runs "
-            "WHERE optimizer_session = ?",
-            (session,),
-        ).fetchall()
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(
+                "SELECT params, total_trades, total_pnl_sol, win_rate, "
+                "profit_factor, roi_pct FROM optimization_runs "
+                "WHERE optimizer_session = %s",
+                (session,),
+            )
+            rows = cur.fetchall()
         runs: list[dict[str, Any]] = []
         for r in rows:
             try:

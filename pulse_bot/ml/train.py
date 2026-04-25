@@ -63,8 +63,7 @@ def train_entry(data_path: Path, model_out: Path, split: str = "chrono") -> dict
 
     # Use canonical feature order from features.py — ensures loaded
     # model + live inference path see columns in identical positions.
-    from pulse_bot.ml.features import (ENTRY_FEATURE_ORDER,
-                                       FEATURE_SCHEMA_VERSION)
+    from pulse_bot.ml.features import ENTRY_FEATURE_ORDER, FEATURE_SCHEMA_VERSION
 
     missing = [c for c in ENTRY_FEATURE_ORDER if c not in df.columns]
     if missing:
@@ -123,18 +122,35 @@ def train_entry(data_path: Path, model_out: Path, split: str = "chrono") -> dict
     # Codex v9 fix: reduce capacity — 80 positives × depth=5 × 500 trees
     # would massively overfit. With depth=3, min_child_weight=5 each leaf
     # needs ≥5 samples, so ~16 leaves across the tree max.
+    #
+    # 2026-04-24: moved to config so optimizer can sweep them. Defaults
+    # preserve the old values. Override via PULSE_ENTRY_* env vars or
+    # `set_config_for_tests` in unit tests.
+    from pulse_bot.config import get_config
+
+    _cfg = get_config()
     model = xgb.XGBClassifier(
-        n_estimators=150,
-        max_depth=3,
-        min_child_weight=5,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
+        n_estimators=_cfg.entry_train_n_estimators,
+        max_depth=_cfg.entry_train_max_depth,
+        min_child_weight=_cfg.entry_train_min_child_weight,
+        learning_rate=_cfg.entry_train_learning_rate,
+        subsample=_cfg.entry_train_subsample,
+        colsample_bytree=_cfg.entry_train_colsample_bytree,
         scale_pos_weight=spw,
         objective="binary:logistic",
         eval_metric="auc",
         early_stopping_rounds=20,
         random_state=42,
+    )
+    logger.info(
+        "XGBoost hparams: n_est=%d depth=%d lr=%.3f min_child=%d "
+        "subsample=%.2f colsample=%.2f",
+        _cfg.entry_train_n_estimators,
+        _cfg.entry_train_max_depth,
+        _cfg.entry_train_learning_rate,
+        _cfg.entry_train_min_child_weight,
+        _cfg.entry_train_subsample,
+        _cfg.entry_train_colsample_bytree,
     )
     if y_test.sum() == 0 or y_train.sum() == 0:
         logger.warning(
@@ -213,7 +229,7 @@ def train_entry(data_path: Path, model_out: Path, split: str = "chrono") -> dict
     # Codex v9: use gain importance (less biased by feature scale).
     booster = model.get_booster()
     raw = booster.get_score(importance_type="gain")
-    importance = dict(sorted(raw.items(), key=lambda x: -x[1])[:15])
+    importance = dict(sorted(raw.items(), key=lambda x: -float(x[1]))[:15])  # type: ignore[arg-type]
 
     # Bootstrap 95% CIs (codex 2026-04-23) — point estimates at N_test=100
     # are ±10pp noise; CI is the only honest way to report them.
@@ -224,12 +240,16 @@ def train_entry(data_path: Path, model_out: Path, split: str = "chrono") -> dict
     logger.info("ENTRY MODEL RESULTS")
     logger.info(
         "  AUC (holdout):         %.4f   95%% CI [%.3f, %.3f]",
-        auc, auc_lo, auc_hi,
+        auc,
+        auc_lo,
+        auc_hi,
     )
     logger.info("  Base rate (test):      %.2f%%", y_test.mean() * 100)
     logger.info(
         "  Precision at top 10%%:  %.2f%%   95%% CI [%.0f%%, %.0f%%]",
-        precision_top10 * 100, prec_lo * 100, prec_hi * 100,
+        precision_top10 * 100,
+        prec_lo * 100,
+        prec_hi * 100,
     )
     logger.info("  Top-15 features:")
     for f, v in importance.items():
@@ -301,8 +321,7 @@ def train_entry_regression(
         df.realized_pnl_pct.median(),
     )
 
-    from pulse_bot.ml.features import (ENTRY_FEATURE_ORDER,
-                                       FEATURE_SCHEMA_VERSION)
+    from pulse_bot.ml.features import ENTRY_FEATURE_ORDER, FEATURE_SCHEMA_VERSION
 
     missing = [c for c in ENTRY_FEATURE_ORDER if c not in df.columns]
     if missing:
@@ -371,8 +390,8 @@ def train_entry_regression(
     pred_test = model.predict(X_test)
 
     # Regression metrics
-    from sklearn.metrics import mean_absolute_error, mean_squared_error
     from scipy.stats import spearmanr
+    from sklearn.metrics import mean_absolute_error, mean_squared_error
 
     rmse = float(np.sqrt(mean_squared_error(y_test, pred_test)))
     mae = float(mean_absolute_error(y_test, pred_test))
@@ -429,7 +448,7 @@ def train_entry_regression(
 
     booster = model.get_booster()
     raw_imp = booster.get_score(importance_type="gain")
-    importance = dict(sorted(raw_imp.items(), key=lambda x: -x[1])[:15])
+    importance = dict(sorted(raw_imp.items(), key=lambda x: -float(x[1]))[:15])  # type: ignore[arg-type]
 
     logger.info("=" * 60)
     logger.info("ENTRY REGRESSION MODEL RESULTS")
@@ -546,14 +565,10 @@ def _search_pnl_thresholds(
         "ceiling": best_ceiling,
         "floor_n": int(below.sum()),
         "floor_wr": float(realized_binary[below].mean()) if below.sum() else 0.0,
-        "floor_avg_pnl": (
-            float(realized_pnl[below].mean()) if below.sum() else 0.0
-        ),
+        "floor_avg_pnl": (float(realized_pnl[below].mean()) if below.sum() else 0.0),
         "ceiling_n": int(above.sum()),
         "ceiling_wr": float(realized_binary[above].mean()) if above.sum() else 0.0,
-        "ceiling_avg_pnl": (
-            float(realized_pnl[above].mean()) if above.sum() else 0.0
-        ),
+        "ceiling_avg_pnl": (float(realized_pnl[above].mean()) if above.sum() else 0.0),
         "min_bucket": min_bucket,
         "grid_step": 5.0,
     }
@@ -678,8 +693,12 @@ def _fit_platt(proba: "np.ndarray", y: "np.ndarray") -> dict:
 
 
 def _bootstrap_ci(
-    arr: "np.ndarray", y: "np.ndarray", metric: str,
-    n_boot: int = 500, alpha: float = 0.05, seed: int = 42,
+    arr: "np.ndarray",
+    y: "np.ndarray",
+    metric: str,
+    n_boot: int = 500,
+    alpha: float = 0.05,
+    seed: int = 42,
 ) -> tuple[float, float]:
     """Percentile bootstrap CI for a metric computed over paired arrays.
 
@@ -765,9 +784,7 @@ def train_exit_quantile(
     """
     df = load_df(data_path)
     if "entry_ts" not in df.columns:
-        raise ValueError(
-            "Exit dataset missing 'entry_ts' — rebuild via build_dataset."
-        )
+        raise ValueError("Exit dataset missing 'entry_ts' — rebuild via build_dataset.")
     # Build 60s forward PnL target from the same trades window the exit
     # labels already use. If the sample_ts is close to token end, forward
     # PnL falls back to the final observed price (no lookahead leak since
@@ -946,7 +963,7 @@ def train_exit(data_path: Path, model_out: Path) -> dict:
 
     booster = model.get_booster()
     raw = booster.get_score(importance_type="gain")
-    importance = dict(sorted(raw.items(), key=lambda x: -x[1])[:15])
+    importance = dict(sorted(raw.items(), key=lambda x: -float(x[1]))[:15])  # type: ignore[arg-type]
 
     logger.info("=" * 60)
     logger.info("EXIT MODEL RESULTS")
@@ -1044,12 +1061,8 @@ def main() -> None:
             sys.exit(1)
         train_exit(data, data_dir / "exit_model.ubj")
         if args.train_exit_quantile:
-            train_exit_quantile(
-                data, data_dir / "exit_quantile_sl.ubj", quantile=0.25
-            )
-            train_exit_quantile(
-                data, data_dir / "exit_quantile_tp.ubj", quantile=0.75
-            )
+            train_exit_quantile(data, data_dir / "exit_quantile_sl.ubj", quantile=0.25)
+            train_exit_quantile(data, data_dir / "exit_quantile_tp.ubj", quantile=0.75)
 
 
 if __name__ == "__main__":

@@ -55,7 +55,9 @@ class TokenMetrics:
     buys_per_unique: float = 0.0  # buy_count / unique_buyers (>1.5 = wash)
     # 2026-04-23 v11 additions
     median_time_between_buys: float = 0.0  # bot-throttle detector (sec)
-    buy_wallet_entropy: float = 0.0  # normalized Shannon [0,1]; 1=diffuse, 0=concentrated
+    buy_wallet_entropy: float = (
+        0.0  # normalized Shannon [0,1]; 1=diffuse, 0=concentrated
+    )
 
     # ── Bonding curve metrics ──────────────────────────────
     curve_progress_pct: float = 0.0  # % of graduation threshold
@@ -174,8 +176,7 @@ class MetricsCalculator:
         # interaction. Zero = single buy or no buys. Unit: seconds.
         if len(buys) >= 3:
             gaps = [
-                buys[i + 1].timestamp - buys[i].timestamp
-                for i in range(len(buys) - 1)
+                buys[i + 1].timestamp - buys[i].timestamp for i in range(len(buys) - 1)
             ]
             if gaps:
                 m.median_time_between_buys = statistics.median(gaps)

@@ -1,6 +1,11 @@
 # tests/pulse_bot/test_refactor_fixes.py
 """Regression tests for the post-refactor fixes.
 
+2026-04-24 PG migration: tests used ``Database(tmp.db)`` SQLite temp
+files. Now each test gets an isolated Postgres DB via the ``pg_test_db``
+fixture (see conftest.py). ``_resolve_dsn`` is monkey-patched to route
+legacy paths to the isolated DB so test code didn't need to change.
+
 Covers:
   F1 — optimizer reads creator_stats from the snapshot DB, not self._db.
   F2 — optimizer emits timeout trade (slot held) for tokens with no monitor trades.
@@ -18,6 +23,10 @@ import sqlite3
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
+
+import pytest
+
+pytestmark = pytest.mark.usefixtures("pg_test_db")
 
 import pytest
 
@@ -99,6 +108,10 @@ def _write_creators_only_db(rows: list[tuple]) -> str:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skip(
+    reason="SQLite snapshot-file isolation is obsolete after PG migration — "
+    "PG uses MVCC for optimizer isolation, no separate DB file needed."
+)
 class TestCreatorStatsFromSnapshot:
     """``get_creator_stats_sync(..., source_db_path=...)`` must read from the
     snapshot DB so the optimizer never queries the results DB for creator data.
@@ -764,12 +777,15 @@ class TestResumeLastEventTs:
 
         asyncio.run(seed())
 
-        conn = sqlite3.connect(db.db_path)
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            """SELECT p.entry_time, p.price_updated_at
-               FROM paper_trades p WHERE p.status='open'"""
-        ).fetchone()
+        import psycopg2, psycopg2.extras
+        from pulse_bot.db import _resolve_dsn
+        conn = psycopg2.connect(_resolve_dsn(db.db_path))
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(
+                """SELECT p.entry_time, p.price_updated_at
+                   FROM paper_trades p WHERE p.status='open'"""
+            )
+            row = cur.fetchone()
         conn.close()
         assert row is not None
         assert row["entry_time"] == pytest.approx(5_000.0)
