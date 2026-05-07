@@ -12,7 +12,11 @@ from typing import Any, AsyncIterator
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from pulse_bot.config import PUMPFUN_GRADUATION_SOL, PulseBotConfig
+from pulse_bot.config import (
+    PUMPFUN_GRADUATION_SOL,
+    PUMPPORTAL_API_KEY,
+    PulseBotConfig,
+)
 from pulse_bot.launchpads.base import Launchpad
 from pulse_bot.models import Token, Trade
 
@@ -39,9 +43,11 @@ class PumpFunLaunchpad(Launchpad):
         self._create_queue: asyncio.Queue[dict] = asyncio.Queue()
         self._trade_queues: dict[str, asyncio.Queue[dict]] = {}
         self._reader_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._watchdog_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._running = False
         self._graduation_sol = PUMPFUN_GRADUATION_SOL
         self._token_creators: dict[str, str] = {}
+        self._last_msg_ts = 0.0
 
     # ── Lifecycle ──────────────────────────────────────────────
 
@@ -71,18 +77,21 @@ class PumpFunLaunchpad(Launchpad):
                 if attempts >= 5:
                     raise
                 await asyncio.sleep(delay)
+        self._last_msg_ts = time.time()
         self._reader_task = asyncio.create_task(self._ws_reader_loop())
-        logger.info("PumpFun WS connected and reader started")
+        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+        logger.info("PumpFun WS connected, reader + watchdog started")
 
     async def disconnect(self) -> None:
         """Stop reader and close WS."""
         self._running = False
-        if self._reader_task and not self._reader_task.done():
-            self._reader_task.cancel()
-            try:
-                await self._reader_task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._reader_task, self._watchdog_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         if self._ws:
             await self._ws.close()
             self._ws = None
@@ -223,9 +232,26 @@ class PumpFunLaunchpad(Launchpad):
     # ── Internal ───────────────────────────────────────────────
 
     async def _establish_connection(self) -> None:
-        """Connect to WS and send initial subscription."""
+        """Connect to WS and send initial subscription.
+
+        2026-05-02: ping_timeout 10→60s — at 50%+ CPU + many concurrent
+        Helius captures + ML inference + survival ticks, the asyncio
+        event loop can't always respond to PumpPortal's ping within 10s.
+
+        2026-05-04: append ?api-key=… when PUMPPORTAL_API_KEY is set —
+        without it `subscribeTokenTrade` is silently rejected.
+        """
+        url = self.ws_url
+        if PUMPPORTAL_API_KEY:
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}api-key={PUMPPORTAL_API_KEY}"
+        else:
+            logger.warning(
+                "PUMPPORTAL_API_KEY not set — `subscribeTokenTrade` will "
+                "be silently rejected; trade ingestion will not work"
+            )
         self._ws = await websockets.connect(
-            self.ws_url, ping_interval=30, ping_timeout=10
+            url, ping_interval=30, ping_timeout=60
         )
         await self._ws.send(json.dumps({"method": "subscribeNewToken"}))
         logger.info("Subscribed to new tokens on PumpFun")
@@ -261,6 +287,7 @@ class PumpFunLaunchpad(Launchpad):
                             {"method": "subscribeTokenTrade", "keys": [mint]}
                         )
                         await self._ws.send(sub_msg)
+                    self._last_msg_ts = time.time()
                     reconnect_count = 0
                     logger.info("WS reconnected successfully")
                 except Exception as reconn_err:
@@ -278,12 +305,19 @@ class PumpFunLaunchpad(Launchpad):
                 await asyncio.sleep(1.0)
 
     async def _read_messages(self) -> None:
-        """Read and route messages from the WS connection."""
+        """Read and route messages from the WS connection.
+
+        Unrecognised payloads (anything that isn't a create/buy/sell event)
+        are surfaced at WARNING — PumpPortal sends ack/error messages here
+        too, and silently dropping them masked the 2026-05-04 auth gating
+        bug for 3 days.
+        """
         if not self._ws:
             return
         async for raw_msg in self._ws:
             if not self._running:
                 break
+            self._last_msg_ts = time.time()
             try:
                 data = json.loads(raw_msg)
             except json.JSONDecodeError:
@@ -298,3 +332,36 @@ class PumpFunLaunchpad(Launchpad):
                 queue = self._trade_queues.get(mint)
                 if queue is not None:
                     await queue.put(data)
+            else:
+                if "errors" in data or "error" in data or "message" in data:
+                    logger.warning("PumpPortal WS response: %s", data)
+
+    async def _watchdog_loop(self) -> None:
+        """Force reconnect if WS goes silent for too long.
+
+        With ``ping_interval=None`` we no longer rely on RFC ping/pong
+        for liveness. PumpPortal occasionally goes silent (no create
+        events, no trade events) for extended periods — observed
+        2026-05-04 with bursts of activity right after reconnect then
+        180s+ of total silence. Threshold is conservative (5 min) so
+        this only fires for genuinely-dead connections, not slow
+        memecoin hours.
+        """
+        SILENCE_LIMIT = 300.0
+        while self._running:
+            await asyncio.sleep(30.0)
+            if not self._running or self._ws is None:
+                continue
+            if self._last_msg_ts == 0.0:
+                continue  # not started receiving yet
+            silence = time.time() - self._last_msg_ts
+            if silence > SILENCE_LIMIT:
+                logger.warning(
+                    "WS silent for %.0fs — closing to force reconnect",
+                    silence,
+                )
+                self._last_msg_ts = 0.0
+                try:
+                    await self._ws.close()
+                except Exception:
+                    pass

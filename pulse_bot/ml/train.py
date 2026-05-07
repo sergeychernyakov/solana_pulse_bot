@@ -181,27 +181,49 @@ def train_entry(data_path: Path, model_out: Path, split: str = "chrono") -> dict
     precision_top10 = y_test[mask].mean() if mask.sum() else 0.0
 
     # ── Confidence-gating: threshold search on val (not test) ──────
-    # Returned thresholds feed EntryMLPolicy.decide_with_confidence()
-    # at inference time. PROBA_FLOOR tuned so that the low-proba bucket
-    # has the lowest achievable WR (saves us from false positives that
-    # rules would otherwise buy). PROBA_CEILING tuned to maximise
-    # precision on the high-proba bucket subject to min-count floor.
-    thresholds = _search_confidence_thresholds(proba_val, y_val.values)
+    # 2026-04-27: switched WR-based search to EV-based (codex review).
+    # Now optimizes mean realized_pnl_pct per bucket — i.e. money, not
+    # accuracy. Falls back to WR if pnl column missing.
+    pnl_val = (
+        val_df["realized_pnl_pct"].values
+        if "realized_pnl_pct" in val_df.columns
+        else None
+    )
+    thresholds = _search_confidence_thresholds(
+        proba_val, y_val.values, pnl=pnl_val
+    )
     logger.info(
-        "Confidence-gating thresholds (val-tuned): FLOOR=%.3f CEILING=%.3f",
+        "Confidence-gating thresholds (val-tuned, objective=%s): "
+        "FLOOR=%.3f CEILING=%.3f",
+        thresholds.get("objective", "wr"),
         thresholds["floor"],
         thresholds["ceiling"],
     )
-    logger.info(
-        "  below FLOOR: n=%d WR=%.2f%%",
-        thresholds["floor_n"],
-        thresholds["floor_wr"] * 100,
-    )
-    logger.info(
-        "  above CEILING: n=%d WR=%.2f%%",
-        thresholds["ceiling_n"],
-        thresholds["ceiling_wr"] * 100,
-    )
+    if "floor_ev" in thresholds:
+        logger.info(
+            "  below FLOOR: n=%d WR=%.2f%% EV=%+.2f%% (val_base=%+.2f%%)",
+            thresholds["floor_n"],
+            thresholds["floor_wr"] * 100,
+            thresholds["floor_ev"],
+            thresholds["val_base_ev"],
+        )
+        logger.info(
+            "  above CEILING: n=%d WR=%.2f%% EV=%+.2f%%",
+            thresholds["ceiling_n"],
+            thresholds["ceiling_wr"] * 100,
+            thresholds["ceiling_ev"],
+        )
+    else:
+        logger.info(
+            "  below FLOOR: n=%d WR=%.2f%%",
+            thresholds["floor_n"],
+            thresholds["floor_wr"] * 100,
+        )
+        logger.info(
+            "  above CEILING: n=%d WR=%.2f%%",
+            thresholds["ceiling_n"],
+            thresholds["ceiling_wr"] * 100,
+        )
 
     # ── Platt calibration on val ────────────────────────────────────
     # Fit a single-feature logistic regression proba_raw → label on val
@@ -256,8 +278,17 @@ def train_entry(data_path: Path, model_out: Path, split: str = "chrono") -> dict
         logger.info("    %.4f  %s", v, f)
     logger.info("=" * 60)
 
+    # Codex 2026-04-28 critical fixes (d), (f): pre-save sanity gates.
+    # Compute health flags BEFORE overwriting model artifact, so the live
+    # policy can refuse to act on a broken retrain.
+    health = _entry_model_health_check(
+        model_out=model_out,
+        proba_val=proba_val,
+        new_auc=auc,
+        thresholds=thresholds,
+    )
     model.save_model(model_out)
-    logger.info("Saved model to %s", model_out)
+    logger.info("Saved model to %s (health=%s)", model_out, health["status"])
     # Save feature list + thresholds + calibration alongside model.
     # config_hash + config_values pin the training-time PulseBotConfig
     # subset that affects labels/features/hparams. Live policy compares
@@ -293,6 +324,7 @@ def train_entry(data_path: Path, model_out: Path, split: str = "chrono") -> dict
                 "config_fields_version": 1,
                 "config_field_names": list(TRAIN_RELEVANT_FIELDS),
                 "config_values": config_values,
+                "model_health": health,
             },
             indent=2,
         )
@@ -411,7 +443,14 @@ def train_entry_t30(data_path: Path, model_out: Path, split: str = "chrono") -> 
     mask = proba_test >= thresh
     precision_top10 = y_test[mask].mean() if mask.sum() else 0.0
 
-    thresholds = _search_confidence_thresholds(proba_val, y_val.values)
+    pnl_val_t30 = (
+        val_df["realized_pnl_pct"].values
+        if "realized_pnl_pct" in val_df.columns
+        else None
+    )
+    thresholds = _search_confidence_thresholds(
+        proba_val, y_val.values, pnl=pnl_val_t30
+    )
     calib = _fit_platt(proba_val, y_val.values)
     test_metrics = _evaluate_gated(proba_test, y_test.values, thresholds, calib)
 
@@ -808,55 +847,231 @@ def _evaluate_gated_regression(
     }
 
 
+def _entry_model_health_check(
+    *,
+    model_out: "Path",
+    proba_val: "np.ndarray",
+    new_auc: float,
+    thresholds: dict,
+) -> dict:
+    """Codex review 2026-04-28: pre-save sanity gates on a freshly-trained
+    entry model. Three signals:
+
+    - **proba_spread** (p99 − p1 on val): if < 0.30 the model outputs a
+      narrow band → no ranking power regardless of holdout AUC. Today's
+      live model: spread = 0.61 − 0.37 = 0.24, AUC=0.825 — passed AUC
+      check yet was completely useless for thresholding.
+    - **threshold_status**: surfaces the floor>=ceiling collapse that
+      ``_search_confidence_thresholds`` now detects + flags.
+    - **auc_regression**: compare against previous meta.json AUC. If the
+      new run dropped by >2pp, mark for rollback (caller decides). Today
+      we silently overwrote 0.905 → 0.891 → 0.825.
+
+    Returns ``{status, proba_spread, prev_auc, auc_delta, threshold_status,
+    notes}``. ``status`` ∈ {"ok", "degenerate", "narrow_proba_spread",
+    "auc_regression"}. The live policy reads this and disables ML override
+    when status != "ok".
+    """
+    import numpy as _np
+
+    out: dict = {}
+    # 1. proba spread on val
+    p_lo = float(_np.quantile(proba_val, 0.01))
+    p_hi = float(_np.quantile(proba_val, 0.99))
+    spread = p_hi - p_lo
+    out["proba_p1"] = p_lo
+    out["proba_p99"] = p_hi
+    out["proba_spread"] = spread
+
+    # 2. threshold-search status (set by _search_confidence_thresholds)
+    out["threshold_status"] = thresholds.get("status", "unknown")
+
+    # 3. AUC regression vs prior meta
+    meta_prev = model_out.with_suffix(".meta.json")
+    prev_auc = None
+    if meta_prev.exists():
+        try:
+            prev = json.loads(meta_prev.read_text())
+            prev_auc = float(prev.get("auc") or 0.0)
+        except Exception:
+            prev_auc = None
+    out["prev_auc"] = prev_auc
+    out["auc_delta"] = (new_auc - prev_auc) if prev_auc is not None else None
+
+    # Decide overall status (most-severe wins).
+    notes: list[str] = []
+    status = "ok"
+    # ok_percentile_fallback is acceptable: EV search collapsed but
+    # ranking enrichment verified, gates are usable. Anything else
+    # (degenerate_flat, unknown, ...) is treated as degenerate.
+    if out["threshold_status"] not in ("ok", "ok_percentile_fallback"):
+        status = "degenerate"
+        notes.append(f"threshold search returned {out['threshold_status']}")
+    if spread < 0.30:
+        if status == "ok":
+            status = "narrow_proba_spread"
+        notes.append(f"val proba spread {spread:.3f} < 0.30 — no ranking power")
+    if prev_auc is not None and (new_auc - prev_auc) < -0.02:
+        if status == "ok":
+            status = "auc_regression"
+        notes.append(
+            f"AUC dropped {prev_auc:.4f} → {new_auc:.4f} (Δ={new_auc - prev_auc:+.4f}) "
+            "— consider rollback to .prev artifact"
+        )
+    out["status"] = status
+    out["notes"] = notes
+
+    # Snapshot the previous model BEFORE the caller overwrites it. Lets
+    # operations roll back via:
+    #   mv data/ml/entry_model.ubj.prev data/ml/entry_model.ubj
+    #   mv data/ml/entry_model.meta.json.prev data/ml/entry_model.meta.json
+    if model_out.exists():
+        try:
+            import shutil
+            shutil.copy2(model_out, model_out.with_suffix(model_out.suffix + ".prev"))
+            if meta_prev.exists():
+                shutil.copy2(
+                    meta_prev,
+                    meta_prev.with_suffix(meta_prev.suffix + ".prev"),
+                )
+        except Exception as e:
+            logger.warning("Failed to snapshot prev model: %s", e)
+            notes.append(f"snapshot failed: {e}")
+
+    if status != "ok":
+        logger.warning("=" * 60)
+        logger.warning("MODEL HEALTH ALERT — status=%s", status)
+        for n in notes:
+            logger.warning("  - %s", n)
+        logger.warning(
+            "Live policy will refuse ML override on this model. To force "
+            "anyway, set PULSE_ALLOW_DEGENERATE_MODEL=1 (unsafe)."
+        )
+        logger.warning("=" * 60)
+    else:
+        logger.info(
+            "Model health: OK (spread=%.3f, threshold=%s, ΔAUC=%s)",
+            spread,
+            out["threshold_status"],
+            f"{out['auc_delta']:+.4f}" if out["auc_delta"] is not None else "n/a",
+        )
+    return out
+
+
 def _search_confidence_thresholds(
     proba: "np.ndarray",
     y: "np.ndarray",
+    pnl: "np.ndarray | None" = None,
 ) -> dict:
     """Grid-search PROBA_FLOOR and PROBA_CEILING on a validation set.
 
-    FLOOR: choose proba value such that the ``below-floor`` bucket is at
-    least ``min_bucket`` samples and has the lowest empirical WR.
-    CEILING: choose proba value such that ``above-ceiling`` bucket is at
-    least ``min_bucket`` samples and has the highest empirical WR.
+    Codex 2026-04-27 review: WR-only search optimizes binary classification
+    accuracy — but we trade with money, not labels. WR=22% with avg_W=22.9%
+    avg_L=-10.2% is loss-making (EV=-2.92%/trade). Switched to EV-based
+    search when ``pnl`` (realized_pnl_pct) is provided:
 
-    Codex 2026-04-23: widened from min_bucket=10 + 0.05 grid to
-    min_bucket=30 + 0.1 grid to reduce selection bias on small val sets
-    (previous tuning showed val CEILING WR 43% collapsed to 32% on test
-    — a classic max-over-noise positive bias). Coarser grid + wider
-    bucket mean we can't *tune* to a narrow spike of ~18 positives.
+      * CEILING: maximise mean(pnl) above threshold (highest-EV bucket
+        the model can identify; this is where we want to BUY).
+      * FLOOR:   minimise mean(pnl) below threshold (lowest-EV bucket;
+        this is where we want to SKIP).
+
+    When ``pnl`` is None, falls back to legacy WR-based search (callers
+    that don't have realized_pnl_pct hand still work).
+
+    min_bucket=30 + 0.1 grid (codex 2026-04-23 tightening) preserved to
+    reduce selection bias on small val sets — same N-floor logic, EV
+    instead of WR as the optimization objective.
     """
     import numpy as np
 
     min_bucket = 30
     grid = np.arange(0.10, 0.91, 0.1)  # 0.1 steps, 9 points
     base_wr = float(y.mean()) if len(y) else 0.0
+    use_ev = pnl is not None and len(pnl) == len(proba)
 
-    # FLOOR: seek low WR below threshold.
+    if use_ev:
+        # Defensive clip — extreme PnL outliers (e.g. unbounded "moonshot"
+        # entries with bad price feeds) would otherwise dominate the
+        # bucket mean and lock CEILING to a ~5-row spike. Clip to the
+        # economically meaningful range our exit logic enforces.
+        pnl_c = np.clip(pnl, -100.0, 200.0)
+    base_ev = float(pnl_c.mean()) if use_ev else 0.0
+
+    # FLOOR: seek lowest EV (or WR fallback) below threshold.
     best_floor = 0.30
+    best_floor_score = float("inf")
     best_floor_wr = 1.0
     for t in grid:
         mask = proba < t
         if mask.sum() < min_bucket:
             continue
-        wr = float(y[mask].mean())
-        if wr < best_floor_wr:
-            best_floor_wr = wr
+        if use_ev:
+            score = float(pnl_c[mask].mean())
+        else:
+            score = float(y[mask].mean())
+        if score < best_floor_score:
+            best_floor_score = score
             best_floor = float(t)
-    # CEILING: seek high WR above threshold.
+            best_floor_wr = float(y[mask].mean())
+    # CEILING: seek highest EV (or WR fallback) above threshold.
     best_ceiling = 0.70
+    best_ceiling_score = -float("inf")
     best_ceiling_wr = 0.0
     for t in grid:
         mask = proba >= t
         if mask.sum() < min_bucket:
             continue
-        wr = float(y[mask].mean())
-        if wr > best_ceiling_wr:
-            best_ceiling_wr = wr
+        if use_ev:
+            score = float(pnl_c[mask].mean())
+        else:
+            score = float(y[mask].mean())
+        if score > best_ceiling_score:
+            best_ceiling_score = score
             best_ceiling = float(t)
-    # Final recount with chosen thresholds
+            best_ceiling_wr = float(y[mask].mean())
+    # Codex 2026-04-28: degeneracy guard with percentile fallback.
+    # When EV is monotonically flat / negative across all proba slices
+    # (typical on memecoin datasets where avg_pnl is heavily skewed),
+    # EV-search returns floor >= ceiling. Previously we marked the
+    # whole model "degenerate" — but if the classifier still RANKS
+    # (top-quintile WR >> bottom-quintile WR), percentile-based gates
+    # are perfectly valid even without positive-EV buckets. Split:
+    #
+    #   ok                       — EV-based gates found a profitable bucket
+    #   ok_percentile_fallback   — EV flat but ranking enrichment present
+    #   degenerate_flat          — no ranking power; do not act
+    status = "ok"
+    if best_floor >= best_ceiling:
+        # EV-based search collapsed. Fall back to proba quintiles and
+        # verify the model still has classification power.
+        try:
+            best_floor = float(np.quantile(proba, 0.20))
+            best_ceiling = float(np.quantile(proba, 0.80))
+        except Exception:
+            best_floor, best_ceiling = 0.30, 0.70
+        above_mask = proba >= best_ceiling
+        below_mask = proba < best_floor
+        above_wr_chk = (
+            float(y[above_mask].mean()) if above_mask.sum() else 0.0
+        )
+        below_wr_chk = (
+            float(y[below_mask].mean()) if below_mask.sum() else 1.0
+        )
+        # Ranking enrichment: top quintile must show ≥1.3× base WR
+        # AND bottom quintile must show ≤0.7× base WR. Both directions
+        # required so a single-tail model (e.g. only confident-skip) is
+        # not mistaken for a working ranker.
+        if (
+            base_wr > 0
+            and above_wr_chk >= base_wr * 1.3
+            and below_wr_chk <= base_wr * 0.7
+        ):
+            status = "ok_percentile_fallback"
+        else:
+            status = "degenerate_flat"
     below = proba < best_floor
     above = proba >= best_ceiling
-    return {
+    out = {
         "floor": best_floor,
         "ceiling": best_ceiling,
         "floor_n": int(below.sum()),
@@ -866,7 +1081,14 @@ def _search_confidence_thresholds(
         "val_base_rate": base_wr,
         "min_bucket": min_bucket,
         "grid_step": 0.1,
+        "objective": "ev" if use_ev else "wr",
+        "status": status,
     }
+    if use_ev:
+        out["floor_ev"] = float(pnl_c[below].mean()) if below.sum() else 0.0
+        out["ceiling_ev"] = float(pnl_c[above].mean()) if above.sum() else 0.0
+        out["val_base_ev"] = base_ev
+    return out
 
 
 def _fit_platt(proba: "np.ndarray", y: "np.ndarray") -> dict:
@@ -993,30 +1215,16 @@ def train_exit_quantile(
     df = load_df(data_path)
     if "entry_ts" not in df.columns:
         raise ValueError("Exit dataset missing 'entry_ts' — rebuild via build_dataset.")
-    # Build 60s forward PnL target from the same trades window the exit
-    # labels already use. If the sample_ts is close to token end, forward
-    # PnL falls back to the final observed price (no lookahead leak since
-    # by this time the trade-stream is truly exhausted).
-    #
-    # Dataset builder already provides peak_pnl_pct and drawdown_from_peak
-    # as state-at-decision-time. The regression target must be the return
-    # between sample_ts and sample_ts+60s — reconstructing from ``trades``
-    # is out of scope here (train_exit_quantile operates on the parquet).
-    # We approximate with: future_pnl ≈ peak_pnl - drawdown_at_t+60s. At
-    # dataset build time, would need a new column `forward_pnl_60s`.
-    #
-    # For now, the realistic target is the change from current_pnl_pct to
-    # final_pnl_pct of the position. We don't have that column either.
-    # Workaround: use peak_pnl_pct - current_pnl_pct (absolute drawdown
-    # potential). This is a monotone proxy for "how bad can it get" and
-    # aligns with SL/TP semantics.
+    # Target: 60s forward realized return, computed at build-time from
+    # the trades table (build_dataset.py:866). The legacy proxy fallback
+    # using `-drawdown_from_peak` was removed 2026-04-27 (codex review):
+    # column is reliably present, fallback was training quantile heads
+    # on the wrong target and dragging Spearman down to 0.11/0.17.
     if "forward_pnl_60s" not in df.columns:
-        logger.warning(
-            "exit.parquet has no forward_pnl_60s column — using "
-            "drawdown_from_peak as quantile target (proxy). Rebuild "
-            "dataset with forward window for honest regression."
+        raise ValueError(
+            "exit.parquet missing 'forward_pnl_60s' — rebuild via "
+            "`python -m pulse_bot.ml.build_dataset --dataset exit`."
         )
-        df["forward_pnl_60s"] = -df["drawdown_from_peak"]
 
     mints_order = df.drop_duplicates("mint").sort_values("entry_ts")["mint"].tolist()
     cut_mint = mints_order[int(len(mints_order) * 0.8)]
@@ -1089,6 +1297,151 @@ def train_exit_quantile(
         )
     )
     logger.info("Saved quantile model to %s", model_out)
+    return {"quantile": quantile, "coverage": coverage, "spearman_rho": rho}
+
+
+def train_exit_quantile_max_hold(
+    data_path: Path, model_out: Path, quantile: float = 0.75
+) -> dict:
+    """Quantile regression for time-to-exit under live policy.
+
+    Target: ``forward_seconds_to_exit`` — simulated time the live exit
+    policy (TP/SL/max_hold + monitor signals) would hold a position
+    entered at the current state. q=0.75 by default: predict a hold time
+    long enough that 75% of similar states stay in until the simulated
+    exit. Used to set per-token max_hold dynamically.
+
+    History:
+        v1 (2026-04-27): target was ``forward_seconds_to_peak`` — produced
+            ρ=-0.196 anti_correlated due to survivor bias (DOA→sec=0,
+            pumpers→sec=600, model learned the inverse).
+        v2 (2026-04-30): replaced with simulate_exit-driven label. Now
+            matches the live policy semantics — what the model is asked
+            to predict at inference equals how the label was generated.
+    """
+    df = load_df(data_path)
+    if "entry_ts" not in df.columns:
+        raise ValueError("Exit dataset missing 'entry_ts' — rebuild via build_dataset.")
+    if "forward_seconds_to_exit" not in df.columns:
+        raise ValueError(
+            "exit.parquet missing 'forward_seconds_to_exit' — rebuild "
+            "via `python -m pulse_bot.ml.build_dataset --dataset exit`."
+        )
+
+    # 2026-04-28 fix: drop right-censored rows where peak wasn't observed
+    # within the 600s horizon. Previously >90% of rows had y=600 (no peak
+    # found) and the regressor learned a near-constant — Spearman -0.21.
+    # Training only on observed-peak rows + emitting a coverage health
+    # flag is the right structural fix until we have post-T+600 data.
+    HORIZON = 600.0
+    censored_mask = df["forward_seconds_to_exit"] >= HORIZON - 0.001
+    n_censored = int(censored_mask.sum())
+    n_observed = int(len(df) - n_censored)
+    coverage = n_observed / max(len(df), 1)
+    logger.info(
+        "exit_quantile_max_hold: %d/%d rows (%.1f%%) had observable peak "
+        "within %.0fs horizon (rest are right-censored, dropped from "
+        "training)",
+        n_observed,
+        len(df),
+        coverage * 100,
+        HORIZON,
+    )
+    if n_observed < 200:
+        raise ValueError(
+            f"exit_quantile_max_hold: only {n_observed} non-censored rows "
+            "— insufficient signal to train. Wait until T+180+ data "
+            "accumulates (>1k observed peaks expected after 1-2 weeks)."
+        )
+    df_obs = df[~censored_mask].copy()
+
+    mints_order = df_obs.drop_duplicates("mint").sort_values("entry_ts")["mint"].tolist()
+    if len(mints_order) < 5:
+        raise ValueError(
+            "exit_quantile_max_hold: too few unique mints with observed "
+            "peaks for chrono split. Wait for more data."
+        )
+    cut_mint = mints_order[int(len(mints_order) * 0.8)]
+    cut_ts = df_obs.loc[df_obs.mint == cut_mint, "entry_ts"].iloc[0]
+    train_mask = df_obs.entry_ts < cut_ts
+
+    from pulse_bot.ml.features import EXIT_FEATURE_ORDER
+
+    missing = [c for c in EXIT_FEATURE_ORDER if c not in df_obs.columns]
+    if missing:
+        raise ValueError(
+            f"exit.parquet missing canonical features {missing}. "
+            "Rebuild via build_dataset before training."
+        )
+    feature_cols = list(EXIT_FEATURE_ORDER)
+    X_train = df_obs.loc[train_mask, feature_cols]
+    y_train = df_obs.loc[train_mask, "forward_seconds_to_exit"].clip(0, HORIZON).values
+    X_test = df_obs.loc[~train_mask, feature_cols]
+    y_test = df_obs.loc[~train_mask, "forward_seconds_to_exit"].clip(0, HORIZON).values
+
+    model = xgb.XGBRegressor(
+        objective="reg:quantileerror",
+        quantile_alpha=quantile,
+        n_estimators=200,
+        max_depth=3,
+        min_child_weight=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        early_stopping_rounds=20,
+        random_state=42,
+    )
+    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+    pred_test = model.predict(X_test)
+
+    coverage_q = float((y_test <= pred_test).mean())
+    from scipy.stats import spearmanr
+
+    rho, _ = spearmanr(pred_test, y_test)
+    rho = float(rho) if not np.isnan(rho) else 0.0
+    # Health gate: refuse to deploy if Spearman is anti-correlated or
+    # near-zero. Old artifact had rho=-0.21 (model predicted opposite
+    # of reality). New training on non-censored rows must beat that
+    # by a wide margin.
+    status = "ok" if rho >= 0.10 else (
+        "anti_correlated" if rho < 0 else "weak_signal"
+    )
+    logger.info("=" * 60)
+    logger.info("EXIT QUANTILE max_hold (q=%.2f) RESULTS", quantile)
+    logger.info("  Coverage (target ≈ %.2f): %.3f", quantile, coverage_q)
+    logger.info("  Spearman rho: %.4f (status=%s)", rho, status)
+    logger.info("  Train rows: %d, Test rows: %d", len(X_train), len(X_test))
+    logger.info("  Observed-peak coverage: %.1f%% (rest right-censored, dropped)",
+                coverage * 100)
+    logger.info("  Pred range: [%.1f, %.1f]s", pred_test.min(), pred_test.max())
+    logger.info("=" * 60)
+
+    model.save_model(model_out)
+    meta_out = model_out.with_suffix(".meta.json")
+    meta_out.write_text(
+        json.dumps(
+            {
+                "objective": "reg:quantileerror",
+                "quantile": quantile,
+                "target": "forward_seconds_to_exit",
+                "horizon_sec": 600.0,
+                "features": feature_cols,
+                "coverage": coverage_q,
+                "non_censored_coverage": coverage,
+                "spearman_rho": rho,
+                "train_rows": int(len(X_train)),
+                "test_rows": int(len(X_test)),
+                "model_health": {"status": status, "spearman": rho},
+                "note": (
+                    "Shadow-only until paired-bootstrap gate passes vs "
+                    "static max_hold default. Wire through "
+                    "PULSE_EXIT_MAX_HOLD_DYNAMIC=1 only after validation."
+                ),
+            },
+            indent=2,
+        )
+    )
+    logger.info("Saved max_hold quantile model to %s", model_out)
     return {"quantile": quantile, "coverage": coverage, "spearman_rho": rho}
 
 
@@ -1267,10 +1620,16 @@ def main() -> None:
         if data is None:
             logger.error("No exit.parquet or exit.csv in %s", data_dir)
             sys.exit(1)
-        train_exit(data, data_dir / "exit_model.ubj")
+        # 2026-04-27: dropped train_exit (binary classifier exit_v3).
+        # Model contributed ~0% to live decisions (proba≥0.80 threshold
+        # rarely fired, overlapped with hard rules). Quantile heads
+        # below replace it with regression-based per-token thresholds.
         if args.train_exit_quantile:
             train_exit_quantile(data, data_dir / "exit_quantile_sl.ubj", quantile=0.25)
             train_exit_quantile(data, data_dir / "exit_quantile_tp.ubj", quantile=0.75)
+            train_exit_quantile_max_hold(
+                data, data_dir / "exit_quantile_max_hold.ubj", quantile=0.75
+            )
 
 
 if __name__ == "__main__":

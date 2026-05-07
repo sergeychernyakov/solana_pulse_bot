@@ -56,12 +56,14 @@ SCORER_FEATURES: list[str] = [
     "buys_per_unique",
     "curve_velocity",
     "curve_acceleration",
-    "creator_tokens_today",
+    # 2026-04-27 v19 cleanup: removed creator_tokens_today + fast_sell_ratio
+    # — stable-dead in TWO sequential 5-seed runs (Apr 25 + Apr 26).
+    # Data still computed by metrics.py and stored on token_scores;
+    # only the ML feature schema drops them.
     "fast_buy_count",
     "fast_unique_buyers",
     "fast_volume_sol",
     "fast_buy_rate",
-    "fast_sell_ratio",
     # 2026-04-23 v10 cleanup: removed has_uri (zero variance on
     # pump.fun — 99% of mints carry metadata).
     "tokens_last_5min",
@@ -97,6 +99,12 @@ SCORER_FEATURES: list[str] = [
     # so XGBoost learns a "no regime data" split path separately from
     # "SOL was at $X".
     "sol_price_usd",
+    # 2026-04-29 — creator_self_buy_position WAS added here (v22) but
+    # rolled back 2026-04-30: bumping schema before retraining the model
+    # caused a feature-list mismatch on bot restart and forced rules-only
+    # fallback. Field still computed in MetricsCalculator + ScoringResult,
+    # just not in the ML schema. Re-add on the NEXT retrain after fresh
+    # EXTENDED_OBSERVE labels accumulate.
     # TODO(Phase A2): market-context features (pumpfun_tokens_per_min,
     # graduated_last_hour, creator_active_tokens_now,
     # days_since_creator_last_token). Require scorer.py changes to
@@ -185,14 +193,13 @@ CREATOR_FEATURES: list[str] = [
     "creator_age_days",
     "creator_median_peak_mc_sol",
     "creator_inter_token_interval_sec",
-    "creator_total_prior_tokens",
     "creator_balance_sol",
     # 2026-04-24 v13 cleanup: removed `creator_rug_count` — STABLE_DEAD
-    # in TWO sequential schema versions (entry_v11 and entry_v12 runs,
-    # gain=0 across 5 seeds each time). Per feature-stability protocol,
-    # safe to remove. `creator_graduated_count` stays — only one DEAD
-    # reading so far (needs 2 consecutive to drop).
-    "creator_graduated_count",
+    # in TWO sequential schema versions (entry_v11 and entry_v12 runs).
+    # 2026-04-27 v19 cleanup: removed `creator_total_prior_tokens` and
+    # `creator_graduated_count` — STABLE_DEAD in TWO sequential 5-seed
+    # runs (Apr 25 v18 + Apr 26 v18 with extended_observe corpus).
+    # Data still in creator_snapshots; only ML schema drops them.
 ]
 
 # Phase E (2026-04-24): top-3 buyer prior-activity features. Computed
@@ -209,6 +216,15 @@ WALLET_FEATURES: list[str] = [
     "top3_buyer_prior_avg_wr",  # avg WR across top-3 that have any closed
     "top3_buyer_max_prior_pnl_sol",  # best prior winner among top-3
     "top3_buyer_wallet_age_days_avg",  # mean days since first seen
+    # v20 (2026-04-27) — codex review minimal wallet additions:
+    "top10_buyer_prior_avg_wr",  # extends top-3 prior-WR to top-10 buyers
+    "top10_buyer_prior_total_pnl_sol",  # sum of priors over top-10 buyers
+    "n_buyers_first_5s",  # sniper proxy: count of buys with age<5s post-mint
+    # v21 (2026-04-28) — wallet_classifications JOIN (4 new features):
+    "n_snipers_in_top10",  # is_sniper=1 in top-10 buyers (bot-cluster signal)
+    "n_smart_money_in_top10",  # is_smart_money=1 (>40% WR on graduated)
+    "n_bots_in_top10",  # is_bot=1 (strict subset, n_buys_30d≥500)
+    "n_in_small_cluster_top10",  # in cluster of size 3-50 (real wash group)
 ]
 
 # Phase 2.5 (2026-04-25): time-aware snapshots in the MAIN entry model.
@@ -274,7 +290,16 @@ ENTRY_FEATURE_ORDER: list[str] = [
 
 # Bumped on any schema change. Prediction path refuses to load models
 # whose meta.json reports a different version.
-FEATURE_SCHEMA_VERSION: str = "entry_v18_20260425"
+FEATURE_SCHEMA_VERSION: str = "entry_v21_20260428_classifications"
+# v20 (2026-04-27): codex-reviewed minimal wallet behavior additions —
+# top10_buyer_prior_avg_wr, top10_buyer_prior_total_pnl_sol (extend
+# Phase E top-3 to top-10 buyers; reuses leak-safe wallet_prior_stats
+# point-in-time path) and n_buyers_first_5s (sniper-bot proxy: count
+# of buyers in [0, 5s] post-mint, computed from trade timestamps).
+# All point-in-time at cutoff_ts = mint.created_at; no future leakage.
+#
+# v19 (2026-04-27): Removed 4 stable_dead features (creator_tokens_today,
+# fast_sell_ratio, creator_total_prior_tokens, creator_graduated_count).
 # v18 (2026-04-25): Phase 2.5 time-aware features — 9 raw snapshot
 # metrics (unique_buyers / buy_rate / buy_volume_sol @30/@60/@90) + 4
 # derived deltas (top1_at_60 interpolated, delta_top1_30_to_60,
@@ -343,12 +368,11 @@ SCORER_FEATURES_T30: list[str] = [
     "buys_per_unique",
     "curve_velocity",
     "curve_acceleration",
-    "creator_tokens_today",
+    # v19 cleanup applied to SCORER_FEATURES_T30 too (same pattern).
     "fast_buy_count",
     "fast_unique_buyers",
     "fast_volume_sol",
     "fast_buy_rate",
-    "fast_sell_ratio",
     "tokens_last_5min",
     "concurrent_observations",
     "pnl_at_fast_entry_pct",
@@ -392,7 +416,7 @@ ENTRY_T30_FEATURE_ORDER: list[str] = [
     *WALLET_FEATURES,
 ]
 
-FEATURE_SCHEMA_VERSION_T30: str = "entry_t30_v1_20260425"
+FEATURE_SCHEMA_VERSION_T30: str = "entry_t30_v4_20260428_classifications"
 
 
 # ── Exit classifier ────────────────────────────────────────────────
@@ -503,6 +527,14 @@ def compute_top3_buyer_wallets(trades: Any) -> list[str]:
     ``trades`` can be any iterable of Trade dataclasses, dicts, or rows
     (pd.Series / sqlite3.Row) — field access is duck-typed via _get.
     """
+    return compute_topN_buyer_wallets(trades, n=3)
+
+
+def compute_topN_buyer_wallets(trades: Any, n: int = 10) -> list[str]:
+    """Generalized top-N buyer wallet ranker. Same SOL-volume ordering and
+    deterministic tiebreak as compute_top3_buyer_wallets. Used for v20+
+    where we extract features over top-10 in addition to legacy top-3.
+    """
     vol: dict[str, float] = {}
     for t in trades:
         if isinstance(t, Mapping):
@@ -520,13 +552,93 @@ def compute_top3_buyer_wallets(trades: Any) -> list[str]:
         except (TypeError, ValueError):
             continue
     ranked = sorted(vol.items(), key=lambda x: (-x[1], x[0]))
-    return [w for w, _ in ranked[:3]]
+    return [w for w, _ in ranked[:n]]
+
+
+def compute_n_buyers_first_5s(trades: Any, mint_created_at: float) -> float:
+    """v20 sniper-proxy: distinct wallets that bought within 5 seconds of
+    token creation. Computed point-in-time from token's own trades — no
+    leakage. Returns float for NaN handling consistency in extractor;
+    integer values are exact.
+
+    Pump.fun mints aren't pre-announced, so sub-5s entry implies an
+    automated WS-listener bot (per codex review thresholds).
+    """
+    if not mint_created_at:
+        return float("nan")
+    seen: set[str] = set()
+    for t in trades:
+        if isinstance(t, Mapping):
+            tx = t.get("tx_type")
+            wallet = t.get("wallet")
+            ts = t.get("timestamp")
+        else:
+            tx = getattr(t, "tx_type", None)
+            wallet = getattr(t, "wallet", None)
+            ts = getattr(t, "timestamp", None)
+        if tx != "buy" or not wallet or ts is None:
+            continue
+        try:
+            age = float(ts) - float(mint_created_at)
+        except (TypeError, ValueError):
+            continue
+        if 0.0 <= age < 5.0:
+            seen.add(wallet)
+    return float(len(seen))
+
+
+def compute_wallet_classification_counts(
+    top_n_wallets: list[str] | None,
+    classifications: Mapping[str, Mapping[str, Any]] | None,
+) -> dict[str, float]:
+    """v21 (2026-04-28): per-token counts of wallet_classifications flags
+    among the top-N buyers. Returns 4 floats keyed by feature name.
+
+    ``classifications`` maps wallet → {is_sniper, is_smart_money,
+    is_bot, cluster_id, cluster_size}. NaN when classification not
+    available (caller passes None for wallets without history).
+    """
+    nan = float("nan")
+    out = {
+        "n_snipers_in_top10": nan,
+        "n_smart_money_in_top10": nan,
+        "n_bots_in_top10": nan,
+        "n_in_small_cluster_top10": nan,
+    }
+    if not top_n_wallets or not classifications:
+        return out
+    n_sniper = 0
+    n_smart = 0
+    n_bot = 0
+    n_cluster = 0
+    matched = 0
+    for w in top_n_wallets:
+        cls = classifications.get(w)
+        if cls is None:
+            continue
+        matched += 1
+        if cls.get("is_sniper"):
+            n_sniper += 1
+        if cls.get("is_smart_money"):
+            n_smart += 1
+        if cls.get("is_bot"):
+            n_bot += 1
+        cluster_size = cls.get("cluster_size")
+        if cluster_size is not None and 3 <= int(cluster_size) <= 50:
+            n_cluster += 1
+    if matched > 0:
+        out["n_snipers_in_top10"] = float(n_sniper)
+        out["n_smart_money_in_top10"] = float(n_smart)
+        out["n_bots_in_top10"] = float(n_bot)
+        out["n_in_small_cluster_top10"] = float(n_cluster)
+    return out
 
 
 def _extract_wallet_prior_features(
     wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None,
     top3_buyer_wallets: list[str] | None,
     cutoff_ts: float | None,
+    wallet_classifications: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, float]:
     """Phase E — aggregate top-3 buyer prior stats into 5 WALLET_FEATURES.
 
@@ -560,15 +672,52 @@ def _extract_wallet_prior_features(
         fs = float(s.get("first_seen_ts", 0.0) or 0.0)
         if fs > 0 and cutoff_ts is not None and cutoff_ts > fs:
             ages_days.append((cutoff_ts - fs) / 86400.0)
-    if mint_counts:
-        out["top3_buyer_prior_mint_count_sum"] = float(sum(mint_counts))
-        out["top3_buyer_prior_total_pnl_sol"] = float(sum(total_pnls))
-    if wrs:
-        out["top3_buyer_prior_avg_wr"] = float(sum(wrs) / len(wrs))
-    if max_pnls:
-        out["top3_buyer_max_prior_pnl_sol"] = float(max(max_pnls))
-    if ages_days:
-        out["top3_buyer_wallet_age_days_avg"] = float(sum(ages_days) / len(ages_days))
+    # Legacy top-3 aggregations (slice the leading 3 of the input list).
+    top3_subset = top3_buyer_wallets[:3]
+    mc3, tp3, wr3, mp3, ad3 = [], [], [], [], []
+    for w in top3_subset:
+        s = wallet_prior_stats.get(w)
+        if not s:
+            continue
+        mc = s.get("all_mint_count", 0) or 0
+        if mc > 0:
+            mc3.append(float(mc))
+            tp3.append(float(s.get("total_pnl_sol", 0.0) or 0.0))
+        wr = s.get("wr")
+        if wr is not None and not (isinstance(wr, float) and math.isnan(wr)):
+            wr3.append(float(wr))
+        mp = s.get("max_pnl_sol")
+        if mp is not None and not (isinstance(mp, float) and math.isnan(mp)):
+            mp3.append(float(mp))
+        fs = float(s.get("first_seen_ts", 0.0) or 0.0)
+        if fs > 0 and cutoff_ts is not None and cutoff_ts > fs:
+            ad3.append((cutoff_ts - fs) / 86400.0)
+    if mc3:
+        out["top3_buyer_prior_mint_count_sum"] = float(sum(mc3))
+        out["top3_buyer_prior_total_pnl_sol"] = float(sum(tp3))
+    if wr3:
+        out["top3_buyer_prior_avg_wr"] = float(sum(wr3) / len(wr3))
+    if mp3:
+        out["top3_buyer_max_prior_pnl_sol"] = float(max(mp3))
+    if ad3:
+        out["top3_buyer_wallet_age_days_avg"] = float(sum(ad3) / len(ad3))
+    # v20 — top-10 aggregations only when caller passes >3 wallets
+    # (i.e. v20 path with up to 10). Reverted 2026-04-27 19:15 after
+    # the codex-suggested removal of this guard caused AUC 0.905 →
+    # 0.891 and EV-search collapse. The NaN-when-≤3 semantics is
+    # actually load-bearing: XGBoost uses missing-feature splits as
+    # a "dead-mint" indicator. Populating top10_* for tokens with
+    # 1-2 buyers introduces noise that degrades ranking signal.
+    if len(top3_buyer_wallets) > 3:
+        if wrs:
+            out["top10_buyer_prior_avg_wr"] = float(sum(wrs) / len(wrs))
+        if total_pnls:
+            out["top10_buyer_prior_total_pnl_sol"] = float(sum(total_pnls))
+    # v21 — wallet_classifications JOIN (sniper/smart/bot/wash counts).
+    cls_counts = compute_wallet_classification_counts(
+        top3_buyer_wallets, wallet_classifications
+    )
+    out.update(cls_counts)
     return out
 
 
@@ -581,6 +730,8 @@ def extract_entry_features(
     wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
     top3_buyer_wallets: list[str] | None = None,
     cutoff_ts: float | None = None,
+    n_buyers_first_5s: float | None = None,
+    wallet_classifications: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, float]:
     """Return the feature dict the entry model expects, in canonical order.
 
@@ -670,8 +821,16 @@ def extract_entry_features(
     # or no history so XGBoost splits on missingness.
     feats.update(
         _extract_wallet_prior_features(
-            wallet_prior_stats, top3_buyer_wallets, cutoff_ts
+            wallet_prior_stats, top3_buyer_wallets, cutoff_ts,
+            wallet_classifications=wallet_classifications,
         )
+    )
+    # v20 sniper proxy — caller pre-computes from raw trades; NaN when
+    # not provided (legacy callers, tests).
+    feats["n_buyers_first_5s"] = (
+        float(n_buyers_first_5s)
+        if n_buyers_first_5s is not None
+        else float("nan")
     )
     # Phase 2.5 (2026-04-25) — time-aware snapshots. Raw values come
     # straight off the ScoringResult / token_scores row (computed by
@@ -700,18 +859,52 @@ def extract_entry_features(
     return feats
 
 
+# Creator features that are **mathematically undefined** when the creator
+# has < 2 prior tokens (solo creator, this token only). median(empty) = 0
+# is *not* meaningful "low MC", and interval(1 token) = 0 is *not*
+# meaningful "fast cadence" — both are missing-data signals XGBoost should
+# split on natively via NaN. About 64% of creators in the live stream are
+# solo (per 2026-05-05 audit), so leaving these as 0 silently shifts the
+# distribution at serve time vs the mostly-veteran-creator training data.
+_CREATOR_FEATS_DEGENERATE_FOR_SOLO: frozenset[str] = frozenset({
+    "creator_median_peak_mc_sol",
+    "creator_inter_token_interval_sec",
+})
+
+
+def _creator_priors_count(snapshot: Any) -> float | None:
+    """Read ``snapshot_prior_tokens`` (or ``total_prior_tokens``) off a
+    CreatorStats / row. Returns None if neither attribute exists."""
+    for key in ("snapshot_prior_tokens", "total_prior_tokens"):
+        if isinstance(snapshot, Mapping):
+            v = snapshot.get(key)
+        else:
+            v = getattr(snapshot, key, None)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
 def _get_creator_feat(snapshot: Any, feat_name: str) -> float:
     """Robust lookup for creator features under mixed naming conventions.
 
-    Returns 0.0 when ``snapshot`` is None OR when every candidate key is
-    legitimately missing on the object. BUT if the snapshot has *some*
-    attributes set (i.e. it is a real CreatorStats/row) and none of our
-    candidate keys match, that is a naming-convention regression and we
-    WARN — silent zero-fill in that case is the exact pathology that let
-    the 2026-04-23 skew bug live undetected for months.
+    Returns NaN when:
+      * ``snapshot`` is None (no creator data at all), OR
+      * the feature is degenerate-for-solo (median_peak_mc / inter_token_interval)
+        AND the creator has < 2 prior tokens.
+
+    Returns 0.0 when every candidate key is legitimately missing on a
+    non-None object — that is the creator-skew bug fingerprint and we WARN.
     """
     if snapshot is None:
-        return 0.0
+        return float("nan")
+    if feat_name in _CREATOR_FEATS_DEGENERATE_FOR_SOLO:
+        priors = _creator_priors_count(snapshot)
+        if priors is not None and priors < 2:
+            return float("nan")
     candidates: list[str] = [feat_name]
     if feat_name.startswith("creator_"):
         candidates.append(feat_name[len("creator_") :])
@@ -762,6 +955,8 @@ def extract_entry_vector(
     wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
     top3_buyer_wallets: list[str] | None = None,
     cutoff_ts: float | None = None,
+    n_buyers_first_5s: float | None = None,
+    wallet_classifications: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> list[float]:
     """Positional list in ENTRY_FEATURE_ORDER — shape predict_proba expects."""
     feats = extract_entry_features(
@@ -772,6 +967,8 @@ def extract_entry_vector(
         wallet_prior_stats=wallet_prior_stats,
         top3_buyer_wallets=top3_buyer_wallets,
         cutoff_ts=cutoff_ts,
+        n_buyers_first_5s=n_buyers_first_5s,
+        wallet_classifications=wallet_classifications,
     )
     return [feats[k] for k in ENTRY_FEATURE_ORDER]
 
@@ -788,6 +985,8 @@ def extract_entry_features_t30(
     wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
     top3_buyer_wallets: list[str] | None = None,
     cutoff_ts: float | None = None,
+    n_buyers_first_5s: float | None = None,
+    wallet_classifications: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, float]:
     """Return the @T+30 feature dict in canonical ``ENTRY_T30_FEATURE_ORDER``.
 
@@ -839,8 +1038,14 @@ def extract_entry_features_t30(
             )
     feats.update(
         _extract_wallet_prior_features(
-            wallet_prior_stats, top3_buyer_wallets, cutoff_ts
+            wallet_prior_stats, top3_buyer_wallets, cutoff_ts,
+            wallet_classifications=wallet_classifications,
         )
+    )
+    feats["n_buyers_first_5s"] = (
+        float(n_buyers_first_5s)
+        if n_buyers_first_5s is not None
+        else float("nan")
     )
     return feats
 
@@ -854,6 +1059,8 @@ def extract_entry_vector_t30(
     wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
     top3_buyer_wallets: list[str] | None = None,
     cutoff_ts: float | None = None,
+    n_buyers_first_5s: float | None = None,
+    wallet_classifications: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> list[float]:
     """Positional list in ENTRY_T30_FEATURE_ORDER — shape predict_proba expects."""
     feats = extract_entry_features_t30(
@@ -864,5 +1071,7 @@ def extract_entry_vector_t30(
         wallet_prior_stats=wallet_prior_stats,
         top3_buyer_wallets=top3_buyer_wallets,
         cutoff_ts=cutoff_ts,
+        n_buyers_first_5s=n_buyers_first_5s,
+        wallet_classifications=wallet_classifications,
     )
     return [feats[k] for k in ENTRY_T30_FEATURE_ORDER]

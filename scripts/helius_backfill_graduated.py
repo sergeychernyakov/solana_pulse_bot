@@ -71,11 +71,51 @@ logger = logging.getLogger("helius_backfill")
 PUMPFUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 GRADUATION_MC_SOL = 85.0
 SIG_PAGE_LIMIT = 1000
-PARSED_TX_BATCH = 100  # Helius enhanced API accepts up to 100 sigs/req
+PARSED_TX_BATCH = 1  # Helius batch API silently throttles batch>=10 on free
+# tier: requests >60s and never return. Single-sig works fine. We accept the
+# 100x more requests in exchange for predictability.
 DEFAULT_CONCURRENCY = 50
 DEFAULT_STATE_PATH = REPO_ROOT / "data" / "backfill_state.json"
 RPC_URL_TEMPLATE = "https://mainnet.helius-rpc.com/?api-key={key}"
 PARSED_URL_TEMPLATE = "https://api.helius.xyz/v0/transactions/?api-key={key}"
+
+# Solana RPC endpoints used for getSignaturesForAddress + getTransaction
+# (saves Helius credits on the cheap RPC calls, reserves them for the
+# parsed-tx batch endpoint).
+#
+# Sources (in priority order, first-tried first):
+# 1. PUBLIC_RPC_URLS env var (comma-separated authenticated URLs like
+#    Alchemy / QuickNode). Highest priority because they're rate-limited
+#    free tiers w/ explicit accounts.
+# 2. Anonymous public fallbacks listed below.
+_PUBLIC_RPC_FALLBACKS: list[str] = [
+    # No anonymous fallbacks active. Tested 2026-04-26:
+    # - api.mainnet-beta.solana.com — 4 RPS limit, drowns in 429 at our load
+    # - solana-api.projectserum.com — hangs / no response
+    # - rpc.ankr.com/solana — 403 "API key not allowed" for getTransaction
+    # Use registered free-tier endpoints (Alchemy/QuickNode) via PUBLIC_RPC_URLS env.
+]
+# 2026-04-29 fix: when PUBLIC_RPC_URLS is empty, auto-fill from Helius
+# API keys (each key spawns its own RPC URL) so the script does not
+# crash with ZeroDivisionError. Helius mainnet endpoint supports the
+# JSON-RPC methods we need (getSignaturesForAddress + getTransaction).
+def _build_rpc_urls_from_keys() -> list[str]:
+    keys: list[str] = []
+    multi = os.environ.get("HELIUS_API_KEYS", "").strip()
+    if multi:
+        keys.extend(k.strip() for k in multi.split(",") if k.strip())
+    single = os.environ.get("HELIUS_API_KEY", "").strip()
+    if single and single not in keys:
+        keys.append(single)
+    return [f"https://mainnet.helius-rpc.com/?api-key={k}" for k in keys]
+
+
+PUBLIC_RPC_URLS = [
+    *(u.strip() for u in os.environ.get("PUBLIC_RPC_URLS", "").split(",") if u.strip()),
+    *_PUBLIC_RPC_FALLBACKS,
+]
+if not PUBLIC_RPC_URLS:
+    PUBLIC_RPC_URLS = _build_rpc_urls_from_keys()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -118,7 +158,7 @@ def fetch_graduated_mints(db: Database, limit: int | None = None) -> list[dict]:
             SELECT 1 FROM trades tr
             WHERE tr.mint = t.mint AND tr.market_cap_sol >= ?
         )
-        ORDER BY t.created_at ASC
+        ORDER BY t.created_at DESC  -- newest first: smaller sig counts + fresher market regime
     """
     rows = db._sync_query(sql, (GRADUATION_MC_SOL,))
     if limit:
@@ -126,18 +166,33 @@ def fetch_graduated_mints(db: Database, limit: int | None = None) -> list[dict]:
     return rows
 
 
-def fetch_existing_trade_keys(db: Database, mint: str) -> set[tuple[int, str]]:
-    """Existing trade dedup keys for ``mint`` (timestamp truncated + wallet).
+def fetch_existing_trade_keys(
+    db: Database, mint: str
+) -> set[tuple[int, str, str, float]]:
+    """Existing trade dedup keys for ``mint``: ``(int_ts, wallet, tx_type,
+    rounded_sol)``. 2026-04-28 (codex review): the prior coarse key
+    ``(int_ts, wallet)`` collapsed legit same-second different-amount
+    trades from the same wallet — sniper bots fire several micro-orders
+    in one block, all distinct on-chain but indistinguishable here.
 
-    Helius timestamps are integer-seconds (block time floored); existing
-    bot timestamps are sub-second. Use int() (truncate, not round)
-    on both sides for deterministic match. Banker's rounding caused
-    600K duplicate rows in earlier runs (live ts=X.7 rounded to X+1
-    while Helius ts=X — different keys, both inserted)."""
+    Truncating timestamp to int seconds is preserved (Helius blocktime
+    is integer; live bot writes sub-second). Sol-amount rounded to 6
+    decimal places: Solana uses lamports (1e-9), so 6 decimal places
+    gives μSOL granularity — unique per trade without spurious mismatch
+    from float reserialization."""
     rows = db._sync_query(
-        "SELECT timestamp, wallet FROM trades WHERE mint = ?", (mint,)
+        "SELECT timestamp, wallet, tx_type, sol_amount FROM trades WHERE mint = ?",
+        (mint,),
     )
-    return {(int(float(r["timestamp"])), r["wallet"]) for r in rows}
+    return {
+        (
+            int(float(r["timestamp"])),
+            r["wallet"],
+            r["tx_type"],
+            round(float(r["sol_amount"] or 0.0), 6),
+        )
+        for r in rows
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -181,6 +236,7 @@ class HeliusBackfillClient:
             raise ValueError("api_keys must be non-empty")
         self._api_keys: list[str] = list(api_keys)
         self._key_idx = 0
+        self._public_idx = 0  # round-robin index into PUBLIC_RPC_URLS
         self._key_cooldown_until: dict[str, float] = {k: 0.0 for k in api_keys}
         self._sem = asyncio.Semaphore(concurrency)
         self._session: Any | None = None
@@ -210,8 +266,8 @@ class HeliusBackfillClient:
             # sequential curl works fine. Also force_close=False reuses
             # connections, avoiding repeated TLS handshakes.
             connector = aiohttp.TCPConnector(
-                limit=4,
-                limit_per_host=4,
+                limit=20,
+                limit_per_host=10,
                 force_close=False,
                 enable_cleanup_closed=True,
             )
@@ -223,15 +279,22 @@ class HeliusBackfillClient:
             await self._session.close()
             self._session = None
 
-    async def get_all_signatures(self, address: str, until_ts: float) -> list[dict]:
+    async def get_all_signatures(
+        self, address: str, until_ts: float, max_sigs: int = 8000
+    ) -> tuple[list[dict], bool]:
         """Paginate ``getSignaturesForAddress`` until ``blockTime`` falls
-        below ``until_ts``. Returns the raw signature dicts (newest first).
-        ``until_ts`` is enforced softly: we may go slightly beyond it
-        because Solana doesn't support a ts cursor — pagination uses
-        ``before=<sig>``."""
+        below ``until_ts``.
+
+        2026-04-28 (codex review): Returns ``(sigs, complete)`` where
+        ``complete=False`` indicates a transient RPC failure mid-pagination.
+        Previously a None response returned a partial ``out`` and the caller
+        marked the mint completed → permanent silent truncation of every
+        downstream label/feature using that mint's trades. Caller MUST NOT
+        add such mints to ``completed_mints``.
+        """
         out: list[dict] = []
         before: str | None = None
-        while True:
+        while len(out) < max_sigs:
             params: list[Any] = [address, {"limit": SIG_PAGE_LIMIT}]
             if before:
                 params[1]["before"] = before
@@ -245,7 +308,9 @@ class HeliusBackfillClient:
                 self.stats.sig_calls += 1
                 data = await self._post("rpc", payload)
             if data is None:
-                return out
+                # Transient failure: return whatever we have but flag
+                # incomplete so caller does NOT mark mint as done.
+                return out, False
             res = data.get("result") or []
             if not res:
                 break
@@ -256,51 +321,94 @@ class HeliusBackfillClient:
                 break
             if oldest_ts and oldest_ts < until_ts:
                 break
-        return out
+        return out, True
 
-    async def get_parsed_transactions(self, sigs: list[str]) -> list[dict]:
-        """Batch-fetch parsed transactions in chunks of ``PARSED_TX_BATCH``."""
+    async def get_parsed_transactions(
+        self, sigs: list[str]
+    ) -> tuple[list[dict], bool]:
+        """Standard JSON-RPC fetch — one ``getTransaction`` per signature.
+
+        Replaces the Helius ``/v0/transactions`` BATCH endpoint which times
+        out on free-tier under our load. Slower (1 sig/call vs 100/call) but
+        works against any RPC source (Alchemy/QuickNode/public). Returned
+        dicts are standard Solana JSON-RPC ``getTransaction(jsonParsed)``
+        responses, parsed downstream by ``parse_pump_swap_from_rpc``.
+        """
         if not sigs:
-            return []
-        out: list[dict] = []
-        for i in range(0, len(sigs), PARSED_TX_BATCH):
-            batch = sigs[i : i + PARSED_TX_BATCH]
+            return [], True
+
+        async def _fetch_one(sig: str) -> tuple[dict | None, bool]:
+            """Returns (tx, success). success=False on RPC error so the
+            caller can flag the batch as incomplete (codex 2026-04-28)."""
             async with self._sem:
                 self.stats.parsed_calls += 1
-                self.stats.parsed_sigs += len(batch)
-                data = await self._post("parsed", {"transactions": batch})
-            if isinstance(data, list):
-                out.extend(data)
-            else:
-                # Helius returned an error envelope — log and continue.
-                self.stats.parse_errors += 1
-                logger.warning("parsed-tx batch error: %s", str(data)[:200])
-        return out
+                self.stats.parsed_sigs += 1
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getTransaction",
+                    "params": [
+                        sig,
+                        {
+                            "encoding": "jsonParsed",
+                            "maxSupportedTransactionVersion": 0,
+                        },
+                    ],
+                }
+                data = await self._post("rpc", payload)
+            if data is None:
+                return None, False  # RPC failure
+            if isinstance(data, dict):
+                # Distinguish "tx legitimately not found" (None result, but
+                # call succeeded — pruned signature) from network failure.
+                return data.get("result"), True
+            return None, False
+
+        results = await asyncio.gather(*(_fetch_one(s) for s in sigs))
+        out_txs = [r for r, ok in results if r is not None]
+        complete = all(ok for _, ok in results)
+        return out_txs, complete
 
     async def _post(self, endpoint: str, payload: dict) -> Any:
         """POST with retry + key rotation on 429.
 
-        ``endpoint`` is "rpc" or "parsed". For each attempt we pick the
-        next non-quarantined key. On 429, the offending key is
-        quarantined for ``KEY_QUARANTINE_SEC`` and we try the next one.
-        Returns None when all keys are quarantined or attempts exhausted.
+        ``endpoint`` is "rpc" or "parsed".
+
+        Hybrid routing strategy:
+        - "rpc" (getSignaturesForAddress) → public Solana RPC first
+          (round-robin via ``self._public_idx``); saves Helius credits.
+          On public RPC failure, falls back to Helius keys.
+        - "parsed" (parsed-tx BATCH) → Helius keys only (only Helius has
+          the /v0/transactions batch endpoint, public RPC has no equivalent).
         """
         import aiohttp
 
         session = await self._get_session()
         backoff = 1.0
         for attempt in range(8):
-            key = self._next_key()
-            if key is None:
-                logger.warning("All Helius keys quarantined; pausing %.1fs", backoff)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30.0)
-                continue
-            url = (
-                RPC_URL_TEMPLATE.format(key=key)
-                if endpoint == "rpc"
-                else PARSED_URL_TEMPLATE.format(key=key)
-            )
+            # Pick endpoint URL.
+            if endpoint == "rpc":
+                # Always use public RPC pool (Alchemy / QuickNode / public).
+                # Helius free-tier keys return 403 on standard JSON-RPC
+                # (only their /v0/transactions endpoint is permitted, and
+                # that is unusable due to per-account batch throttling).
+                url = PUBLIC_RPC_URLS[self._public_idx % len(PUBLIC_RPC_URLS)]
+                self._public_idx += 1
+                key = None
+            else:
+                # "parsed" endpoint — Helius enhanced. Currently unused
+                # (get_parsed_transactions was rewritten to use rpc path),
+                # kept for future re-enable if Helius parsed-tx becomes
+                # viable again.
+                key = self._next_key()
+                if key is None:
+                    logger.warning(
+                        "All Helius keys quarantined; pausing %.1fs", backoff
+                    )
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 30.0)
+                    continue
+                url = PARSED_URL_TEMPLATE.format(key=key)
             try:
                 async with session.post(
                     url,
@@ -309,27 +417,25 @@ class HeliusBackfillClient:
                 ) as resp:
                     if resp.status == 429:
                         self.stats.rate_limit_hits += 1
-                        self._quarantine_key(key)
-                        logger.warning(
-                            "Helius 429 on key=...%s; quarantine %.0fs (other keys left=%d)",
-                            key[-6:],
-                            self.KEY_QUARANTINE_SEC,
-                            sum(
-                                1
-                                for k in self._api_keys
-                                if self._key_cooldown_until[k] <= time.time()
-                            ),
-                        )
-                        continue  # try next key immediately
+                        if key is not None:
+                            self._quarantine_key(key)
+                            logger.warning(
+                                "Helius 429 on key=...%s; quarantine %.0fs",
+                                key[-6:],
+                                self.KEY_QUARANTINE_SEC,
+                            )
+                        else:
+                            logger.warning("Public RPC 429; brief backoff")
+                            await asyncio.sleep(0.5)
+                        continue  # try next key/endpoint immediately
                     if resp.status != 200:
                         body = await resp.text()
                         # max-usage-reached is permanent for the month — quarantine longer
-                        if "max usage reached" in body.lower() or resp.status in (
-                            402,
-                            403,
+                        if key is not None and (
+                            "max usage reached" in body.lower()
+                            or resp.status in (402, 403)
                         ):
-                            self._quarantine_key(key)
-                            self._key_cooldown_until[key] = time.time() + 86400.0  # 24h
+                            self._key_cooldown_until[key] = time.time() + 86400.0
                             logger.warning(
                                 "Helius key=...%s exhausted (status=%d); 24h quarantine",
                                 key[-6:],
@@ -357,6 +463,114 @@ class HeliusBackfillClient:
 # ──────────────────────────────────────────────────────────────────────
 # Pump.fun parsing
 # ──────────────────────────────────────────────────────────────────────
+
+
+def parse_pump_swap_from_rpc(tx: dict, mint: str) -> Trade | None:
+    """Parse a standard Solana JSON-RPC ``getTransaction(jsonParsed)`` response
+    into a ``Trade``. Used when Helius enhanced parsed-tx is unavailable.
+
+    Logic:
+    1. Verify pump.fun program (``PUMPFUN_PROGRAM_ID``) appears in instructions.
+    2. Direction from log: ``Program log: Instruction: Buy/Sell``.
+    3. Trader = first account key (signer/feePayer).
+    4. sol_amount = max |postBalance − preBalance| over non-signer accounts
+       (bonding-curve account always has the largest delta; signer balance is
+       polluted by tx fees / rent).
+    5. token_amount = max |postTokenBalance − preTokenBalance| over accounts
+       holding the target ``mint``.
+    """
+    if not tx or not isinstance(tx, dict):
+        return None
+    meta = tx.get("meta") or {}
+    if meta.get("err") is not None:
+        return None
+    transaction = tx.get("transaction") or {}
+    message = transaction.get("message") or {}
+
+    instructions = message.get("instructions") or []
+    has_pumpfun = any(
+        inst.get("programId") == PUMPFUN_PROGRAM_ID for inst in instructions
+    )
+    # Inner instructions can also be where the pump.fun program lives.
+    if not has_pumpfun:
+        for inner_set in meta.get("innerInstructions") or []:
+            for inst in inner_set.get("instructions") or []:
+                if inst.get("programId") == PUMPFUN_PROGRAM_ID:
+                    has_pumpfun = True
+                    break
+            if has_pumpfun:
+                break
+    if not has_pumpfun:
+        return None
+
+    log_messages = meta.get("logMessages") or []
+    is_buy = any("Instruction: Buy" in m for m in log_messages)
+    is_sell = any("Instruction: Sell" in m for m in log_messages)
+    if not (is_buy or is_sell):
+        return None
+    tx_type = "buy" if is_buy else "sell"
+
+    account_keys = message.get("accountKeys") or []
+    if not account_keys:
+        return None
+    first_key = account_keys[0]
+    trader = first_key.get("pubkey", "") if isinstance(first_key, dict) else first_key
+    if not trader:
+        return None
+
+    # SOL amount: largest non-signer balance delta. preBalances[0] is signer.
+    pre_balances = meta.get("preBalances") or []
+    post_balances = meta.get("postBalances") or []
+    if (
+        len(pre_balances) != len(post_balances)
+        or len(pre_balances) < 2
+    ):
+        return None
+    biggest_delta = 0
+    for i in range(1, len(pre_balances)):
+        delta = abs(post_balances[i] - pre_balances[i])
+        if delta > biggest_delta:
+            biggest_delta = delta
+    sol_amount = biggest_delta / 1e9  # lamports → SOL
+
+    # Token amount: largest balance change for accounts holding ``mint``.
+    pre_tok = meta.get("preTokenBalances") or []
+    post_tok = meta.get("postTokenBalances") or []
+    pre_for_mint = {
+        t.get("accountIndex"): t for t in pre_tok if t.get("mint") == mint
+    }
+    post_for_mint = {
+        t.get("accountIndex"): t for t in post_tok if t.get("mint") == mint
+    }
+    token_amount = 0.0
+    for idx in set(pre_for_mint) | set(post_for_mint):
+        pre_amt = float(
+            (pre_for_mint.get(idx, {}).get("uiTokenAmount") or {}).get("uiAmount") or 0
+        )
+        post_amt = float(
+            (post_for_mint.get(idx, {}).get("uiTokenAmount") or {}).get("uiAmount") or 0
+        )
+        change = abs(post_amt - pre_amt)
+        if change > token_amount:
+            token_amount = change
+
+    if sol_amount <= 0 or token_amount <= 0:
+        return None
+
+    block_time = tx.get("blockTime") or 0
+    return Trade(
+        mint=mint,
+        wallet=trader,
+        tx_type=tx_type,
+        sol_amount=sol_amount,
+        token_amount=token_amount,
+        new_token_balance=0.0,
+        bonding_curve_key="",
+        v_sol_in_bonding_curve=0.0,
+        v_tokens_in_bonding_curve=0.0,
+        market_cap_sol=0.0,
+        timestamp=float(block_time),
+    )
 
 
 def parse_pump_swap(tx: dict, mint: str) -> Trade | None:
@@ -435,43 +649,67 @@ async def backfill_one_mint(
     db: Database,
     client: HeliusBackfillClient,
     mint_row: dict,
-) -> tuple[int, int, float]:
+) -> tuple[int, int, float, bool]:
     """Fetch + parse + insert trades for a single mint.
 
-    Returns ``(parsed, inserted, elapsed_sec)``."""
+    2026-04-28 (codex review): 4-tuple now includes ``complete: bool``
+    explicitly. Caller marks ``completed_mints`` ONLY when complete=True.
+    Previously a transient RPC failure mid-pagination silently truncated
+    a mint's history forever.
+
+    Returns ``(parsed, inserted, elapsed_sec, complete)``."""
     mint = mint_row["mint"]
     created_at = float(mint_row["created_at"] or 0.0)
     until_ts = max(0.0, created_at - 60.0)
 
     t0 = time.time()
-    sig_dicts = await client.get_all_signatures(mint, until_ts)
+    sig_dicts, sigs_complete = await client.get_all_signatures(mint, until_ts)
     if not sig_dicts:
-        return (0, 0, time.time() - t0)
+        # Empty either because no on-chain history (legitimate complete=True
+        # for graduated mints whose history is older than our window) OR
+        # because the RPC call returned None on first request (incomplete).
+        return (0, 0, time.time() - t0, sigs_complete)
     sigs = [s["signature"] for s in sig_dicts]
 
-    parsed_txs = await client.get_parsed_transactions(sigs)
+    parsed_txs, parse_complete = await client.get_parsed_transactions(sigs)
+    overall_complete = sigs_complete and parse_complete
 
     trades: list[Trade] = []
     for tx in parsed_txs:
         if not isinstance(tx, dict):
             continue
-        trade = parse_pump_swap(tx, mint)
+        # New path: standard JSON-RPC getTransaction response (Alchemy/QuickNode/public).
+        # Old Helius enhanced path (parse_pump_swap) is dead code now that
+        # Helius parsed-tx batch is unusable on free tier.
+        trade = parse_pump_swap_from_rpc(tx, mint)
         if trade is None:
             client.stats.unknown_txs += 1
             continue
         trades.append(trade)
 
     if not trades:
-        return (0, 0, time.time() - t0)
+        return (0, 0, time.time() - t0, overall_complete)
 
     # Idempotent insert: dedup against existing rows for this mint.
+    # 2026-04-28 (codex review): dedup key now includes tx_type and a
+    # rounded sol_amount so two same-second buys from the same wallet
+    # with different amounts (sniper bots fire multiple micro-orders
+    # per second) are preserved instead of silently collapsed into one.
     existing = fetch_existing_trade_keys(db, mint)
-    new_trades = [t for t in trades if (int(t.timestamp), t.wallet) not in existing]
+    new_trades = [
+        t for t in trades
+        if (
+            int(t.timestamp),
+            t.wallet,
+            t.tx_type,
+            round(float(t.sol_amount or 0.0), 6),
+        ) not in existing
+    ]
     if not new_trades:
-        return (len(trades), 0, time.time() - t0)
+        return (len(trades), 0, time.time() - t0, overall_complete)
 
     await db.insert_trades_batch(new_trades)
-    return (len(trades), len(new_trades), time.time() - t0)
+    return (len(trades), len(new_trades), time.time() - t0, overall_complete)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -544,25 +782,33 @@ async def run(args: argparse.Namespace) -> None:
                 mint = mint_row["mint"]
                 if result is None:
                     continue
-                parsed, inserted, elapsed = result
+                parsed, inserted, elapsed, complete = result
                 total_parsed += parsed
                 total_inserted += inserted
                 elapsed_per_mint.append(elapsed)
                 logger.info(
-                    "[%d/%d] %s sigs->%d parsed->%d inserted->%d in %.1fs",
+                    "[%d/%d] %s sigs->%d parsed->%d inserted->%d complete=%s in %.1fs",
                     idx,
                     len(pending),
                     mint[:12],
                     parsed,
                     parsed,
                     inserted,
+                    complete,
                     elapsed,
                 )
-                completed.add(mint)
+                # 2026-04-28 (codex review): only mark complete when the
+                # ENTIRE fetch+parse chain reported success. The earlier
+                # heuristic ``parsed > 0 or inserted > 0`` could pass when
+                # an RPC error truncated the result mid-pagination —
+                # silently poisoning every downstream label that uses
+                # this mint's truncated history.
+                if complete:
+                    completed.add(mint)
             state["completed_mints"] = sorted(completed)
             state["rpc_calls"] = client.stats.sig_calls + client.stats.parsed_calls
             _save_state(state_path, state)
-            if client.stats.rate_limit_hits >= 50:
+            if client.stats.rate_limit_hits >= 50000:
                 logger.error("Too many 429s — aborting; rerun to resume")
                 aborted = True
                 break

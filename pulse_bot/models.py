@@ -35,6 +35,12 @@ class Trade:
     market_cap_sol: float
     timestamp: float
     is_creator: bool = False
+    # 2026-04-30 — solana tx signature when available (Geyser path).
+    # Empty string for sources that don't expose signatures (PumpPortal WS).
+    # MultiplexerLaunchpad dedup prefers this when non-empty for exact
+    # cross-source identity (synthetic key with int-second timestamp +
+    # rounded sol_amount collides on sniper-bot identical orders).
+    signature: str = ""
 
 
 @dataclass
@@ -107,6 +113,11 @@ class ScoringResult:
     buy_diversity: int = 0
     max_buy_sol: float = 0.0
     creator_sold: bool = False
+    # 2026-04-29 — creator self-buy detection (rug-pull / fake-demand
+    # signal). ``creator_self_buy_position`` is 1-indexed among buys
+    # (1 = creator bought first, 0 = never bought in scoring window).
+    creator_self_buy: bool = False
+    creator_self_buy_position: int = 0
     sell_pressure: float = 0.0
     avg_buy_sol: float = 0.0
     median_buy_sol: float = 0.0

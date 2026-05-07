@@ -71,9 +71,13 @@ def test_extract_fills_missing_with_zero() -> None:
     * ``WALLET_FEATURES`` (Phase E 2026-04-24) — NaN when no wallet stats
       were provided, so XGBoost can split on missingness explicitly.
       "No wallet data" is not the same as "zero wallet data".
+    * ``CREATOR_FEATURES`` (2026-05-05 NaN-policy v2) — NaN when
+      ``creator_snapshot=None`` (no creator data at all). Aligns with
+      build_dataset.py merge_asof miss → NaN, fixing the train/serve
+      skew on the ~64% of live tokens with brand-new creators.
     """
-    feats = extract_entry_features({}, holder_snapshot=None)
-    special = {"hour_cos", *WALLET_FEATURES}
+    feats = extract_entry_features({}, holder_snapshot=None, creator_snapshot=None)
+    special = {"hour_cos", *WALLET_FEATURES, *CREATOR_FEATURES}
     zero_defaults = [f for f in ENTRY_FEATURE_ORDER if f not in special]
     for name in zero_defaults:
         assert feats[name] == 0.0, f"{name} should default to 0.0"
@@ -82,6 +86,10 @@ def test_extract_fills_missing_with_zero() -> None:
         assert math.isnan(
             feats[name]
         ), f"{name} should default to NaN when wallet_prior_stats is None"
+    for name in CREATOR_FEATURES:
+        assert math.isnan(
+            feats[name]
+        ), f"{name} should default to NaN when creator_snapshot is None"
 
 
 def test_extract_reads_scorer_fields() -> None:
@@ -252,15 +260,55 @@ def test_creator_features_live_vs_training_parity() -> None:
     assert feats_live["creator_age_days"] == 7.25
     assert feats_live["creator_median_peak_mc_sol"] == 42.5
     assert feats_live["creator_inter_token_interval_sec"] == 3600.0
-    assert feats_live["creator_total_prior_tokens"] == 10.0
     assert feats_live["creator_balance_sol"] == 12.8
+    # creator_total_prior_tokens / creator_graduated_count removed in
+    # v19 cleanup (stable_dead × 2 sequential runs). They're no longer
+    # part of CREATOR_FEATURES; data still in CreatorStats for diagnostics.
 
 
-def test_creator_features_missing_snapshot_is_zero() -> None:
-    """``creator_snapshot=None`` → all CREATOR_FEATURES default to 0.0."""
+def test_creator_features_missing_snapshot_is_nan() -> None:
+    """``creator_snapshot=None`` → all CREATOR_FEATURES default to NaN
+    (2026-05-05 NaN-policy v2). XGBoost handles missingness natively;
+    matches build_dataset.py behavior on rows with no creator snapshot."""
     feats = extract_entry_features({}, creator_snapshot=None)
     for name in CREATOR_FEATURES:
-        assert feats[name] == 0.0
+        assert math.isnan(feats[name]), f"{name} should be NaN when snapshot=None"
+
+
+def test_creator_features_solo_creator_partial_nan() -> None:
+    """Solo creator (priors < 2): ``creator_median_peak_mc_sol`` and
+    ``creator_inter_token_interval_sec`` are mathematically undefined
+    (median of empty list, interval of single token) → NaN.
+    ``creator_age_days`` and ``creator_balance_sol`` remain real values."""
+    snap = {
+        "snapshot_prior_tokens": 1,
+        "creator_age_days": 5.2,
+        "creator_balance_sol": 3.7,
+        "median_peak_mc_sol": 0.0,
+        "inter_token_interval_sec": 0.0,
+    }
+    feats = extract_entry_features({}, creator_snapshot=snap)
+    assert math.isnan(feats["creator_median_peak_mc_sol"])
+    assert math.isnan(feats["creator_inter_token_interval_sec"])
+    assert feats["creator_age_days"] == 5.2
+    assert feats["creator_balance_sol"] == 3.7
+
+
+def test_creator_features_veteran_real_values() -> None:
+    """Creator with ≥ 2 priors keeps real median/interval values — no
+    degenerate-NaN replacement."""
+    snap = {
+        "snapshot_prior_tokens": 5,
+        "creator_age_days": 30.0,
+        "creator_balance_sol": 12.0,
+        "median_peak_mc_sol": 25.0,
+        "inter_token_interval_sec": 3600.0,
+    }
+    feats = extract_entry_features({}, creator_snapshot=snap)
+    assert feats["creator_median_peak_mc_sol"] == 25.0
+    assert feats["creator_inter_token_interval_sec"] == 3600.0
+    assert feats["creator_age_days"] == 30.0
+    assert feats["creator_balance_sol"] == 12.0
 
 
 def test_creator_balance_sol_in_schema() -> None:
@@ -332,10 +380,26 @@ def test_parity_with_parquet_if_present() -> None:
     df = pd.read_parquet(pq, columns=None)
     df_cols = set(df.columns)
     missing_in_parquet = [c for c in ENTRY_FEATURE_ORDER if c not in df_cols]
+    # New columns added across versions — skip when parquet predates each.
     new_in_v18 = set(TIME_AWARE_FEATURES) | set(TIME_AWARE_DERIVED_FEATURES)
-    if set(missing_in_parquet).issubset(new_in_v18) and missing_in_parquet:
+    new_in_v20 = {
+        "top10_buyer_prior_avg_wr",
+        "top10_buyer_prior_total_pnl_sol",
+        "n_buyers_first_5s",
+    }
+    # v21 added wallet_classifications — sniper / smart-money / bot /
+    # cluster counts among top-10 buyers. Same forward-compat principle:
+    # skip when parquet predates the schema rather than fail.
+    new_in_v21 = {
+        "n_snipers_in_top10",
+        "n_smart_money_in_top10",
+        "n_bots_in_top10",
+        "n_in_small_cluster_top10",
+    }
+    forward_compat = new_in_v18 | new_in_v20 | new_in_v21
+    if set(missing_in_parquet).issubset(forward_compat) and missing_in_parquet:
         pytest.skip(
-            "entry.parquet predates schema v18 (Phase 2.5); rebuild via "
+            "entry.parquet predates current schema; rebuild via "
             "`python -m pulse_bot.ml.build_dataset --dataset entry`"
         )
     assert (

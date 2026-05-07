@@ -11,6 +11,14 @@ PUMPFUN_FEE_PCT = 0.01  # 1% Pump.fun fee
 PUMPFUN_GRADUATION_SOL = 85.0  # SOL to graduate
 PUMPFUN_PRIORITY_FEE = 0.0001  # priority fee SOL
 
+# 2026-05-04 — PumpPortal silently gated `subscribeTokenTrade` and
+# `subscribeAccountTrade` behind an API key whose linked Lightning
+# wallet holds ≥0.02 SOL. Without the key the WS still accepts the
+# subscribe message but server-side keepalive drops at ~60-90s with
+# code 1011 — caused 3 days of zero realtime trade ingestion before
+# we probed the WS directly and saw the error response.
+PUMPPORTAL_API_KEY = os.environ.get("PUMPPORTAL_API_KEY", "")
+
 
 @dataclass
 class PulseBotConfig:
@@ -40,6 +48,15 @@ class PulseBotConfig:
     fast_score_threshold: int = 15
     fast_max_curve_pct: float = 60.0
     fast_creator_sold_reject: bool = True
+    # 2026-04-29 — creator self-buy gates. Most pump.fun rugs feature the
+    # dev sniping their own token in the first ~3 buys to manufacture
+    # momentum.  ``fast_creator_self_buy_reject_max_position`` = N rejects
+    # tokens where creator appears as buyer #1..N in the fast window
+    # (1-indexed; 0 disables, default = 0 / off — collect data first).
+    # ``fast_creator_self_buy_score`` adds a soft penalty even when not
+    # hard-rejected so the scorer reflects the rug risk.
+    fast_creator_self_buy_reject_max_position: int = 0
+    fast_creator_self_buy_score: int = -10
 
     # ── FAST PHASE scoring weights ─────────────────────────
     fast_w_buyers: int = 15
@@ -54,13 +71,32 @@ class PulseBotConfig:
     score_threshold_buy: int = 50  # strict defaults from volume-cliff sweep 2026-04-22
     score_threshold_borderline: int = 10
 
-    # Post-scoring trade collection window for SKIP/RULES tokens. Default
-    # 0 = current behavior (unsubscribe immediately after decision). Set
-    # to 600+ to keep collecting trades for ML label horizon — required
-    # to enable max_hold > observe_seconds in label / sweep pipelines.
-    # Enable via PULSE_EXTENDED_OBSERVE_SECONDS=600. Cost: extra WS
-    # bandwidth + DB writes for every non-DOA SKIP token.
-    pulse_extended_observe_seconds: float = 0.0
+    # Post-scoring trade collection window for SKIP/RULES tokens.
+    # Default lifted 0 → 600s 2026-04-26: zero default silently broke
+    # max_hold sweeps and entry_timing label generation (see memory
+    # ``project_post_scoring_data_truncation``). 600s = 10 min extra
+    # observation per non-DOA SKIP, costs +N WS/DB writes.
+    # Override via env ``PULSE_EXTENDED_OBSERVE_SECONDS`` (e.g. =0 to
+    # opt out, =1200 for 20 min).
+    pulse_extended_observe_seconds: float = 600.0
+
+    # ── LAUNCHPAD SOURCE ──────────────────────────────────
+    # Which adapter feeds new tokens / trades into the pipeline.
+    #   "pumpportal"        — current default: PumpPortal WebSocket only.
+    #   "geyser+pumpportal" — Yellowstone gRPC primary + PumpPortal fallback
+    #                         (deduplicated, auto-failover via multiplexer).
+    #   "geyser"            — gRPC only (no fallback, for testing).
+    pulse_launchpad: str = "pumpportal"
+    # Yellowstone gRPC endpoint of the local validator
+    # (must run agave-validator with --geyser-plugin-config).
+    pulse_geyser_endpoint: str = "127.0.0.1:10000"
+    # Optional auth token for hosted Yellowstone (Triton, Helius gRPC) —
+    # leave empty for our own local validator.
+    pulse_geyser_x_token: str = ""
+    # Multiplexer marks primary "stale" if no event for this many seconds
+    # and logs a fallback-active warning. Stream itself never stops; the
+    # fallback adapter just naturally carries it.
+    pulse_geyser_health_lag_seconds: float = 5.0
 
     # ── HARD ENTRY FILTERS (reject before scoring) ─────────
     min_market_cap_sol: float = 0.0  # min MCap to consider (0 = no filter)
@@ -255,6 +291,13 @@ class PulseBotConfig:
     # (anti-signal); reconsider once N_exit ≥ 3000.
     # User directive 2026-04-23: activated by default in paper-trading.
     exit_regression_active: bool = True
+    # 2026-04-30: dynamic max_hold via exit_quantile_max_hold model. Default
+    # OFF — bot uses static cfg.exit_max_hold_seconds. When True, the model
+    # is queried once per position to pick max_hold ∈ [30s, exit_max_hold_
+    # seconds], so it can only EARLY-exit (the static value remains the
+    # safety ceiling). Activate via PULSE_EXIT_MAX_HOLD_DYNAMIC=1 after
+    # paired-bootstrap shadow validation.
+    exit_max_hold_dynamic: bool = False
 
     # ── ENTRY ML gating + sizing (moved from hardcoded 2026-04-24) ──
     # Confidence-gating thresholds. None → use val-tuned values baked
@@ -334,8 +377,13 @@ def get_config() -> PulseBotConfig:
             "exit_regression_active",
             lambda v: v.lower() in ("1", "true", "yes"),
         ),
+        "PULSE_EXIT_MAX_HOLD_DYNAMIC": (
+            "exit_max_hold_dynamic",
+            lambda v: v.lower() in ("1", "true", "yes"),
+        ),
         "PULSE_ENTRY_PROBA_FLOOR": ("entry_ml_proba_floor", float),
         "PULSE_ENTRY_PROBA_CEILING": ("entry_ml_proba_ceiling", float),
+        "PULSE_ENTRY_MODE": ("entry_mode", str),
         "PULSE_ML_SIZING_PROBA_1": ("ml_sizing_proba_1", float),
         "PULSE_ML_SIZING_FRAC_1": ("ml_sizing_frac_1", float),
         "PULSE_ML_SIZING_PROBA_2": ("ml_sizing_proba_2", float),
@@ -354,6 +402,18 @@ def get_config() -> PulseBotConfig:
         "PULSE_EXIT_MAX_HOLD_SECONDS": ("exit_max_hold_seconds", float),
         "PULSE_EXIT_INACTIVITY_SECONDS": ("exit_inactivity_seconds", float),
         "PULSE_EXTENDED_OBSERVE_SECONDS": ("pulse_extended_observe_seconds", float),
+        "PULSE_FAST_CREATOR_SELF_BUY_REJECT_MAX_POSITION": (
+            "fast_creator_self_buy_reject_max_position",
+            int,
+        ),
+        "PULSE_FAST_CREATOR_SELF_BUY_SCORE": (
+            "fast_creator_self_buy_score",
+            int,
+        ),
+        "PULSE_LAUNCHPAD": ("pulse_launchpad", str),
+        "PULSE_GEYSER_ENDPOINT": ("pulse_geyser_endpoint", str),
+        "PULSE_GEYSER_X_TOKEN": ("pulse_geyser_x_token", str),
+        "PULSE_GEYSER_HEALTH_LAG_SECONDS": ("pulse_geyser_health_lag_seconds", float),
     }
     for env_key, target in env_map.items():
         val = os.environ.get(env_key)
@@ -363,4 +423,35 @@ def get_config() -> PulseBotConfig:
                 kwargs[field_name] = cast(val)
             else:
                 kwargs[target] = val
-    return PulseBotConfig(**kwargs)
+    cfg = PulseBotConfig(**kwargs)
+    _warn_on_dead_exit_combo(cfg)
+    return cfg
+
+
+def _warn_on_dead_exit_combo(cfg: PulseBotConfig) -> None:
+    """Emit a startup WARNING when ``(exit_max_hold_seconds,
+    exit_take_profit_pct)`` is the long-known dead pair (TP=100% but
+    max_hold=90s makes TP unreachable in practice — see memory
+    ``project_exit_take_profit_broken`` and
+    ``project_economic_backtest_failing``). Optimizer must re-tune the
+    pair; live bots running with these defaults are effectively in a
+    "rules + dead TP" regime.
+
+    We log once at config-build time and never raise so existing
+    setups keep working through the warning.
+    """
+    import logging as _logging
+
+    _logger = _logging.getLogger("pulse_bot.config")
+    tp = float(cfg.exit_take_profit_pct or 0.0)
+    mh = float(cfg.exit_max_hold_seconds or 0.0)
+    if tp >= 100.0 and mh <= 120.0:
+        _logger.warning(
+            "EXIT CONFIG WARNING: take_profit_pct=%.1f%% with "
+            "max_hold_seconds=%.0fs is the documented dead pair "
+            "(TP almost never fires; see "
+            "project_exit_take_profit_broken). Run optimizer sweep "
+            "before activating ML exit gates.",
+            tp,
+            mh,
+        )

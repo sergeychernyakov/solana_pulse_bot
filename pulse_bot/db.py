@@ -561,6 +561,31 @@ class Database:
         )
         return int(row["cnt"]) if row else 0
 
+    # ── Trades-by-mint (live hydration parity) ─────────────────────
+    def get_trades_for_mint_sync(
+        self,
+        mint: str,
+        max_ts: float,
+        source_db_path: str | None = None,
+    ) -> list[dict]:
+        """All trades for ``mint`` with ``timestamp <= max_ts``.
+
+        Used by ``FeatureHydrationService`` to mirror the training
+        pipeline's data source — training reads trades from DB, so
+        live hydration must too, otherwise top-N buyer ranking and
+        wallet_prior_stats lookup degrade silently when WS in-memory
+        accumulation lags (typical at T+30 — only 0-2 trades observed
+        live vs 5-10 actually present in DB).
+        """
+        return self._sync_query(
+            "SELECT mint, wallet, tx_type, sol_amount, token_amount, "
+            "market_cap_sol, v_sol_in_bonding_curve, timestamp, is_creator "
+            "FROM trades WHERE mint = ? AND timestamp <= ? "
+            "ORDER BY timestamp ASC, id ASC",
+            (mint, float(max_ts)),
+            source_db_path=source_db_path,
+        )
+
     # ── Wallet analytics (Phase E) ──────────────────────────────────
     def get_wallet_prior_stats_sync(
         self,

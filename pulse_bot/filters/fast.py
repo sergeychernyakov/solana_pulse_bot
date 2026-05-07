@@ -41,6 +41,8 @@ class FastFilter:
                 sell_ratio=0.0,
                 curve_pct=0.0,
                 elapsed=0.0,
+                creator_self_buy=False,
+                creator_self_buy_position=0,
             )
 
         buys = [t for t in trades if t.tx_type == "buy"]
@@ -78,6 +80,16 @@ class FastFilter:
             t.wallet == token.creator and t.tx_type == "sell" for t in trades
         )
 
+        # Creator self-buy? (rug-pull / fake-demand signal — dev sniping
+        # their own token to manufacture early-momentum appearance).
+        # Tracks 1-indexed position among buys; 0 = creator never bought.
+        creator_self_buy_position = 0
+        for idx, b in enumerate(buys, start=1):
+            if b.wallet == token.creator:
+                creator_self_buy_position = idx
+                break
+        creator_self_buy = creator_self_buy_position > 0
+
         # ── Hard rejects ───────────────────────────────────
         # Shared entry filters (same thresholds as Scorer._apply_rules): mirror
         # hard rejects here so fast-mode entries respect min_market_cap_sol /
@@ -99,6 +111,8 @@ class FastFilter:
                 sell_ratio=sell_ratio,
                 curve_pct=curve_pct,
                 elapsed=elapsed,
+                creator_self_buy=creator_self_buy,
+                creator_self_buy_position=creator_self_buy_position,
             )
 
         if cfg.min_market_cap_sol > 0 and mcap_sol < cfg.min_market_cap_sol:
@@ -113,6 +127,23 @@ class FastFilter:
 
         if self._cfg.fast_creator_sold_reject and creator_sold:
             return _reject("creator_sold_fast")
+
+        # Creator self-buy hard-reject (opt-in).  Most pump.fun rugs feature
+        # the creator buying their own token in the first ~3 seconds to
+        # manufacture momentum.  Default off — collect data + ML fits the
+        # sniping pattern naturally — operator can flip on for aggressive
+        # filtering.
+        creator_self_buy_max_pos = getattr(
+            self._cfg, "fast_creator_self_buy_reject_max_position", 0
+        )
+        if (
+            creator_self_buy
+            and creator_self_buy_max_pos > 0
+            and creator_self_buy_position <= creator_self_buy_max_pos
+        ):
+            return _reject(
+                f"creator_self_buy_pos{creator_self_buy_position}"
+            )
 
         # ── Scoring ────────────────────────────────────────
 
@@ -158,6 +189,19 @@ class FastFilter:
         else:
             reasons.append(f"curve_high_{curve_pct:.1f}%")
 
+        # 7. Creator self-buy soft penalty (when not hard-rejected above).
+        # Even if we don't reject outright, flag this as suspicious so
+        # the score reflects the rug risk.
+        creator_self_buy_score = getattr(
+            self._cfg, "fast_creator_self_buy_score", 0
+        )
+        if creator_self_buy and creator_self_buy_score:
+            total_score += creator_self_buy_score
+            reasons.append(
+                f"creator_self_buy_pos{creator_self_buy_position}"
+                f"({creator_self_buy_score:+d})"
+            )
+
         # HARD reject gates (April 2026): reject dead-on-arrival tokens even
         # if scoring threshold met. 92% of fast=BUY historically went to
         # full=SKIP (noise); these gates kill most of that tail.
@@ -188,6 +232,8 @@ class FastFilter:
             sell_ratio=sell_ratio,
             curve_pct=curve_pct,
             elapsed=elapsed,
+            creator_self_buy=creator_self_buy,
+            creator_self_buy_position=creator_self_buy_position,
         )
 
 
@@ -206,6 +252,13 @@ class FastResult:
         "sell_ratio",
         "curve_pct",
         "elapsed",
+        # 2026-04-29 — creator self-buy detection (rug-pull / fake-demand
+        # signal). ``creator_self_buy`` is True when the token's creator
+        # wallet appears as a buyer in the fast-window trade stream.
+        # ``creator_self_buy_position`` is the 1-indexed position among
+        # buyers (1 = first buy, 0 = creator never bought).
+        "creator_self_buy",
+        "creator_self_buy_position",
     )
 
     def __init__(
@@ -221,6 +274,8 @@ class FastResult:
         sell_ratio: float,
         curve_pct: float,
         elapsed: float,
+        creator_self_buy: bool = False,
+        creator_self_buy_position: int = 0,
     ) -> None:
         self.decision = decision
         self.score = score
@@ -233,3 +288,5 @@ class FastResult:
         self.sell_ratio = sell_ratio
         self.curve_pct = curve_pct
         self.elapsed = elapsed
+        self.creator_self_buy = creator_self_buy
+        self.creator_self_buy_position = creator_self_buy_position

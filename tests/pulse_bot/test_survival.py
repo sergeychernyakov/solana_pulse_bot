@@ -37,7 +37,12 @@ def _make_record(
     exit_time: float | None,
     exit_reason: str | None,
     status: str = "closed",
+    pnl_pct: float = -50.0,
 ) -> dict:
+    """2026-04-30: death is now defined by ``pnl_pct < -3 %``, not by
+    ``exit_reason`` (DEATH_PNL_THRESHOLD_PCT). Default ``pnl_pct=-50``
+    keeps the legacy "this is a death" intent for tests that pass an
+    exit_reason like ``pulse_dead``."""
     return {
         "mint": mint,
         "status": status,
@@ -46,6 +51,7 @@ def _make_record(
         "exit_reason": exit_reason or "",
         "entry_score": 50,
         "entry_buyer_number": 5,
+        "pnl_pct": pnl_pct,
     }
 
 
@@ -113,7 +119,11 @@ def test_death_label_in_correct_bucket() -> None:
 
 
 def test_censored_token_has_zero_hazards() -> None:
-    """Closed-but-not-dead and open tokens emit all-zero hazard labels."""
+    """Closed-but-not-dead and open tokens emit all-zero hazard labels.
+
+    Death is determined by ``pnl_pct < DEATH_PNL_THRESHOLD_PCT`` (-3 %)
+    since the 2026-04-30 fix; pass ``pnl_pct >= -3`` so these records
+    represent the censored / alive states the test asserts."""
     builder = SurvivalLabelBuilder(bucket_seconds=5.0, max_horizon_seconds=180.0)
     records = [
         _make_record(
@@ -121,6 +131,7 @@ def test_censored_token_has_zero_hazards() -> None:
             entry_time=0.0,
             exit_time=45.0,
             exit_reason="take_profit",
+            pnl_pct=30.0,
         ),
         _make_record(
             mint="OPEN",
@@ -128,6 +139,7 @@ def test_censored_token_has_zero_hazards() -> None:
             exit_time=None,
             exit_reason=None,
             status="open",
+            pnl_pct=0.0,
         ),
     ]
     df = builder.build_from_records(records, now_ts=10_000.0)

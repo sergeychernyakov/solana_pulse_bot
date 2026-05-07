@@ -13,13 +13,45 @@ try:
 except ImportError:
     pass
 
-from pulse_bot.backtest import BacktestEngine
+# Note (2026-04-28 codex review consolidation): the backtest CLI uses
+# Pipeline + ReplayLaunchpad as the single canonical runtime — see
+# the ``backtest`` command branch ~line 195. ``BacktestEngine`` from
+# pulse_bot/backtest.py is kept ONLY as a parity reference for
+# test_optimizer_parity.py and is no longer wired into any CLI path.
 from pulse_bot.config import get_config
 from pulse_bot.db import Database
 from pulse_bot.filters.fast import FastFilter
 from pulse_bot.filters.scorer import Scorer
+from pulse_bot.launchpads.base import Launchpad
 from pulse_bot.launchpads.pumpfun import PumpFunLaunchpad
 from pulse_bot.pipeline import Pipeline
+
+
+def _build_launchpad(config) -> Launchpad:  # type: ignore[no-untyped-def]
+    """Construct the live launchpad source per ``config.pulse_launchpad``.
+
+    ``pumpportal``        — current default, single PumpPortal WS adapter.
+    ``geyser+pumpportal`` — Yellowstone gRPC primary + PumpPortal fallback,
+                            deduplicated and auto-failover.
+    ``geyser``            — gRPC only (test / standalone mode, no fallback).
+    """
+    mode = (config.pulse_launchpad or "pumpportal").lower()
+    if mode == "pumpportal":
+        return PumpFunLaunchpad(config)
+    # Lazy-import so missing grpcio doesn't break monitor when unused.
+    from pulse_bot.launchpads.geyser import GeyserLaunchpad
+    from pulse_bot.launchpads.multiplexer import MultiplexerLaunchpad
+
+    if mode == "geyser":
+        return GeyserLaunchpad(config)
+    if mode == "geyser+pumpportal":
+        primary = GeyserLaunchpad(config)
+        fallback = PumpFunLaunchpad(config)
+        return MultiplexerLaunchpad(config, primary, fallback)
+    raise ValueError(
+        f"Unknown PULSE_LAUNCHPAD mode: {mode!r} "
+        "(expected pumpportal | geyser+pumpportal | geyser)"
+    )
 
 
 def main() -> None:
@@ -111,7 +143,7 @@ def _run_monitor() -> None:
         # ~zero variance; kept for future-launchpad / edge-case readiness).
         onchain_client = HeliusOnchainClient(helius_key)
 
-    launchpad = PumpFunLaunchpad(config)
+    launchpad = _build_launchpad(config)
     scorer = Scorer(config, db)
     fast_filter = FastFilter(config)
     pipeline = Pipeline(
@@ -216,19 +248,25 @@ def _run_verify() -> None:
 
     config = get_config()
 
+    # ``--limit=N`` caps how many of the most-recent live tokens get
+    # replayed. Default 10000 ≈ "all". Use ``--limit=300`` for a fast
+    # sanity-parity sweep that finishes in ~25min on the dev box.
+    sample_limit = 10000
     for arg in sys.argv[2:]:
         if arg.startswith("--db="):
             config.db_path = arg.split("=", 1)[1]
+        elif arg.startswith("--limit="):
+            sample_limit = int(arg.split("=", 1)[1])
 
     db = Database(config.db_path)
     db.init_schema()
 
     # Step 1: Check live data exists
-    live_rows = db.get_recent_scores(limit=10000, source="live")
+    live_rows = db.get_recent_scores(limit=sample_limit, source="live")
     if not live_rows:
         log.info("No live data. Run 'python main.py monitor' first, then 'python main.py verify'.")
         sys.exit(1)
-    log.info("Live scores: %d tokens", len(live_rows))
+    log.info("Live scores: %d tokens (limit=%d)", len(live_rows), sample_limit)
 
     # Step 2: Clear backtest scores only (keep creator cache from live — it's the correct state)
     log.info("Clearing backtest scores...")
@@ -237,7 +275,7 @@ def _run_verify() -> None:
     log.info("Running backtest (replay) on same data...")
     from pulse_bot.sources.replay import ReplayLaunchpad
 
-    launchpad = ReplayLaunchpad(config.db_path, speed=0.0)
+    launchpad = ReplayLaunchpad(config.db_path, speed=0.0, limit=sample_limit)
     scorer = Scorer(config, db)
     fast_filter = FastFilter(config)
     pipeline = Pipeline(config, db, launchpad, scorer, fast_filter)

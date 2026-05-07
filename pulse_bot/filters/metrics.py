@@ -25,6 +25,13 @@ class TokenMetrics:
     buy_diversity: int = 0  # unique buy amounts (rounded)
     max_buy_sol: float = 0.0  # largest single buy
     creator_sold: bool = False
+    # 2026-04-29 — creator self-buy detection (rug-pull / fake-demand
+    # signal). Mirrors the fast-window detector in FastFilter but on the
+    # full window so the ML features see it for any window size.
+    # ``creator_self_buy_position`` is 1-indexed among buys in the window
+    # (1 = first buyer, 0 = creator never bought in window).
+    creator_self_buy: bool = False
+    creator_self_buy_position: int = 0
 
     # New: trade pattern analysis
     avg_buy_sol: float = 0.0  # mean buy size
@@ -151,6 +158,13 @@ class MetricsCalculator:
         m.buy_diversity = len({round(a, 4) for a in buy_amounts}) if buy_amounts else 0
         m.max_buy_sol = max(buy_amounts, default=0.0)
         m.creator_sold = any(t.wallet == token.creator for t in sells)
+        # Creator self-buy: 1-indexed position among buys, 0 = never bought
+        m.creator_self_buy_position = 0
+        for idx, b in enumerate(buys, start=1):
+            if b.wallet == token.creator:
+                m.creator_self_buy_position = idx
+                break
+        m.creator_self_buy = m.creator_self_buy_position > 0
 
         m.sell_ratio = m.sell_count / max(m.buy_count, 1)
 

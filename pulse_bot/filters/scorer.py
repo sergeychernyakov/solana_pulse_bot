@@ -109,6 +109,8 @@ class Scorer:
             buy_diversity=m.buy_diversity,
             max_buy_sol=m.max_buy_sol,
             creator_sold=m.creator_sold,
+            creator_self_buy=m.creator_self_buy,
+            creator_self_buy_position=m.creator_self_buy_position,
             sell_pressure=m.sell_ratio,
             avg_buy_sol=m.avg_buy_sol,
             median_buy_sol=m.median_buy_sol,

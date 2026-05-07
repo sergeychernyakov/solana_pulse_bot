@@ -29,8 +29,88 @@ import pandas as pd
 import psycopg2
 import psycopg2.extras
 
+from pulse_bot.config import get_config
 from pulse_bot.db import _resolve_dsn
 from pulse_bot.ml.features import SCORER_FEATURES
+from pulse_bot.ml.simulate_exit import simulate_exit
+from pulse_bot.models import Trade
+
+
+_CACHED_CONFIG = None
+
+
+def _get_cached_config():
+    """Cache the pulse config — called per-row, building it from env each time
+    would dominate runtime."""
+    global _CACHED_CONFIG
+    if _CACHED_CONFIG is None:
+        _CACHED_CONFIG = get_config()
+    return _CACHED_CONFIG
+
+
+def _df_rows_to_trades(
+    df: pd.DataFrame, mint: str, creator_wallet: str | None = None
+) -> list[Trade]:
+    """Construct Trade objects from a trades-table row slice for simulate_exit.
+
+    2026-05-01 (codex M3): ``is_creator`` is honored when ``creator_wallet``
+    is supplied — otherwise the simulated exit never sees ``creator_dump``
+    even on tokens where the creator actually sold, biasing forward-hold
+    labels longer than reality.
+    """
+    out: list[Trade] = []
+    for r in df.itertuples(index=False):
+        wallet = str(getattr(r, "wallet", "") or "")
+        out.append(
+            Trade(
+                mint=mint,
+                wallet=wallet,
+                tx_type=str(r.tx_type),
+                sol_amount=float(r.sol_amount or 0.0),
+                token_amount=float(r.token_amount or 0.0),
+                new_token_balance=0.0,
+                bonding_curve_key="",
+                v_sol_in_bonding_curve=float(getattr(r, "v_sol_in_bonding_curve", 0.0) or 0.0),
+                v_tokens_in_bonding_curve=0.0,
+                market_cap_sol=float(r.market_cap_sol or 0.0),
+                timestamp=float(r.timestamp),
+                is_creator=bool(creator_wallet) and wallet == creator_wallet,
+            )
+        )
+    return out
+
+
+def _simulate_forward_hold_seconds(
+    trades: pd.DataFrame,
+    t: float,
+    current_price: float,
+    mint: str,
+    creator_wallet: str | None = None,
+) -> float:
+    """Simulate live exit policy over trades after ``t`` and return time-to-exit
+    in seconds. Right-censored at the end of the available trade stream.
+
+    Used as the regression target for the ``exit_quantile_max_hold`` head —
+    matches the question the model must answer at inference: "if I entered
+    now at current state, how long would the bot hold this position?"
+
+    2026-05-01 (codex M2): wrapped in broad exception handler. One bad row
+    must not crash a 60k-row dataset rebuild — return 0.0 (right-censored
+    immediate-exit) and continue.
+    """
+    fwd_df = trades[trades.timestamp > t]
+    if fwd_df.empty:
+        return 0.0
+    try:
+        config = _get_cached_config()
+        fwd_trades = _df_rows_to_trades(fwd_df, mint, creator_wallet)
+        result = simulate_exit(config, fwd_trades, t, current_price)
+        return float(result.hold_seconds)
+    except Exception:  # nosec B110
+        # Reason: dataset rebuild is a long-running batch; one malformed
+        # mint must not abort the whole run. Treat as immediate-exit.
+        logger.exception("simulate_exit failed for %s @ %.0f — censoring", mint, t)
+        return 0.0
 
 
 def _connect_pg(db_path: str):
@@ -178,6 +258,20 @@ def build_entry_dataset(
         """,
         conn,
     )
+    h60 = pd.read_sql_query(
+        """
+        SELECT mint,
+               top1_pct AS top1_60,
+               top5_pct AS top5_60,
+               top10_pct AS top10_60,
+               holder_count AS hc_60
+        FROM token_holders_snapshots
+        WHERE capture_at_age_sec = 60.0
+          AND is_negative_row = 0
+          AND top1_pct IS NOT NULL
+        """,
+        conn,
+    )
     h120 = pd.read_sql_query(
         """
         SELECT mint,
@@ -193,7 +287,37 @@ def build_entry_dataset(
         conn,
     )
     base = base.merge(h30, on="mint", how="left")
+    base = base.merge(h60, on="mint", how="left")
     base = base.merge(h120, on="mint", how="left")
+
+    # Train/serve parity fix (2026-05-05): Pipeline._fetch_holder_snapshot_all
+    # extrapolates T+120 from (T+30, T+60) when the scheduled T+120 capture
+    # hasn't landed yet at predict time (race: scoring at T+90 vs capture at
+    # T+120). Mirror that here for the ~1.2% of historical rows that have
+    # T+30 + T+60 but no T+120, so the live distribution matches training.
+    # Linear projection: f(120) ≈ 2*f(60) - f(30). Pump.fun bonding-curve
+    # concentration is mostly monotonic in the first 2 minutes — this is a
+    # defensible proxy. holder_count clamped to >= max(hc_30, hc_60).
+    needs_extrap = base["top1_120"].isna() & ~base["top1_60"].isna() & ~base["top1_30"].isna()
+    if needs_extrap.any():
+        n_extrap = int(needs_extrap.sum())
+        logger.info("Extrapolating T+120 holder snapshot for %d / %d rows", n_extrap, len(base))
+        for col_30, col_60, col_120 in [
+            ("top1_30",  "top1_60",  "top1_120"),
+            ("top5_30",  "top5_60",  "top5_120"),
+            ("top10_30", "top10_60", "top10_120"),
+        ]:
+            base.loc[needs_extrap, col_120] = (
+                2.0 * base.loc[needs_extrap, col_60] - base.loc[needs_extrap, col_30]
+            ).clip(0.0, 100.0)
+        # hc_120: linear extrap, but holders only ever grow, so floor by
+        # max(hc_30, hc_60).
+        hc_extrap = (
+            2.0 * base.loc[needs_extrap, "hc_60"] - base.loc[needs_extrap, "hc_30"]
+        )
+        hc_floor = base.loc[needs_extrap, ["hc_30", "hc_60"]].max(axis=1)
+        base.loc[needs_extrap, "hc_120"] = pd.concat([hc_extrap, hc_floor], axis=1).max(axis=1)
+
     base["top1_delta"] = base["top1_120"] - base["top1_30"]
     base["top5_delta"] = base["top5_120"] - base["top5_30"]
     base["top10_delta"] = base["top10_120"] - base["top10_30"]
@@ -290,17 +414,43 @@ def build_entry_dataset(
                 base[c] = base[c].fillna(0.0)
         # helius_snapshot_complete is already 0/1 from the expression
         # above; no fillna needed.
-        creator_cols = [
-            "creator_age_days",
+        #
+        # Creator features — train/serve parity (2026-05-05): align with
+        # ``_get_creator_feat`` in features/_main.py:
+        #   * Rows with no creator snapshot at all (merge_asof miss) → NaN
+        #     (matches serve when ``creator_snapshot=None``).
+        #   * Rows with snapshot but creator_total_prior_tokens < 2 →
+        #     ``creator_median_peak_mc_sol`` and ``creator_inter_token_interval_sec``
+        #     are mathematically undefined (median of empty / interval of one)
+        #     → NaN. The other creator features (age_days, balance_sol) stay as-is.
+        # XGBoost handles NaN natively via missingness splits; this restores
+        # the distribution that the model needs to see in serve, where ~64%
+        # of live creators are solo (single-token wallets).
+        creator_zero_fill = {
+            "creator_total_prior_tokens",  # legitimate count; 0 for solo
+            "creator_graduated_count",     # legitimate count
+        }
+        creator_nan_for_solo = {
             "creator_median_peak_mc_sol",
             "creator_inter_token_interval_sec",
-            "creator_total_prior_tokens",
+        }
+        creator_keep_real = {
+            "creator_age_days",
             "creator_balance_sol",
-            "creator_graduated_count",
-        ]
-        for c in creator_cols:
+        }
+        if "creator_total_prior_tokens" in base.columns:
+            solo_mask = base["creator_total_prior_tokens"].fillna(0).lt(2)
+            for c in creator_nan_for_solo:
+                if c in base.columns:
+                    import numpy as _np
+                    base.loc[solo_mask, c] = _np.nan
+        # Counts → 0-fill (no snapshot ≡ no observed priors).
+        for c in creator_zero_fill:
             if c in base.columns:
                 base[c] = base[c].fillna(0.0)
+        # ``creator_age_days`` and ``creator_balance_sol`` stay NaN when
+        # no snapshot — XGBoost will route them via the missingness branch
+        # rather than treat them as "fresh wallet, zero balance".
 
     # Phase E — top-3 buyer wallet prior features. Same helper used
     # by live pipeline (``compute_top3_buyer_wallets``) + same SQL
@@ -312,7 +462,8 @@ def build_entry_dataset(
     from pulse_bot.ml.features import (
         WALLET_FEATURES,
         _extract_wallet_prior_features,
-        compute_top3_buyer_wallets,
+        compute_n_buyers_first_5s,
+        compute_topN_buyer_wallets,
     )
 
     wa_row_count = _pg_exec(conn, "SELECT COUNT(*) FROM wallet_activity").fetchone()[0]
@@ -333,64 +484,178 @@ def build_entry_dataset(
 
     wallet_feat_rows: list[dict[str, float]] = []
     nz_wallet_feat_count = 0
+    # Pre-load mint→created_at map for n_buyers_first_5s computation.
+    mint_created_map: dict[str, float] = {}
+    for mrow in _pg_exec(
+        conn, "SELECT mint, created_at FROM tokens"
+    ).fetchall():
+        mint_created_map[mrow[0]] = float(mrow[1] or 0.0)
+
+    # 2026-04-28 perf fix: replace ~88k per-mint trade queries with a
+    # single bulk SELECT + pandas groupby. Old loop took ~30 min on
+    # rich (88k roundtrips × ~20 ms each). New path fetches all
+    # ts<=max(scored_at) trades for the mints we care about in one
+    # pass and indexes into a dict — runtime drops to ~2 min.
+    logger.info("Bulk-fetching trade rows for %d mints (replaces per-row "
+                "loop)...", len(base))
+    base_mints = base["mint"].tolist()
+    max_scored = float(base["scored_at"].max()) if len(base) else 0.0
+    trades_by_mint: dict[str, list[dict]] = {m: [] for m in base_mints}
+    chunk = 5000
+    fetched = 0
+    for i in range(0, len(base_mints), chunk):
+        chunk_mints = base_mints[i:i + chunk]
+        placeholders = ",".join("?" * len(chunk_mints))
+        cur = _pg_exec(
+            conn,
+            f"""SELECT mint, tx_type, wallet, sol_amount, timestamp
+                FROM trades
+                WHERE mint IN ({placeholders}) AND timestamp <= ?
+                ORDER BY id ASC""",
+            (*chunk_mints, max_scored),
+        )
+        for tr in cur.fetchall():
+            mint = tr[0]
+            if mint in trades_by_mint:
+                trades_by_mint[mint].append({
+                    "tx_type": tr[1],
+                    "wallet": tr[2],
+                    "sol_amount": tr[3],
+                    "timestamp": tr[4],
+                })
+                fetched += 1
+    logger.info("Bulk-fetched %d trade rows (avg %.1f per mint)",
+                fetched, fetched / max(len(base_mints), 1))
+
+    # Pre-collect all top-10 buyer wallets across mints and bulk-query
+    # wallet_activity once (instead of per-mint subqueries). Filter by
+    # last_trade_ts < per-mint scored_at applied client-side.
+    per_mint_top10: dict[str, list[str]] = {}
+    all_wallets: set[str] = set()
     for _, row in base.iterrows():
         mint = row["mint"]
         scored_at = float(row["scored_at"])
-        trade_rows = _pg_exec(
-            conn,
-            """SELECT tx_type, wallet, sol_amount FROM trades
-               WHERE mint = ? AND timestamp <= ?
-               ORDER BY id ASC""",
-            (mint, scored_at),
-        ).fetchall()
-        trades_as_dicts = [
-            {"tx_type": tr[0], "wallet": tr[1], "sol_amount": tr[2]}
-            for tr in trade_rows
-        ]
-        top3 = compute_top3_buyer_wallets(trades_as_dicts)
-        stats_map: dict[str, dict] = {}
-        if top3 and wa_row_count > 0:
-            placeholders = ",".join("?" * len(top3))
-            stats_cur = _pg_exec(
+        trades_for_mint = trades_by_mint.get(mint, [])
+        # Filter to trades ≤ scored_at (bulk fetched at max_scored above
+        # so a per-mint trim is needed for the leakage-safe semantics).
+        trades_clipped = [t for t in trades_for_mint if t["timestamp"] <= scored_at]
+        top10 = compute_topN_buyer_wallets(trades_clipped, n=10)
+        per_mint_top10[mint] = top10
+        all_wallets.update(top10)
+
+    # Bulk pull wallet_activity for the union of all top10 wallets,
+    # one query for everyone. We collapse the per-mint filter
+    # (mint != X AND last_trade_ts < scored_at) client-side because
+    # the wallet→mint set is large.
+    wallet_activity_rows: dict[str, list[dict]] = {w: [] for w in all_wallets}
+    if all_wallets and wa_row_count > 0:
+        wallets_list = list(all_wallets)
+        for i in range(0, len(wallets_list), chunk):
+            chunk_w = wallets_list[i:i + chunk]
+            placeholders = ",".join("?" * len(chunk_w))
+            cur = _pg_exec(
                 conn,
-                f"""SELECT wallet,
-                           COUNT(*) AS all_mint_count,
-                           MIN(first_buy_ts) AS first_seen_ts,
-                           SUM(CASE WHEN sell_volume_sol > 0 THEN 1 ELSE 0 END)
-                               AS closed_mint_count,
-                           SUM(CASE WHEN sell_volume_sol > 0
-                                    THEN sell_volume_sol - buy_volume_sol
-                                    ELSE 0 END) AS total_pnl_sol,
-                           SUM(CASE WHEN sell_volume_sol > 0
-                                    AND sell_volume_sol - buy_volume_sol > 0
-                                    THEN 1 ELSE 0 END) AS win_count,
-                           MAX(CASE WHEN sell_volume_sol > 0
-                                    THEN sell_volume_sol - buy_volume_sol
-                                    ELSE NULL END) AS max_pnl_sol
+                f"""SELECT wallet, mint, first_buy_ts, last_trade_ts,
+                           buy_volume_sol, sell_volume_sol
                     FROM wallet_activity
-                    WHERE wallet IN ({placeholders})
-                      AND mint != ?
-                      AND last_trade_ts < ?
-                    GROUP BY wallet""",
-                (*top3, mint, scored_at),
+                    WHERE wallet IN ({placeholders})""",
+                tuple(chunk_w),
             )
-            for srow in stats_cur.fetchall():
-                all_mc = int(srow[1] or 0)
-                closed_mc = int(srow[3] or 0)
-                wc = int(srow[5] or 0)
-                stats_map[srow[0]] = {
-                    "all_mint_count": all_mc,
-                    "closed_mint_count": closed_mc,
-                    "wr": (wc / closed_mc) if closed_mc > 0 else float("nan"),
-                    "total_pnl_sol": float(srow[4] or 0.0),
-                    "max_pnl_sol": (
-                        float(srow[6]) if srow[6] is not None else float("nan")
-                    ),
-                    "first_seen_ts": float(srow[2] or 0.0),
-                }
-        feats = _extract_wallet_prior_features(stats_map, top3, scored_at)
+            for r in cur.fetchall():
+                wallet_activity_rows[r[0]].append({
+                    "mint": r[1],
+                    "first_buy_ts": float(r[2] or 0.0),
+                    "last_trade_ts": float(r[3] or 0.0),
+                    "buy_volume_sol": float(r[4] or 0.0),
+                    "sell_volume_sol": float(r[5] or 0.0),
+                })
+    logger.info("Bulk-pulled wallet_activity for %d distinct top-10 wallets",
+                len(all_wallets))
+
+    # v21 (2026-04-28): bulk-pull wallet_classifications for sniper /
+    # smart_money / bot / cluster flags. One query for the whole top-10
+    # union; ~150k rows in the table so this is millisecond cheap.
+    classifications: dict[str, dict] = {}
+    if all_wallets:
+        try:
+            wallets_list = list(all_wallets)
+            for i in range(0, len(wallets_list), chunk):
+                chunk_w = wallets_list[i:i + chunk]
+                placeholders = ",".join("?" * len(chunk_w))
+                cur = _pg_exec(
+                    conn,
+                    f"""SELECT wallet, is_sniper, is_smart_money, is_bot,
+                               cluster_size
+                        FROM wallet_classifications
+                        WHERE wallet IN ({placeholders})""",
+                    tuple(chunk_w),
+                )
+                for r in cur.fetchall():
+                    classifications[r[0]] = {
+                        "is_sniper": bool(r[1] or 0),
+                        "is_smart_money": bool(r[2] or 0),
+                        "is_bot": bool(r[3] or 0),
+                        "cluster_size": r[4],
+                    }
+            logger.info(
+                "Bulk-pulled wallet_classifications for %d wallets",
+                len(classifications),
+            )
+        except Exception as exc:
+            logger.warning(
+                "wallet_classifications JOIN failed (continuing w/o v21 "
+                "features): %s", exc,
+            )
+
+    for _, row in base.iterrows():
+        mint = row["mint"]
+        scored_at = float(row["scored_at"])
+        trades_for_mint = trades_by_mint.get(mint, [])
+        trades_clipped = [t for t in trades_for_mint if t["timestamp"] <= scored_at]
+        top10 = per_mint_top10.get(mint, [])
+
+        # Compute per-wallet stats client-side (replaces the per-mint
+        # GROUP BY query on wallet_activity).
+        stats_map: dict[str, dict] = {}
+        for w in top10:
+            rows_w = [
+                r for r in wallet_activity_rows.get(w, [])
+                if r["mint"] != mint and r["last_trade_ts"] < scored_at
+            ]
+            if not rows_w:
+                continue
+            all_mc = len(rows_w)
+            closed_rows = [r for r in rows_w if r["sell_volume_sol"] > 0]
+            closed_mc = len(closed_rows)
+            total_pnl = sum(r["sell_volume_sol"] - r["buy_volume_sol"] for r in closed_rows)
+            wins = sum(
+                1 for r in closed_rows
+                if (r["sell_volume_sol"] - r["buy_volume_sol"]) > 0
+            )
+            max_pnl = max(
+                (r["sell_volume_sol"] - r["buy_volume_sol"] for r in closed_rows),
+                default=None,
+            )
+            first_seen = min((r["first_buy_ts"] for r in rows_w), default=0.0)
+            stats_map[w] = {
+                "all_mint_count": all_mc,
+                "closed_mint_count": closed_mc,
+                "wr": (wins / closed_mc) if closed_mc > 0 else float("nan"),
+                "total_pnl_sol": float(total_pnl),
+                "max_pnl_sol": (float(max_pnl) if max_pnl is not None else float("nan")),
+                "first_seen_ts": float(first_seen),
+            }
+
+        # v21 — pass classification subset for top10 to extractor.
+        cls_subset = {w: classifications[w] for w in top10 if w in classifications}
+        feats = _extract_wallet_prior_features(
+            stats_map, top10, scored_at,
+            wallet_classifications=cls_subset,
+        )
+        feats["n_buyers_first_5s"] = compute_n_buyers_first_5s(
+            trades_clipped, mint_created_map.get(mint, 0.0)
+        )
         wallet_feat_rows.append(feats)
-        # Track how many rows got non-NaN features for diagnostics.
         import math as _m
 
         if not _m.isnan(feats["top3_buyer_prior_mint_count_sum"]):
@@ -732,7 +997,7 @@ def build_exit_dataset(
     candidates = pd.read_sql_query(
         """
         SELECT DISTINCT s.mint, s.scored_at AS entry_ts,
-               t.created_at
+               t.created_at, t.creator AS creator_wallet
         FROM token_scores s
         JOIN tokens t ON t.mint = s.mint
         WHERE s.source = 'live'
@@ -750,6 +1015,7 @@ def build_exit_dataset(
     rows: list[dict] = []
     for _, c in candidates.iterrows():
         mint, entry_ts = c["mint"], c["entry_ts"]
+        creator_wallet = c.get("creator_wallet") if hasattr(c, "get") else c["creator_wallet"]
         trades = pd.read_sql_query(
             """SELECT timestamp, tx_type, sol_amount, token_amount,
                       market_cap_sol, v_sol_in_bonding_curve, wallet
@@ -814,6 +1080,17 @@ def build_exit_dataset(
             else:
                 fwd_price = fwd_window.price.iloc[-1]
             forward_pnl_60s = (fwd_price - current_price) / current_price * 100
+            # Time-to-exit target for max_hold quantile head (v2 2026-04-30).
+            # Was: ``forward_seconds_to_peak`` had survivor bias (ρ=-0.196,
+            # anti_correlated). DOA tokens collapsed to sec=0; pumpers to
+            # sec=600. Model learned the inverse of what we need.
+            # Now: simulate live exit policy on future trades; label is the
+            # time the bot would actually hold this position. This matches
+            # the inference-time question — "given current state, when
+            # would max_hold/SL/TP fire?"
+            forward_seconds_to_exit = _simulate_forward_hold_seconds(
+                trades, t, current_price, mint, creator_wallet
+            )
 
             rows.append(
                 {
@@ -842,6 +1119,7 @@ def build_exit_dataset(
                         else 0.0
                     ),
                     "forward_pnl_60s": float(forward_pnl_60s),
+                    "forward_seconds_to_exit": float(forward_seconds_to_exit),
                     "label": label,
                 }
             )

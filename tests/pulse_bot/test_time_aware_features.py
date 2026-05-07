@@ -129,7 +129,11 @@ def test_entry_feature_order_includes_time_aware_at_end() -> None:
 
 
 def test_schema_version_bumped_to_v18() -> None:
-    assert FEATURE_SCHEMA_VERSION == "entry_v18_20260425"
+    # Bumped through v19 (dead-feature cleanup) → v20 (wallet additions)
+    # → v21 (wallet classifications: sniper/smart-money/bot/cluster
+    # counts among top-10 buyers). Test name kept for git-blame
+    # continuity; assertion tracks the current head-of-line version.
+    assert FEATURE_SCHEMA_VERSION == "entry_v21_20260428_classifications"
 
 
 # ── Test 4: build_entry_dataset wiring ──────────────────────────────

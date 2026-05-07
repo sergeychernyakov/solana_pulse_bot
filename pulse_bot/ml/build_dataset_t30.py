@@ -36,7 +36,8 @@ from pulse_bot.ml.features import (
     SCORER_FEATURES_T30,
     WALLET_FEATURES,
     _extract_wallet_prior_features,
-    compute_top3_buyer_wallets,
+    compute_n_buyers_first_5s,
+    compute_topN_buyer_wallets,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,7 @@ def build_entry_dataset_t30(
     label_horizon_sec: float = 300.0,
     require_helius: bool = False,
     now_buffer_sec: float | None = None,
+    base_parquet_path: Path | None = None,
 ) -> pd.DataFrame:
     """Build the @T+30 entry dataset.
 
@@ -71,13 +73,46 @@ def build_entry_dataset_t30(
     Returns a DataFrame whose feature columns match
     ``ENTRY_T30_FEATURE_ORDER`` exactly, plus ``mint``, ``scored_at``,
     ``label``, ``realized_pnl_pct``, ``exit_reason``.
+
+    2026-04-28 perf fix: if ``base_parquet_path`` is provided AND the
+    file is fresh (mtime within 24h), reuse the pre-built dataframe
+    instead of calling ``build_entry_dataset`` from scratch. This was
+    the second-biggest cost in the retrain pipeline — the inner build
+    duplicated ~25min of work that ``train --dataset entry`` had just
+    done. CLI auto-passes ``data/ml/entry.parquet``.
     """
-    base = build_entry_dataset(
-        db_path,
-        label_horizon_sec=label_horizon_sec,
-        require_helius=require_helius,
-        now_buffer_sec=now_buffer_sec,
-    )
+    base: pd.DataFrame | None = None
+    import time as _time
+    if base_parquet_path is not None and base_parquet_path.exists():
+        age_sec = _time.time() - base_parquet_path.stat().st_mtime
+        if age_sec < 24 * 3600:
+            try:
+                base = pd.read_parquet(base_parquet_path)
+                logger.info(
+                    "Reusing freshly-built %s (%.0f min old, %d rows) — "
+                    "skipping build_entry_dataset (saves ~25 min)",
+                    base_parquet_path,
+                    age_sec / 60,
+                    len(base),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to load %s, falling back to full build: %s",
+                    base_parquet_path, exc,
+                )
+                base = None
+        else:
+            logger.info(
+                "%s is %.0f min old (>24h) — forcing full rebuild",
+                base_parquet_path, age_sec / 60,
+            )
+    if base is None:
+        base = build_entry_dataset(
+            db_path,
+            label_horizon_sec=label_horizon_sec,
+            require_helius=require_helius,
+            now_buffer_sec=now_buffer_sec,
+        )
     if base.empty:
         logger.warning("base entry dataset empty — returning empty T30 frame")
         return base
@@ -100,16 +135,21 @@ def build_entry_dataset_t30(
             # ranking matches what the live T+30 inference would see.
             trade_rows = _pg_exec(
                 conn,
-                """SELECT tx_type, wallet, sol_amount FROM trades
+                """SELECT tx_type, wallet, sol_amount, timestamp FROM trades
                    WHERE mint = ? AND timestamp <= ?
                    ORDER BY id ASC""",
                 (mint, t30_cutoff),
             ).fetchall()
             trades_as_dicts = [
-                {"tx_type": tr[0], "wallet": tr[1], "sol_amount": tr[2]}
+                {
+                    "tx_type": tr[0],
+                    "wallet": tr[1],
+                    "sol_amount": tr[2],
+                    "timestamp": tr[3],
+                }
                 for tr in trade_rows
             ]
-            top3 = compute_top3_buyer_wallets(trades_as_dicts)
+            top3 = compute_topN_buyer_wallets(trades_as_dicts, n=10)
             stats_map: dict[str, dict] = {}
             if top3 and wa_row_count > 0:
                 placeholders = ",".join("?" * len(top3))
@@ -151,7 +191,40 @@ def build_entry_dataset_t30(
                         ),
                         "first_seen_ts": float(srow[2] or 0.0),
                     }
-            feats = _extract_wallet_prior_features(stats_map, top3, t30_cutoff)
+            # v21 — wallet_classifications JOIN for top3 wallets.
+            cls_subset: dict = {}
+            if top3:
+                try:
+                    placeholders = ",".join("?" * len(top3))
+                    cls_cur = _pg_exec(
+                        conn,
+                        f"""SELECT wallet, is_sniper, is_smart_money, is_bot,
+                                   cluster_size
+                            FROM wallet_classifications
+                            WHERE wallet IN ({placeholders})""",
+                        tuple(top3),
+                    )
+                    for r in cls_cur.fetchall():
+                        cls_subset[r[0]] = {
+                            "is_sniper": bool(r[1] or 0),
+                            "is_smart_money": bool(r[2] or 0),
+                            "is_bot": bool(r[3] or 0),
+                            "cluster_size": r[4],
+                        }
+                except Exception:
+                    pass  # v21 features default to NaN
+            feats = _extract_wallet_prior_features(
+                stats_map, top3, t30_cutoff,
+                wallet_classifications=cls_subset,
+            )
+            # v20 sniper proxy at T+30. Need mint creation time for age.
+            created_at_row = _pg_exec(
+                conn, "SELECT created_at FROM tokens WHERE mint = ?", (mint,)
+            ).fetchone()
+            mint_created_at = float(created_at_row[0] or 0.0) if created_at_row else 0.0
+            feats["n_buyers_first_5s"] = compute_n_buyers_first_5s(
+                trades_as_dicts, mint_created_at
+            )
             wallet_feat_rows.append(feats)
         wallet_df = pd.DataFrame(wallet_feat_rows)
         for col in WALLET_FEATURES:
@@ -224,10 +297,15 @@ def main() -> None:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    # 2026-04-28: auto-reuse the just-built entry.parquet when
+    # invoked right after `train --dataset entry`. Saves ~25 min by
+    # skipping the duplicate build_entry_dataset call inside.
+    base_path = out_dir / "entry.parquet"
     df = build_entry_dataset_t30(
         args.db,
         label_horizon_sec=args.entry_horizon_sec,
         require_helius=args.require_helius,
+        base_parquet_path=base_path if base_path.exists() else None,
     )
     out = out_dir / "entry_t30.parquet"
     try:

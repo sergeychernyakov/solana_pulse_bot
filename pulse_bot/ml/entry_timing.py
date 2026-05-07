@@ -99,7 +99,7 @@ TIMING_FEATURE_ORDER: tuple[str, ...] = (
     "creator_sold",
 )
 
-TIMING_SCHEMA_VERSION: str = "entry_timing_v1_20260425"
+TIMING_SCHEMA_VERSION: str = "entry_timing_v2_nan_20260426"
 
 # Label threshold defaults — exposed on EntryTimingLabelBuilder so a
 # caller can sweep them without forking the module.
@@ -152,13 +152,32 @@ def extract_snapshot_features(
 
     Returns:
         Feature dict with exactly the keys in :data:`TIMING_FEATURE_ORDER`.
-        Missing data → 0.0 (XGBoost handles this fine; later iterations
-        can switch to NaN sentinels for "no observation yet").
+        Defaults are nuanced (codex 2026-04-26 finding #3):
+          * COUNT/SUM features (unique_buyers, buy_count, sell_count,
+            buy_volume_sol, sell_volume_sol, creator_sold) default to
+            ``0.0`` — absence is observable.
+          * DERIVED / observation features (mc_at_t, mc_growth_pct,
+            buy_rate, sell_pressure, *_ratio, time_since_first_buy,
+            first_buy_sol, max_buy_sol, avg_buy_sol) default to
+            ``NaN`` — undefined when there's no underlying datum.
+        Schema bumped to ``entry_timing_v2_nan_20260426`` so the trees
+        learn the missing-branch split.
     """
     cutoff_ts = token_created_at + snapshot_t
     visible = [t for t in trades if t.timestamp <= cutoff_ts]
 
-    feats: dict[str, float] = {k: 0.0 for k in TIMING_FEATURE_ORDER}
+    _ZERO_DEFAULT_KEYS = {
+        "unique_buyers",
+        "buy_count",
+        "sell_count",
+        "buy_volume_sol",
+        "sell_volume_sol",
+        "creator_sold",
+    }
+    feats: dict[str, float] = {
+        k: 0.0 if k in _ZERO_DEFAULT_KEYS else float("nan")
+        for k in TIMING_FEATURE_ORDER
+    }
     feats["snapshot_t"] = float(snapshot_t)
 
     if not visible:
@@ -428,7 +447,43 @@ def train_entry_timing(
     # The Booster path simply respects ``num_class=3`` regardless and
     # outputs zero-probability columns for unseen classes. Inference
     # then loads it identically via ``xgb.Booster().load_model``.
-    dtrain = xgb.DMatrix(X, label=y)
+    #
+    # 2026-04-28 fix: per-row sample_weight = 1 / class_count[y_i]
+    # (inverse-frequency balancing). Without this the model collapses
+    # to "predict SKIP for everything" — SKIP class is 75-80% of rows
+    # so plain log-loss minimization just learns the prior. Live
+    # observation: p_skip=1.00 on virtually all live tokens. Balanced
+    # weighting forces the model to actually distinguish the rare
+    # BUY/WAIT classes.
+    import numpy as _np
+    n_total = len(y)
+    class_counts_arr = _np.bincount(y, minlength=3).astype(float)
+    # Inverse frequency, normalized so total weight = n_total (keeps
+    # gradient magnitudes comparable to the unbalanced run).
+    weights_per_class = _np.where(
+        class_counts_arr > 0, n_total / (3.0 * class_counts_arr), 1.0
+    )
+    sample_w = weights_per_class[y]
+    logger.info(
+        "Class weights (inverse freq): WAIT=%.3f BUY=%.3f SKIP=%.3f",
+        weights_per_class[0],
+        weights_per_class[1],
+        weights_per_class[2],
+    )
+    # 2026-05-01 (codex review): emit per-class metrics + AUC alongside
+    # raw counts. Held-out 20% test split (random; no time order in
+    # snapshots — they're per-checkpoint observations not chronological
+    # mints). Metrics let downstream calibration / activation gates
+    # compare retrains objectively.
+    rng = _np.random.default_rng(random_state)
+    test_mask = rng.random(n_total) < 0.2
+    train_mask = ~test_mask
+    if train_mask.sum() < 100 or test_mask.sum() < 50:
+        # Safety: tiny dataset (synth tests) → train on all, no test split.
+        train_mask = _np.ones(n_total, dtype=bool)
+        test_mask = _np.zeros(n_total, dtype=bool)
+
+    dtrain = xgb.DMatrix(X[train_mask], label=y[train_mask], weight=sample_w[train_mask])
     params = {
         "objective": "multi:softprob",
         "num_class": 3,
@@ -441,6 +496,38 @@ def train_entry_timing(
     }
     booster = xgb.train(params, dtrain, num_boost_round=n_estimators)
 
+    # Per-class metrics on test split.
+    per_class: dict[str, dict[str, float]] = {}
+    overall_auc: float | None = None
+    if int(test_mask.sum()) >= 50:
+        from sklearn.metrics import (
+            precision_recall_fscore_support,
+            roc_auc_score,
+        )
+
+        X_test = X[test_mask]
+        y_test = y[test_mask]
+        dtest = xgb.DMatrix(X_test)
+        proba = booster.predict(dtest)  # shape (N, 3)
+        y_pred = proba.argmax(axis=1)
+        precision, recall, f1, support = precision_recall_fscore_support(
+            y_test, y_pred, labels=[0, 1, 2], zero_division=0
+        )
+        for i, name in enumerate(CLASS_NAMES):
+            per_class[name] = {
+                "precision": float(precision[i]),
+                "recall": float(recall[i]),
+                "f1": float(f1[i]),
+                "support": int(support[i]),
+            }
+        # One-vs-rest AUC if we have all 3 classes in test set.
+        try:
+            overall_auc = float(
+                roc_auc_score(y_test, proba, multi_class="ovr", labels=[0, 1, 2])
+            )
+        except ValueError:
+            overall_auc = None
+
     model_out = Path(model_out)
     model_out.parent.mkdir(parents=True, exist_ok=True)
     booster.save_model(model_out)
@@ -450,7 +537,14 @@ def train_entry_timing(
         "features": list(TIMING_FEATURE_ORDER),
         "class_names": list(CLASS_NAMES),
         "n_rows": int(len(y)),
+        "train_rows": int(train_mask.sum()),
+        "test_rows": int(test_mask.sum()),
         "class_counts": counts,
+        "class_weights": {
+            CLASS_NAMES[i]: float(weights_per_class[i]) for i in range(3)
+        },
+        "per_class_metrics": per_class,
+        "auc_ovr": overall_auc,
         "snapshot_times_sec": list(DEFAULT_SNAPSHOT_TIMES_SEC),
         "hparams": {
             "n_estimators": n_estimators,
@@ -526,10 +620,28 @@ def predict_entry_timing(
     import xgboost as xgb
 
     booster, _ = _load_model_and_meta(Path(model_path))
-    row = np.asarray(
-        [[float(features.get(k, 0.0)) for k in TIMING_FEATURE_ORDER]],
-        dtype=np.float32,
+    raw_vec = [float(features.get(k, float("nan"))) for k in TIMING_FEATURE_ORDER]
+    # Train/serve skew guard. Only fires when there IS visible activity
+    # (buy_count > 0) but features are still mostly NaN — that pattern
+    # signals a real extractor bug, not a DOA token. DOA tokens (0
+    # trades visible) legitimately have all-NaN features and shouldn't
+    # spam logs.
+    buy_count = features.get("buy_count")
+    has_activity = (
+        buy_count is not None and not (buy_count != buy_count) and buy_count > 0
     )
+    if has_activity:
+        finite = sum(1 for v in raw_vec if not (v != v))
+        if len(raw_vec) > 0 and finite / len(raw_vec) < 0.5:
+            logger.warning(
+                "entry_timing predict: only %d/%d features non-NaN with "
+                "buy_count=%s — train/serve skew? snapshot_t=%s",
+                finite,
+                len(raw_vec),
+                buy_count,
+                features.get("snapshot_t"),
+            )
+    row = np.asarray([raw_vec], dtype=np.float32)
     dmatrix = xgb.DMatrix(row)
     proba = booster.predict(dmatrix)[0]
     # ``multi:softprob`` outputs class probabilities in label order

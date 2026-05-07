@@ -235,6 +235,7 @@ class EntryMLPolicy:
         proba_floor = None
         proba_ceiling = None
         calibration = None
+        model_health: dict | None = None
         if meta_path.exists():
             meta = json.loads(meta_path.read_text())
             conf = meta.get("confidence_thresholds")
@@ -242,6 +243,48 @@ class EntryMLPolicy:
                 proba_floor = conf.get("floor")
                 proba_ceiling = conf.get("ceiling")
             calibration = meta.get("calibration")
+            # Codex 2026-04-28: read model_health from meta. If the
+            # training pipeline marked the model as degenerate /
+            # narrow_proba_spread / auc_regression, REFUSE ML override
+            # at runtime (we don't want to fire BUY/SKIP off a model
+            # that can't separate winners from losers). PULSE_
+            # ALLOW_DEGENERATE_MODEL=1 forces load anyway (unsafe).
+            model_health = meta.get("model_health") or None
+            if model_health is not None:
+                status = model_health.get("status", "ok")
+                # 2026-04-28 train.py update: ok_percentile_fallback is
+                # a healthy state — EV-search collapsed (typical on
+                # memecoin datasets where avg_pnl is skewed) but the
+                # model still ranks. Percentile-based gates work the
+                # same way for live decisions.
+                healthy = status in ("ok", "ok_percentile_fallback")
+                if not healthy:
+                    notes = model_health.get("notes") or []
+                    logger.warning(
+                        "EntryMLPolicy: model_health=%s — %s",
+                        status,
+                        "; ".join(notes) if notes else "(no notes)",
+                    )
+                    import os as _os_health
+                    if _os_health.environ.get(
+                        "PULSE_ALLOW_DEGENERATE_MODEL", "0"
+                    ) != "1":
+                        logger.warning(
+                            "EntryMLPolicy: refusing to act — set "
+                            "PULSE_ALLOW_DEGENERATE_MODEL=1 to override "
+                            "(this is a kill-switch for ML BUY/SKIP "
+                            "overrides; rules path is unaffected)."
+                        )
+                        # Force decide_with_confidence to return RULES
+                        # for everything: floor=0 means nothing falls
+                        # below, ceiling=1 means nothing clears above.
+                        proba_floor = 0.0
+                        proba_ceiling = 1.0
+                elif status == "ok_percentile_fallback":
+                    logger.info(
+                        "EntryMLPolicy: model healthy via percentile "
+                        "fallback (EV-search flat but ranking confirmed)."
+                    )
         # 2026-04-24: config can override meta.json thresholds at startup
         # (optimizer uses this to sweep proba gating without retraining).
         # Precedence: config override > meta.json > hardcoded default.
@@ -293,6 +336,8 @@ class EntryMLPolicy:
         wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
         top3_buyer_wallets: list[str] | None = None,
         cutoff_ts: float | None = None,
+        n_buyers_first_5s: float | None = None,
+        wallet_classifications: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> float:
         """Raw model score.
 
@@ -313,6 +358,8 @@ class EntryMLPolicy:
             wallet_prior_stats=wallet_prior_stats,
             top3_buyer_wallets=top3_buyer_wallets,
             cutoff_ts=cutoff_ts,
+            n_buyers_first_5s=n_buyers_first_5s,
+            wallet_classifications=wallet_classifications,
         )
         # 2026-04-23 skew guard (codex-tightened): per-feature-group
         # coverage. A legitimate non-None snapshot should produce at least
@@ -378,6 +425,8 @@ class EntryMLPolicy:
         wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
         top3_buyer_wallets: list[str] | None = None,
         cutoff_ts: float | None = None,
+        n_buyers_first_5s: float | None = None,
+        wallet_classifications: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> float:
         """Back-compat alias. For classification returns P(profitable).
 
@@ -393,6 +442,8 @@ class EntryMLPolicy:
             wallet_prior_stats=wallet_prior_stats,
             top3_buyer_wallets=top3_buyer_wallets,
             cutoff_ts=cutoff_ts,
+            n_buyers_first_5s=n_buyers_first_5s,
+            wallet_classifications=wallet_classifications,
         )
 
     def decide(
@@ -404,6 +455,8 @@ class EntryMLPolicy:
         wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
         top3_buyer_wallets: list[str] | None = None,
         cutoff_ts: float | None = None,
+        n_buyers_first_5s: float | None = None,
+        wallet_classifications: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> tuple[bool, float]:
         """Return (should_buy, score). ``score`` is proba for classification,
         predicted PnL% for regression.
@@ -418,6 +471,8 @@ class EntryMLPolicy:
             wallet_prior_stats=wallet_prior_stats,
             top3_buyer_wallets=top3_buyer_wallets,
             cutoff_ts=cutoff_ts,
+            n_buyers_first_5s=n_buyers_first_5s,
+            wallet_classifications=wallet_classifications,
         )
         # For regression, threshold semantics differ: a PnL > 0 is the
         # natural "buy" signal. For classification, >= threshold (0.5
@@ -435,6 +490,8 @@ class EntryMLPolicy:
         wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
         top3_buyer_wallets: list[str] | None = None,
         cutoff_ts: float | None = None,
+        n_buyers_first_5s: float | None = None,
+        wallet_classifications: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> tuple[str, float, float]:
         """Confidence-gated three-way decision.
 
@@ -457,6 +514,8 @@ class EntryMLPolicy:
             wallet_prior_stats=wallet_prior_stats,
             top3_buyer_wallets=top3_buyer_wallets,
             cutoff_ts=cutoff_ts,
+            n_buyers_first_5s=n_buyers_first_5s,
+            wallet_classifications=wallet_classifications,
         )
         s_cal = self._calibrate(s_raw)
         if s_raw >= self.proba_ceiling:
@@ -464,7 +523,17 @@ class EntryMLPolicy:
         elif s_raw < self.proba_floor:
             action = "SKIP"
         else:
-            action = "RULES"
+            # Grey zone. By default we defer to rules engine, but
+            # entry_model.meta shows RULES_WR=0.57% (vs BUY_WR=8.46%) —
+            # the rules engine on grey-zone tokens is the dominant
+            # source of paper-loss. PULSE_ENTRY_GREY_TO_SKIP=1 forces
+            # SKIP override (strict hybrid). Default off for safe
+            # rollback; flip on in .env to activate.
+            import os as _os_grey
+            if _os_grey.environ.get("PULSE_ENTRY_GREY_TO_SKIP", "0") == "1":
+                action = "SKIP"
+            else:
+                action = "RULES"
         return action, s_raw, s_cal
 
     def _calibrate(self, raw: float) -> float:
@@ -493,6 +562,8 @@ class EntryMLPolicy:
         wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
         top3_buyer_wallets: list[str] | None = None,
         cutoff_ts: float | None = None,
+        n_buyers_first_5s: float | None = None,
+        wallet_classifications: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> str:
         feats = extract_entry_features(
             scoring_result,
@@ -501,6 +572,8 @@ class EntryMLPolicy:
             wallet_prior_stats=wallet_prior_stats,
             top3_buyer_wallets=top3_buyer_wallets,
             cutoff_ts=cutoff_ts,
+            n_buyers_first_5s=n_buyers_first_5s,
+            wallet_classifications=wallet_classifications,
         )
         return json.dumps(feats, separators=(",", ":"))
 
@@ -608,6 +681,8 @@ class EntryT30Policy:
         wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
         top3_buyer_wallets: list[str] | None = None,
         cutoff_ts: float | None = None,
+        n_buyers_first_5s: float | None = None,
+        wallet_classifications: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> float:
         """Return P(profitable | observed by T+30) ∈ [0, 1]."""
         vec = extract_entry_vector_t30(
@@ -617,7 +692,25 @@ class EntryT30Policy:
             wallet_prior_stats=wallet_prior_stats,
             top3_buyer_wallets=top3_buyer_wallets,
             cutoff_ts=cutoff_ts,
+            n_buyers_first_5s=n_buyers_first_5s,
+            wallet_classifications=wallet_classifications,
         )
+        # Train/serve skew guard — same pattern as EntryMLPolicy.predict_score
+        # at policy.py:329-364. Surfaces broken inference paths early
+        # (e.g. holder/wallet/creator missing) before they become silent
+        # 0-proba SKIPs in production.
+        non_zero = sum(1 for v in vec if v != 0.0)
+        total = len(vec)
+        if total > 0 and non_zero / total < 0.5:
+            logger.warning(
+                "T30 predict_proba: only %d/%d features non-zero "
+                "(holder=%s creator=%s wallet_stats=%s) — train/serve skew?",
+                non_zero,
+                total,
+                "set" if holder_snapshot_t30 else "None",
+                "set" if creator_snapshot else "None",
+                "set" if wallet_prior_stats else "None",
+            )
         arr = np.asarray([vec], dtype=float)
         return float(self._model.predict_proba(arr)[0, 1])
 
@@ -630,6 +723,8 @@ class EntryT30Policy:
         wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
         top3_buyer_wallets: list[str] | None = None,
         cutoff_ts: float | None = None,
+        n_buyers_first_5s: float | None = None,
+        wallet_classifications: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> tuple[str, float]:
         """3-way @T+30 decision.
 
@@ -645,6 +740,8 @@ class EntryT30Policy:
             wallet_prior_stats=wallet_prior_stats,
             top3_buyer_wallets=top3_buyer_wallets,
             cutoff_ts=cutoff_ts,
+            n_buyers_first_5s=n_buyers_first_5s,
+            wallet_classifications=wallet_classifications,
         )
         if p >= self.buy_ceiling:
             return ("BUY", p)
@@ -661,6 +758,8 @@ class EntryT30Policy:
         wallet_prior_stats: Mapping[str, Mapping[str, Any]] | None = None,
         top3_buyer_wallets: list[str] | None = None,
         cutoff_ts: float | None = None,
+        n_buyers_first_5s: float | None = None,
+        wallet_classifications: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> str:
         feats = extract_entry_features_t30(
             scoring_result_partial,
@@ -669,6 +768,8 @@ class EntryT30Policy:
             wallet_prior_stats=wallet_prior_stats,
             top3_buyer_wallets=top3_buyer_wallets,
             cutoff_ts=cutoff_ts,
+            n_buyers_first_5s=n_buyers_first_5s,
+            wallet_classifications=wallet_classifications,
         )
         return json.dumps(feats, separators=(",", ":"))
 

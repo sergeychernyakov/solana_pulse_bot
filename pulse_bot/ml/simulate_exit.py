@@ -54,12 +54,14 @@ def _replay_trades(
     inactivity = float(getattr(config, "exit_inactivity_seconds", 0.0) or 0.0)
     for trade in trades:
         if inactivity > 0.0 and (trade.timestamp - last_ts) > inactivity:
-            return runner.timeout_result()
+            return runner.timeout_result(
+                hold_seconds=max(last_ts - entry_ts, 0.0)
+            )
         result = runner.process_trade(trade, entry_ts)
         if result is not None:
             return result
         last_ts = trade.timestamp
-    return runner.timeout_result()
+    return runner.timeout_result(hold_seconds=max(last_ts - entry_ts, 0.0))
 
 
 def simulate_exit(

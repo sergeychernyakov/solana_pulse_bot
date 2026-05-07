@@ -56,6 +56,17 @@ logger = logging.getLogger(__name__)
 DEATH_EXIT_REASONS: frozenset[str] = frozenset(
     {"pulse_dead", "no_new_blood", "sell_pressure"}
 )
+# 2026-04-30 BUG FIX: original DEATH_EXIT_REASONS misclassified labels.
+# Audit on real paper_trades:
+#   dead_token   n=9016  avg_pnl=-5.87%  was CENSORED (should be death)
+#   hard_stop    n=1868  avg_pnl=-19.49% was CENSORED (should be death)
+#   no_new_blood n= 496  avg_pnl= +3.28% was death (avg PnL POSITIVE!)
+#   sell_pressure n=267  avg_pnl= +0.28% was death (near zero)
+# Result: ~10800 real deaths labeled "alive" + ~760 winners labeled "dead".
+# Model learned the inverse signal.
+# Fix: death is defined by realized PnL at exit, not exit_reason name.
+# This is policy-agnostic and grounded in the outcome we want to predict.
+DEATH_PNL_THRESHOLD_PCT: float = -3.0
 
 # Time-discretisation. 5s buckets give us ~36 rows per token at the
 # default 180s observation cap — fine-grained enough to localize the
@@ -164,14 +175,16 @@ class SurvivalLabelBuilder:
     ) -> tuple[float, bool]:
         """Return ``(duration_seconds, died_bool)`` for a single trade.
 
-        Censoring rules:
-        * Closed trades whose ``exit_reason`` is in
-          :data:`DEATH_EXIT_REASONS` → died, duration = exit - entry.
-        * Closed trades exiting for any other reason → censored at
-          their actual exit time (we only know they survived that long).
+        Censoring rules (2026-04-30, PnL-based death):
+        * Closed trades with ``pnl_pct < DEATH_PNL_THRESHOLD_PCT`` → died,
+          duration = exit - entry. The original exit_reason-based check
+          (DEATH_EXIT_REASONS) misclassified ~10800 real deaths as
+          censored and ~760 winners as deaths — labels driven by
+          realized PnL avoid that.
+        * Closed trades with pnl_pct ≥ threshold → censored at exit
+          (we know they survived the held period without dying).
         * Open trades → censored at ``now_ts``.
-        * Duration is clamped to ``max_horizon_seconds`` regardless of
-          status to match the live ceiling.
+        * Duration clamped to ``max_horizon_seconds`` to match live ceiling.
         """
         raw_entry = rec.get("entry_time")
         if raw_entry is None:
@@ -180,11 +193,11 @@ class SurvivalLabelBuilder:
         if entry_time < 0:
             return 0.0, False
         status = str(rec.get("status") or "").lower()
-        exit_reason = str(rec.get("exit_reason") or "").lower()
         if status == "closed":
             exit_time = float(rec.get("exit_time") or 0.0)
             raw_duration = max(0.0, exit_time - entry_time)
-            died = exit_reason in DEATH_EXIT_REASONS
+            pnl_pct = float(rec.get("pnl_pct") or 0.0)
+            died = pnl_pct < DEATH_PNL_THRESHOLD_PCT
         else:
             raw_duration = max(0.0, now_ts - entry_time)
             died = False
@@ -206,7 +219,7 @@ class SurvivalLabelBuilder:
         dsn = _resolve_dsn(db_path)
         # Minimal columns; downstream feature joins happen in train().
         sql = (
-            "SELECT mint, status, entry_time, exit_time, exit_reason, "
+            "SELECT mint, status, entry_time, exit_time, exit_reason, pnl_pct, "
             "entry_score, entry_mcap_sol, entry_buyer_number "
             "FROM paper_trades WHERE entry_time IS NOT NULL AND entry_time > 0"
         )
@@ -236,6 +249,12 @@ def _select_feature_columns(df: pd.DataFrame) -> list[str]:
         "exit_time",
         "entry_time",
         "bucket_end_seconds",
+        # 2026-04-30: pnl_pct is the FINAL realized PnL of the trade —
+        # used to derive the death label, must NOT also be a feature
+        # (would leak the answer at inference). Pulled into the SQL so
+        # SurvivalLabelBuilder can compute pnl-based death; dropped here
+        # so it never reaches the model input matrix.
+        "pnl_pct",
     }
     cols: list[str] = []
     for c in df.columns:
@@ -251,10 +270,13 @@ def train_survival_model(
     model_out: Path,
     *,
     n_estimators: int = 200,
-    max_depth: int = 4,
-    learning_rate: float = 0.05,
+    max_depth: int = 3,
+    learning_rate: float = 0.03,
+    reg_lambda: float = 2.0,
+    reg_alpha: float = 0.1,
     bucket_seconds: float = DEFAULT_BUCKET_SECONDS,
     max_horizon_seconds: float = DEFAULT_MAX_HORIZON_SECONDS,
+    sanity_test_n: int = 100,
 ) -> dict[str, Any]:
     """Fit an XGBoost classifier on the hazard rows.
 
@@ -264,10 +286,23 @@ def train_survival_model(
             ``elapsed_seconds`` columns. Additional numeric columns will
             be picked up automatically as features.
         model_out: Where to write the .ubj model file. ``.meta.json`` is
-            written alongside.
+            written alongside. Existing files are snapshotted to
+            ``.ubj.prev`` / ``.meta.json.prev`` before overwrite — restore
+            with ``cp survival_model.ubj.prev survival_model.ubj``.
+        n_estimators / max_depth / learning_rate / reg_lambda / reg_alpha:
+            Defaults tuned 2026-05-05 after a degenerate retrain at the
+            original ``max_depth=4 lr=0.05`` set predicted ``remaining=25s``
+            for every token at confidence 0.39. Conservative depth + l2
+            regularization keeps the per-token signal intact.
+        sanity_test_n: After fit, sample N random feature rows from the
+            training frame and check that ``predict_remaining_life`` gives
+            varying outputs (not collapsed to a single value). Raises
+            ``RuntimeError`` if all predictions are identical, blocking
+            silent deploy of a degenerate model.
 
     Returns a metrics dict (rows, positive rate, feature list).
     """
+    import shutil
     import xgboost as xgb  # lazy: only available in .venv
 
     if "died_in_bucket" not in df.columns:
@@ -290,12 +325,33 @@ def train_survival_model(
         max_depth=max_depth,
         learning_rate=learning_rate,
         scale_pos_weight=spw,
+        reg_lambda=reg_lambda,
+        reg_alpha=reg_alpha,
         objective="binary:logistic",
         eval_metric="logloss",
         n_jobs=-1,
         tree_method="hist",
     )
     model.fit(x, y)
+
+    meta_out = model_out.with_suffix(".meta.json")
+    # Snapshot existing model to .prev before overwrite — symmetric with
+    # _save_with_health_check used by entry training. Lets ops roll back via:
+    #   cp survival_model.ubj.prev survival_model.ubj
+    #   cp survival_model.meta.json.prev survival_model.meta.json
+    if model_out.exists():
+        try:
+            shutil.copy2(
+                model_out, model_out.with_suffix(model_out.suffix + ".prev")
+            )
+            if meta_out.exists():
+                shutil.copy2(
+                    meta_out,
+                    meta_out.with_suffix(meta_out.suffix + ".prev"),
+                )
+        except Exception as e:
+            logger.warning("Failed to snapshot prev survival model: %s", e)
+
     model_out.parent.mkdir(parents=True, exist_ok=True)
     model.save_model(model_out)
     meta = {
@@ -310,15 +366,69 @@ def train_survival_model(
         "n_estimators": n_estimators,
         "max_depth": max_depth,
         "learning_rate": learning_rate,
+        "reg_lambda": reg_lambda,
+        "reg_alpha": reg_alpha,
     }
-    meta_out = model_out.with_suffix(".meta.json")
+
+    # ── Sanity test — predictions must vary across tokens ────────────
+    # Symptom of the 2026-05-05 regression: every token hit the survival-
+    # threshold at the same bucket → identical remaining_life. Detect that
+    # before deploy by sampling N random unique-mint rows and asserting
+    # at least 5 distinct ``remaining_life_seconds`` values among them.
+    sanity_status = "ok"
+    sanity_distinct = None
+    if sanity_test_n > 0 and "mint" in df.columns:
+        try:
+            sample_mints = df.drop_duplicates("mint").sample(
+                n=min(sanity_test_n, df["mint"].nunique()),
+                random_state=42,
+            )
+            distinct_remaining: set[float] = set()
+            for _, row in sample_mints.iterrows():
+                feats_at_now = {c: float(row[c]) for c in feature_cols}
+                pred = predict_remaining_life(
+                    model,
+                    feats_at_now,
+                    feature_order=feature_cols,
+                    bucket_seconds=bucket_seconds,
+                    max_horizon_seconds=max_horizon_seconds,
+                    now_elapsed_seconds=0.0,
+                    survival_threshold=0.10,
+                )
+                distinct_remaining.add(round(pred.remaining_life_seconds, 2))
+            sanity_distinct = len(distinct_remaining)
+            if sanity_distinct < 5:
+                sanity_status = "degenerate"
+                logger.error(
+                    "Survival sanity test FAILED: only %d distinct "
+                    "remaining_life values across %d sampled mints. "
+                    "Model likely collapsed — restore .prev before activating.",
+                    sanity_distinct,
+                    sanity_test_n,
+                )
+            else:
+                logger.info(
+                    "Survival sanity test OK: %d distinct remaining_life "
+                    "values across %d sampled mints.",
+                    sanity_distinct,
+                    sanity_test_n,
+                )
+        except Exception as e:
+            sanity_status = f"error:{type(e).__name__}"
+            logger.warning("Survival sanity test crashed: %s", e)
+    meta["sanity_status"] = sanity_status
+    meta["sanity_distinct_remaining"] = sanity_distinct
+
     meta_out.write_text(json.dumps(meta, indent=2))
     logger.info(
-        "Trained survival model: %d rows, %d positives (%.2f%%) → %s",
+        "Trained survival model: %d rows, %d positives (%.2f%%) → %s "
+        "(sanity=%s, distinct_remaining=%s)",
         meta["rows"],
         meta["positives"],
         float(meta["positive_rate"]) * 100.0,
         model_out,
+        sanity_status,
+        sanity_distinct,
     )
     return meta
 

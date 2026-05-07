@@ -160,7 +160,7 @@ class WalletIndexer:
                 a["buy_sol"],
                 a["sell_sol"],
                 a["sell_sol"] - a["buy_sol"],
-                1,
+                1 if a["sell_sol"] > 0 else 0,
                 now,
             )
             for (wallet, mint), a in agg.items()

@@ -87,14 +87,18 @@ def test_t30_excludes_t120_only_features() -> None:
 
 
 def test_t30_extract_fills_missing_with_zero() -> None:
-    """Empty inputs → zero defaults except hour_cos=1 and WALLET_FEATURES=NaN."""
-    feats = extract_entry_features_t30({}, holder_snapshot_t30=None)
-    special = {"hour_cos", *WALLET_FEATURES}
+    """Empty inputs → zero defaults except hour_cos=1, WALLET_FEATURES=NaN,
+    and CREATOR_FEATURES=NaN (2026-05-05 NaN-policy v2; ``creator_snapshot=None``
+    routes via missingness split rather than a fake zero baseline)."""
+    feats = extract_entry_features_t30({}, holder_snapshot_t30=None, creator_snapshot=None)
+    special = {"hour_cos", *WALLET_FEATURES, *CREATOR_FEATURES}
     for name in [n for n in ENTRY_T30_FEATURE_ORDER if n not in special]:
         assert feats[name] == 0.0, f"{name} should default to 0.0"
     assert feats["hour_cos"] == 1.0
     for name in WALLET_FEATURES:
         assert math.isnan(feats[name])
+    for name in CREATOR_FEATURES:
+        assert math.isnan(feats[name]), f"{name} should default to NaN when snapshot=None"
 
 
 def test_t30_holder_snapshot_t30_only() -> None:

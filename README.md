@@ -1,6 +1,14 @@
 # Solana Pulse Bot
 
-Бот-наблюдатель для мемкоин-лончпадов на Solana (pump.fun, letsbonk). Наблюдает за новыми токенами, оценивает органичность интереса, принимает решение о покупке. Двухфазный скоринг: быстрый вход (T+5s) + полный анализ (T+90s). **79 ML-фич на токен**, 80+ конфигурируемых параметров, 6 ML голов (entry main / entry @T+30 / entry-timing / survival / SL+TP quantile heads).
+> **🟢 Status (2026-05-07): paper-bot профитный.** N=161 закрытых трейдов за 19ч с момента включения survival confidence-gate (2026-05-06 14:30 UTC):
+> - **PnL: +2.78 SOL** (≈+3.5 SOL/день pace)
+> - WR: **18.6 %** (30 wins / 131 losses)
+> - Avg PnL/trade: +0.017 SOL
+> - Top-5 winners (TYLEE +780 %, RWAFY +383 %, BFS +364 %, MAUA +347 %, INCOME +333 %) — 80 % всей прибыли. Стратегия = "lottery-ticket farming" + tail capture.
+> - 8/8 моделей загружены (`status=ok`); survival эффективно в shadow-режиме через `PULSE_SURVIVAL_MIN_CONFIDENCE=0.50` — гейт фильтрует low-confidence kills (см. CHANGELOG 2026-05-06 14:30).
+> - **Live execution не подключён** — это paper PnL, real money требует отдельной валидации (slippage 1-3 % на pump.fun bonding curve).
+
+Бот-наблюдатель для мемкоин-лончпадов на Solana (pump.fun, letsbonk). Наблюдает за новыми токенами, оценивает органичность интереса, принимает решение о покупке. Двухфазный скоринг: быстрый вход (T+5s) + полный анализ (T+90s). **82 ML-фич на токен** (схема v21), 80+ конфигурируемых параметров, 8 ML голов (entry main / entry @T+30 / entry regression / entry-timing / survival / SL+TP+max_hold quantile heads).
 
 Бэктест использует тот же код что и live бот — **100% совпадение решений** (верифицировано на 300+ токенах).
 
@@ -191,42 +199,58 @@ python main.py verify     # replay + сравнить
 
 ## Production deployment — Rich server (192.168.3.118)
 
-Бот запущен на отдельном сервере `rich` для 24/7 работы. Mac остаётся dev-машиной.
+> **ВАЖНО — где что запускается:**
+> - **`pulse_bot monitor` (живой бот)** — **только на rich**, через systemd. Никогда не запускать на Mac.
+> - **Mac** — только разработка: backtest, optimizer sweep, ML train, analytics.
+> - **Dashboards (live + backtest)** — на rich, доступны по http://192.168.3.118:8501/8502.
+> - **Backfill** и **Solana validator** — тоже на rich, через systemd.
 
 ```bash
 # SSH alias настроен в ~/.ssh/config: Host rich → 192.168.3.118 user=sergey
 ssh rich
 
-# Bot status
-ps auxw | grep main.py | grep -v grep
+# Bot status (systemd user units)
+systemctl --user status pulse-bot.service
+systemctl --user status backfill.service
+systemctl --user status solana-validator.service
+systemctl --user status pulse-dashboard.service
+systemctl --user status pulse-backtest-dashboard.service
 tail -f ~/www/gg/logs/bot.log
 
-# Restart with new env
-cd ~/www/gg
-pkill -f "main.py monitor"
-set -a && source .env && set +a
-nohup .venv/bin/python main.py monitor > logs/bot.log 2>&1 &
+# Dashboards (live data, network-accessible):
+# http://192.168.3.118:8501  — main live monitoring
+# http://192.168.3.118:8502  — backtest / optimizer results
+
+# Bot lifecycle
+systemctl --user start pulse-bot.service
+systemctl --user restart pulse-bot.service       # после изменений в .env / коде
+systemctl --user stop pulse-bot.service
+
+# Unit file: ~/.config/systemd/user/pulse-bot.service
+# Логи: ~/www/gg/logs/bot.log
 
 # DB on rich: PG 16, user=sergeychernyakov password=pulsebot
 PGPASSWORD=pulsebot psql -U sergeychernyakov -d pulse_bot -h localhost
 ```
 
-**Sync БД между Rich (production) и Mac (dev):**
+**Sync БД между Rich (production) и Mac (dev) — on-demand:**
+
+Rich = source of truth (там бот пишет 24/7). Mac забирает свежий snapshot когда нужен для retrain/sweep/анализа. Cron не настраиваем — синк по требованию.
+
 ```bash
-# Mac → Rich (одноразово при первом deploy):
+# Rich → Mac (для свежих данных перед retrain/sweep, ~5 мин для 3GB БД):
+ssh rich 'pg_dump -U sergeychernyakov -d pulse_bot -F c -Z 9' > /tmp/rich.dump \
+  && pg_restore --clean --no-owner -d pulse_bot /tmp/rich.dump
+
+# Mac → Rich (только при первом deploy или восстановлении):
 pg_dump -d pulse_bot -F c -Z 9 -f /tmp/dump.dump
 scp /tmp/dump.dump rich:/tmp/
 ssh rich 'pg_restore -U sergeychernyakov -d pulse_bot /tmp/dump.dump'
-
-# Rich → Mac (для dev-анализа свежих данных):
-ssh rich 'pg_dump -U sergeychernyakov -d pulse_bot -F c -Z 9' > /tmp/rich.dump
-pg_restore --clean -d pulse_bot /tmp/rich.dump
-
-# TODO: настроить streaming replication Mac → Rich для live sync
-# (сейчас Rich = source of truth, Mac периодически забирает snapshot)
 ```
 
 ## Быстрый старт (dev на Mac)
+
+> Mac — **только dev**: backtest / optimizer / ML retrain / dashboards. Живой `monitor` запускать только на rich (см. выше).
 
 ```bash
 git clone <repo-url>
@@ -239,10 +263,10 @@ pip install xgboost psycopg2-binary asyncpg  # ML + Postgres deps (не в requi
 # ВАЖНО: всегда активировать venv перед запуском
 source .venv/bin/activate
 
-# Запустить мониторинг
-python main.py monitor
+# Backtest на свежем dump из rich
+python main.py backtest
 
-# В другом терминале — dashboard
+# Dashboard для просмотра данных
 streamlit run pulse_bot/dashboard.py --server.port 8501
 ```
 

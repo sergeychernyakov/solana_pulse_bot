@@ -58,14 +58,25 @@ logger = logging.getLogger(__name__)
 RPC_URL_TEMPLATE = "https://mainnet.helius-rpc.com/?api-key={key}"
 DEFAULT_TIMEOUT_SEC = 1.5
 
-# Three capture timepoints (seconds since token's created_at).
-# Empirically observed (Apr 2026): Helius indexes pump.fun mints
-# somewhere between T+10 (100% parse_error: empty accounts) and T+30
-# (100% success). So we start at T+30 where indexing is reliable, and
-# use T+60 and T+120 to measure distribution over a 90-second window.
-# Delta top1_pct(T+120) − top1_pct(T+30) separates "stuck" (rug
-# likely) from "distributed" (organic growth).
-CAPTURE_AGE_SECONDS: tuple[float, ...] = (30.0, 60.0, 120.0)
+# Capture timepoints (seconds since token's created_at).
+# Helius indexes pump.fun mints between T+10 and T+30; we start at T+30.
+# T+30/60/120 = original "early death" detector. T+180/300/600 added
+# 2026-04-27 to enable a two-stage cascade: stage 1 buys/skips at T+90,
+# stage 2 (post-90s data) re-validates survivors. Override via env
+# PULSE_HOLDER_CAPTURE_AGES="30,60,120,180,300,600".
+import os as _os_capture
+
+_default_ages = (30.0, 60.0, 120.0, 180.0, 300.0, 600.0)
+_env_ages = _os_capture.environ.get("PULSE_HOLDER_CAPTURE_AGES", "").strip()
+if _env_ages:
+    try:
+        CAPTURE_AGE_SECONDS: tuple[float, ...] = tuple(
+            float(x) for x in _env_ages.split(",") if x.strip()
+        )
+    except ValueError:
+        CAPTURE_AGE_SECONDS = _default_ages
+else:
+    CAPTURE_AGE_SECONDS = _default_ages
 
 
 @dataclass

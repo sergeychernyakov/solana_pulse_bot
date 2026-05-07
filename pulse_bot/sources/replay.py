@@ -35,9 +35,15 @@ class ReplayLaunchpad(Launchpad):
     name = "replay"
     ws_url = "sqlite"
 
-    def __init__(self, db_path: str, speed: float = 0.0) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        speed: float = 0.0,
+        limit: int | None = None,
+    ) -> None:
         self._db_path = db_path
         self._speed = speed
+        self._limit = limit  # None = all tokens; e.g. 300 = fast verify sweep
         self._trade_queues: dict[str, asyncio.Queue[Trade]] = {}
         self._token_creators: dict[str, str] = {}
         self._token_created_at: dict[str, float] = {}
@@ -57,7 +63,16 @@ class ReplayLaunchpad(Launchpad):
         conn = psycopg2.connect(_resolve_dsn(self._db_path))
         try:
             cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-            cur.execute("SELECT * FROM tokens ORDER BY created_at ASC")
+            # Most-recent-first when ``limit`` is set so the verify sample
+            # covers the freshest config window (matches what live ran on);
+            # full replay stays chronological for backtest semantics.
+            if self._limit is not None and self._limit > 0:
+                cur.execute(
+                    "SELECT * FROM tokens ORDER BY created_at DESC LIMIT %s",
+                    (int(self._limit),),
+                )
+            else:
+                cur.execute("SELECT * FROM tokens ORDER BY created_at ASC")
             prev_ts = 0.0
             for row in cur:
                 if not self._running:

@@ -90,6 +90,12 @@ def _make_pipeline_skeleton(monkeypatch):
     pipe._timing_model_path = None
     pipe._survival_model = None
     pipe._survival_load_attempted = False
+    # Survival hyperparams normally parsed by __init__ from env. Tests
+    # bypass __init__ so we set the production defaults inline. The
+    # confidence gate (added 2026-05-06) is 0.50 — fake models in tests
+    # use confidence=0.9 to pass the gate.
+    pipe._survival_threshold = 0.10
+    pipe._survival_min_confidence = 0.50
     return pipe
 
 

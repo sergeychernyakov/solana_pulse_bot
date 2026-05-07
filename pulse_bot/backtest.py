@@ -1,5 +1,21 @@
 # pulse_bot/backtest.py
-"""BacktestEngine — replays historical data through the full pipeline: score → buy → monitor → exit."""
+"""BacktestEngine — DEPRECATED parity-only test reference.
+
+**Status (codex review 2026-04-28):** ``BacktestEngine`` is no longer
+the canonical backtest runtime. The ``backtest`` CLI command in
+``main.py`` now uses ``Pipeline + ReplayLaunchpad`` as the single
+source of truth for replay semantics. This file is kept ONLY because
+``tests/pulse_bot/test_optimizer_parity.py`` still uses it as a
+differential reference against the Optimizer.
+
+Do NOT add new functionality here. Do NOT call ``BacktestEngine``
+from any non-test code. New backtest runs go through Pipeline +
+ReplayLaunchpad — that's where event-time semantics, ML hooks,
+holder capture, and resume logic live.
+
+When the parity test is migrated to Pipeline + ReplayLaunchpad as
+the reference (or removed), this file can be deleted entirely.
+"""
 
 from __future__ import annotations
 

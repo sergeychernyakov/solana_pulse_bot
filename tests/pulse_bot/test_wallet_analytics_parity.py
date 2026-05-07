@@ -295,13 +295,23 @@ def fixture_db(tmp_path_factory, pg_test_db):
 
 
 def test_hist_mints_produce_non_nan_features(fixture_db):
-    """50 history-rich tokens must have non-NaN values across all 5 features."""
+    """50 history-rich tokens must have non-NaN values across the legacy
+    top-3 wallet features. Top-10 features (added v20 2026-04-27) and
+    n_buyers_first_5s sit outside this fixture's scope:
+    - top10_* require >3 buyers — the build helper here uses
+      ``compute_top3_buyer_wallets`` so the top-10 group stays NaN by
+      design (NaN-when-≤3 is the load-bearing missing signal codex review
+      kept after I tried to remove it and tanked AUC).
+    - n_buyers_first_5s comes from a separate computation path that the
+      build helper here doesn't exercise.
+    """
+    LEGACY_TOP3_FEATURES = [f for f in WALLET_FEATURES if f.startswith("top3_")]
     db = Database(fixture_db["db_path"])
     conn = _connect(fixture_db["db_path"])
     scored_at = fixture_db["scored_at"]
     for mint in fixture_db["hist_mints"]:
         live = _compute_features_build_path(conn, mint, scored_at)
-        for feat in WALLET_FEATURES:
+        for feat in LEGACY_TOP3_FEATURES:
             v = live[feat]
             assert not math.isnan(v), (
                 f"hist mint {mint}: feature {feat} is NaN, "

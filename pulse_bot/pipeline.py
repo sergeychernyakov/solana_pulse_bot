@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from pulse_bot.ml.policy import EntryMLPolicy, EntryT30Policy
     from pulse_bot.models import CreatorStats, Token, Trade
 
+from pulse_bot.ml import shadow
 from pulse_bot.ml.policy import (
     get_active_policy_name,
     load_entry_policy_if_available,
@@ -80,6 +81,35 @@ class Pipeline:
         from pulse_bot.market_context import SOLPriceCache
 
         self._sol_price = SOLPriceCache()
+        # 2026-04-28 (architecture phase F): hydration moved out of
+        # this god-object into FeatureHydrationService. Pipeline now
+        # calls one method to get everything an ML model needs at
+        # decision time.
+        from pulse_bot.feature_hydration import FeatureHydrationService
+
+        self._hydration = FeatureHydrationService(
+            db=db,
+            holder_fetcher=self._fetch_holder_snapshot_all,
+        )
+        # 2026-04-28 (architecture phase B step 1): entry-override
+        # chain extracted into DecisionService. Pipeline now wires the
+        # rules → bot-cluster → ML → checkpoint chain through it
+        # instead of inlining ~150 lines of branchy logic.
+        from pulse_bot.decision_service import DecisionService
+
+        _hard_skip = int(os.environ.get("PULSE_BOT_CLUSTER_HARD_SKIP", "3"))
+        # 2026-05-01 (codex review): wash-cluster gate. Default 0 = OFF;
+        # ship behind env after optimizer-sweep determines threshold.
+        _wash_skip = int(os.environ.get("PULSE_WASH_CLUSTER_SKIP_N", "0"))
+        _wash_min = int(os.environ.get("PULSE_WASH_CLUSTER_SIZE_MIN", "5"))
+        _wash_max = int(os.environ.get("PULSE_WASH_CLUSTER_SIZE_MAX", "50"))
+        self._decision = DecisionService(
+            db=db,
+            hard_skip_n_env=_hard_skip,
+            wash_cluster_skip_n=_wash_skip,
+            wash_cluster_size_min=_wash_min,
+            wash_cluster_size_max=_wash_max,
+        )
         # Holder-snapshot capture tasks (non-blocking). Bounded via
         # ``_holder_sem`` (50 concurrent fetches max) to prevent
         # unbounded growth when many tokens are awaiting their T+30
@@ -123,6 +153,34 @@ class Pipeline:
         #     when it is confident (``BUY`` / ``SKIP``). Rules handle
         #     the grey zone. Every ML override is logged at WARN so
         #     regressions are visible immediately.
+        # 2026-04-28 (architecture phase E): ModelRegistry boot summary.
+        # Logs full status of every artifact (existence, schema_version,
+        # AUC, health) so operators see the model ensemble at startup.
+        from pulse_bot.ml.model_registry import ModelRegistry
+        from pulse_bot.observability import metrics as _obs, start_http_server
+
+        self._model_registry = ModelRegistry()
+        self._model_registry.log_boot_summary()
+        # 2026-05-01: filter health summary — surface dead gates (e.g.,
+        # the creators.blacklisted gate that was silently 0-firings for
+        # weeks before the 2026-05-01 cleanup pass found it).
+        try:
+            from pulse_bot.filter_health import log_filter_health_summary
+            log_filter_health_summary()
+        except Exception as exc:  # nosec B110
+            # Reason: best-effort observability; never block startup.
+            logger.debug("filter_health summary skipped: %s", exc)
+        # Sync model_health gauge so /metrics shows current state.
+        for _spec in self._model_registry.list_all():
+            _obs.model_health.set(
+                1 if _spec.healthy else 0, name=_spec.name
+            )
+        # 2026-04-28 (architecture phase H): expose Prometheus
+        # exposition-format /metrics endpoint. Tunable via
+        # PULSE_METRICS_PORT (default 9100, set 0 to disable).
+        _metrics_port = int(os.environ.get("PULSE_METRICS_PORT", "9100"))
+        start_http_server(_metrics_port)
+
         self._ml_entry_policy: "EntryMLPolicy | None" = load_entry_policy_if_available()
         self._policy_mode: str = get_active_policy_name()
         if self._ml_entry_policy is not None:
@@ -143,6 +201,31 @@ class Pipeline:
             self._policy_mode = "rules"
         self._ml_overrides_buy: int = 0
         self._ml_overrides_skip: int = 0
+        # Codex Q4 #1 — entry_model_reg ranking layer (2026-04-28).
+        # Loaded as a sibling EntryMLPolicy in regression mode. Used at
+        # ml_override decision time to enrich entry_score with predicted
+        # PnL % (instead of the int(ml_cal*100) heuristic). No hard gate
+        # — current rho ≈ 0.146 is too weak to reject BUYs; informative
+        # only. Will become a kill-gate once retrained on better labels.
+        self._ml_entry_reg_policy: "EntryMLPolicy | None" = None
+        try:
+            from pulse_bot.ml.policy._main import EntryMLPolicy as _EntryMLPolicy
+            from pathlib import Path as _Path
+            _reg_path = _Path("data/ml/entry_model_reg.ubj")
+            if _reg_path.exists() and self._ml_entry_policy is not None:
+                self._ml_entry_reg_policy = _EntryMLPolicy.from_path(_reg_path)
+                logger.info(
+                    "Entry regression head loaded: model_hash=%s "
+                    "(predicted_pnl%% feeds entry_score on ml_override)",
+                    self._ml_entry_reg_policy.model_hash[:16],
+                )
+        except Exception as exc:
+            logger.warning(
+                "Entry regression head load failed (%s) — falling back "
+                "to int(ml_cal*100) entry_score.",
+                exc,
+            )
+            self._ml_entry_reg_policy = None
         # Exit ML status log — confirms at boot whether the exit advisor
         # is loaded and whether it can actively escalate rule-based holds.
         from pulse_bot.ml.policy import load_exit_policy_if_available
@@ -177,12 +260,74 @@ class Pipeline:
         self._entry_t30_active: bool = (
             os.environ.get("PULSE_ENTRY_T30_ACTIVE", "0") == "1"
         )
+        # SKIP-only mode: T+30 model fires SKIP but never BUY. Enables
+        # asymmetric activation since meta shows skip_wr≈0.012% (great
+        # filter) while buy_wr ≈ 8.6% is still below break-even.
+        self._entry_t30_skip_only_active: bool = (
+            os.environ.get("PULSE_ENTRY_T30_SKIP_ACTIVE", "0") == "1"
+        )
         self._survival_active: bool = (
             os.environ.get("PULSE_SURVIVAL_ACTIVE", "0") == "1"
         )
         self._timing_active: bool = os.environ.get("PULSE_TIMING_ACTIVE", "0") == "1"
+        # 2026-05-01 (codex review CRITICAL): parse survival threshold ONCE
+        # at startup, fail loudly. Previously parsed inside the per-tick
+        # hook; a malformed value (e.g. inline-comment regression in .env)
+        # raised ValueError on every survival tick, silently dropping
+        # exit decisions.
+        try:
+            self._survival_threshold: float = float(
+                os.environ.get("PULSE_SURVIVAL_THRESHOLD", "0.10")
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"PULSE_SURVIVAL_THRESHOLD must be a float, got: "
+                f"{os.environ.get('PULSE_SURVIVAL_THRESHOLD')!r}"
+            ) from exc
+        if not 0.0 < self._survival_threshold <= 1.0:
+            raise ValueError(
+                f"PULSE_SURVIVAL_THRESHOLD must be in (0, 1], got: "
+                f"{self._survival_threshold}"
+            )
+        # 2026-05-06 — confidence gate. PULSE_SURVIVAL_THRESHOLD is the
+        # *calibration* parameter for the survival curve (where on the
+        # decay curve we declare "death"). It does NOT measure how
+        # confident the model is in that prediction. Without a separate
+        # confidence gate, low-uncertainty predictions (mean hazard ≈ 0.5
+        # → confidence ≈ 0) still trigger exits — which is exactly the
+        # degeneracy we observed: 92% of trades killed by survival at
+        # confidence 0.29. Default 0.50 = act only when hazards are
+        # consistently far from 0.5 (clear death signal). Set to 0.0 to
+        # bypass the gate (legacy behaviour).
+        try:
+            self._survival_min_confidence: float = float(
+                os.environ.get("PULSE_SURVIVAL_MIN_CONFIDENCE", "0.50")
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"PULSE_SURVIVAL_MIN_CONFIDENCE must be a float, got: "
+                f"{os.environ.get('PULSE_SURVIVAL_MIN_CONFIDENCE')!r}"
+            ) from exc
+        if not 0.0 <= self._survival_min_confidence <= 1.0:
+            raise ValueError(
+                f"PULSE_SURVIVAL_MIN_CONFIDENCE must be in [0, 1], got: "
+                f"{self._survival_min_confidence}"
+            )
+        # 2026-04-30: skip-only switch mirrors entry_t30 pattern. Set to 1
+        # without PULSE_TIMING_ACTIVE — the timing model can SKIP_EARLY but
+        # never BUY_EARLY. Useful when shadow data shows BUY-side is anti-
+        # correlated (training class imbalance favors SKIP, BUY-proba never
+        # crosses production gate). When both flags are 1, ACTIVE wins.
+        self._timing_skip_only_active: bool = (
+            os.environ.get("PULSE_TIMING_SKIP_ONLY_ACTIVE", "0") == "1"
+        )
         self._ml_entry_t30_policy: "EntryT30Policy | None" = None
-        if self._entry_t30_active:
+        # Load policy if either LIVE, SKIP-only, or SHADOW mode is requested.
+        if (
+            self._entry_t30_active
+            or self._entry_t30_skip_only_active
+            or shadow.t30_shadow_enabled()
+        ):
             self._ml_entry_t30_policy = load_entry_t30_policy_if_available()
             if self._ml_entry_t30_policy is None:
                 logger.warning(
@@ -213,7 +358,11 @@ class Pipeline:
         # internally; cached in _timing_booster on first hit).
         self._timing_model_path: Path | None = None
         self._timing_booster_cache: tuple[Any, dict] | None = None
-        if self._timing_active:
+        if (
+            self._timing_active
+            or self._timing_skip_only_active
+            or shadow.timing_shadow_enabled()
+        ):
             from pulse_bot.ml.entry_timing import TIMING_SCHEMA_VERSION
 
             default_path = Path("data/ml/entry_timing_model.ubj")
@@ -578,7 +727,23 @@ class Pipeline:
             checkpoint_task: asyncio.Task | None = None
             if not is_replay and (
                 (self._entry_t30_active and self._ml_entry_t30_policy is not None)
+                or (
+                    self._entry_t30_skip_only_active
+                    and self._ml_entry_t30_policy is not None
+                )
                 or (self._timing_active and self._timing_model_path is not None)
+                or (
+                    self._timing_skip_only_active
+                    and self._timing_model_path is not None
+                )
+                or (
+                    shadow.t30_shadow_enabled()
+                    and self._ml_entry_t30_policy is not None
+                )
+                or (
+                    shadow.timing_shadow_enabled()
+                    and self._timing_model_path is not None
+                )
             ):
                 checkpoint_task = asyncio.create_task(
                     self._observation_checkpoint_loop(
@@ -658,6 +823,24 @@ class Pipeline:
             creator_tokens_today = self._db.get_creator_tokens_on_day_sync(
                 token.creator, ref_mint=token.mint
             )
+            # Pull the merged T+30/T+120 holder snapshot for ML inference.
+            # build_dataset.py joins the same rows at training time, so
+            # passing them here closes a long-standing train/serve skew
+            # gap (predict_proba previously saw holder=None on every
+            # token because this fetch wasn't wired).
+            holder_snapshot_all: dict = {}
+            try:
+                holder_snapshot_all = self._fetch_holder_snapshot_all(token.mint)
+            except Exception as exc:
+                # Promote to WARNING with traceback — silent failures here
+                # mean every ML inference falls back to all-zero HELIUS
+                # features, which silently re-introduces train/serve skew.
+                logger.warning(
+                    "holder_snapshot_all fetch failed for %s: %s",
+                    token.mint[:12],
+                    exc,
+                    exc_info=True,
+                )
             result = self._scorer.score(
                 token,
                 all_trades,
@@ -665,6 +848,7 @@ class Pipeline:
                 concurrent_observations=concurrent,
                 creator_snapshot=creator_snapshot,
                 creator_tokens_today=creator_tokens_today,
+                holder_snapshot=holder_snapshot_all or None,
             )
 
             # Attach fast phase data
@@ -703,32 +887,23 @@ class Pipeline:
                 except Exception:
                     logger.debug("save_sol_price failed", exc_info=True)
 
-            # Phase E — top-3 buyer prior stats computed once per scoring
-            # and reused by the shadow-logging + decide_with_confidence
-            # call sites below. Both paths call the same features.py
-            # helpers so train/serve parity is enforced by construction.
-            try:
-                from pulse_bot.ml.features import compute_top3_buyer_wallets
-
-                top3_wallets = compute_top3_buyer_wallets(all_trades)
-                wallet_prior_stats = (
-                    self._db.get_wallet_prior_stats_sync(
-                        top3_wallets,
-                        exclude_mint=token.mint,
-                        cutoff_ts=float(result.scored_at or 0.0),
-                    )
-                    if top3_wallets
-                    else {}
-                )
-            except Exception as exc:
-                logger.warning(
-                    "wallet_prior_stats lookup failed for %s: %s",
-                    token.mint[:12],
-                    exc,
-                )
-                top3_wallets = []
-                wallet_prior_stats = {}
+            # 2026-04-28 (architecture phase F): hydration centralized
+            # in FeatureHydrationService. Replaces ~40 lines of inline
+            # try/except for top-N wallets + wallet_prior_stats + sniper
+            # count. Same train/serve parity guarantees, but tested in
+            # isolation (see tests/pulse_bot/test_feature_hydration.py).
             scoring_cutoff_ts = float(result.scored_at or 0.0)
+            hydrated = self._hydration.hydrate_for_t90(
+                token=token,
+                all_trades=all_trades,
+                scored_at=scoring_cutoff_ts,
+            )
+            # Pull legacy variable names so the rest of this function
+            # doesn't have to change shape (gradual migration).
+            top3_wallets = hydrated.top_n_wallets
+            wallet_prior_stats = hydrated.wallet_prior_stats
+            n_snipers_first_5s = hydrated.n_buyers_first_5s
+            wallet_cls = hydrated.wallet_classifications  # v21
 
             # Shadow ML logging — never drives live decisions; writes
             # ml_entry_proba + feature vector alongside rules output so
@@ -741,17 +916,21 @@ class Pipeline:
                 try:
                     proba = self._ml_entry_policy.predict_proba(
                         result,
+                        holder_snapshot=holder_snapshot_all or None,
                         creator_snapshot=creator_snapshot,
                         wallet_prior_stats=wallet_prior_stats,
                         top3_buyer_wallets=top3_wallets,
                         cutoff_ts=scoring_cutoff_ts,
+                        n_buyers_first_5s=n_snipers_first_5s, wallet_classifications=wallet_cls,
                     )
                     feat_json = self._ml_entry_policy.dump_features_json(
                         result,
+                        holder_snapshot=holder_snapshot_all or None,
                         creator_snapshot=creator_snapshot,
                         wallet_prior_stats=wallet_prior_stats,
                         top3_buyer_wallets=top3_wallets,
                         cutoff_ts=scoring_cutoff_ts,
+                        n_buyers_first_5s=n_snipers_first_5s, wallet_classifications=wallet_cls,
                     )
                     await self._db.save_ml_prediction(
                         mint=token.mint,
@@ -841,6 +1020,31 @@ class Pipeline:
                 fast_result, result, self._config
             )
 
+            # 2026-04-28 (architecture phase B step 1): bot-cluster
+            # pre-filter delegated to DecisionService. Same semantics
+            # as before but tested in isolation.
+            from pulse_bot.decision_service import EntryDecision as _ED
+
+            _decision = _ED(
+                should_enter=should_enter,
+                entry_type=entry_type,
+                entry_score=entry_score,
+                entry_buyer_num=entry_buyer_num,
+            )
+            _decision = await self._decision.filter_creator_blacklist(
+                token, _decision, mint_short
+            )
+            _decision = await self._decision.filter_bot_cluster(
+                token, all_trades, _decision, mint_short
+            )
+            _decision = await self._decision.filter_wash_cluster(
+                token, all_trades, _decision, mint_short
+            )
+            should_enter = _decision.should_enter
+            entry_type = _decision.entry_type
+            entry_score = _decision.entry_score
+            entry_buyer_num = _decision.entry_buyer_num
+
             # ── ML confidence-gating (hybrid mode) ────────────────
             # In hybrid mode ML has authority over entry when it is
             # confident. Mechanics:
@@ -857,33 +1061,61 @@ class Pipeline:
                     ml_action, ml_proba, ml_cal = (
                         self._ml_entry_policy.decide_with_confidence(
                             result,
+                            holder_snapshot=holder_snapshot_all or None,
                             creator_snapshot=creator_snapshot,
                             wallet_prior_stats=wallet_prior_stats,
                             top3_buyer_wallets=top3_wallets,
                             cutoff_ts=scoring_cutoff_ts,
+                            n_buyers_first_5s=n_snipers_first_5s, wallet_classifications=wallet_cls,
                         )
                     )
-                    if ml_action == "BUY" and not should_enter:
-                        logger.warning(
-                            "ML OVERRIDE %s: rules=SKIP → ML=BUY "
-                            "(p_raw=%.3f p_cal=%.3f)",
-                            mint_short,
-                            ml_proba,
-                            ml_cal,
-                        )
-                        should_enter = True
-                        self._ml_overrides_buy += 1
-                    elif ml_action == "SKIP" and should_enter:
-                        logger.warning(
-                            "ML OVERRIDE %s: rules=BUY → ML=SKIP "
-                            "(p_raw=%.3f p_cal=%.3f)",
-                            mint_short,
-                            ml_proba,
-                            ml_cal,
-                        )
-                        should_enter = False
-                        self._ml_overrides_skip += 1
-                    # else: agreement or grey zone → no change, no noise.
+                    # Codex Q4 #1 — regression head ranking (2026-04-28).
+                    # Compute predicted PnL% from the parallel reg model.
+                    # Used by DecisionService.apply_ml_override to set a
+                    # meaningful entry_score (live PnL forecast) instead
+                    # of the binary-proba heuristic. Best-effort: a missing
+                    # or failing reg model leaves reg_pnl=None and we fall
+                    # back to the legacy int(ml_cal*100) score.
+                    reg_pnl: float | None = None
+                    if self._ml_entry_reg_policy is not None:
+                        try:
+                            reg_pnl = self._ml_entry_reg_policy.predict_score(
+                                result,
+                                holder_snapshot=holder_snapshot_all or None,
+                                creator_snapshot=creator_snapshot,
+                                wallet_prior_stats=wallet_prior_stats,
+                                top3_buyer_wallets=top3_wallets,
+                                cutoff_ts=scoring_cutoff_ts,
+                                n_buyers_first_5s=n_snipers_first_5s,
+                                wallet_classifications=wallet_cls,
+                            )
+                        except Exception as _reg_exc:
+                            logger.debug(
+                                "Entry reg predict_score failed for %s: %s",
+                                mint_short, _reg_exc,
+                            )
+                            reg_pnl = None
+                    # 2026-04-28 (architecture phase B step 1): ML override
+                    # delegated to DecisionService. Pure function — easy
+                    # to unit-test without spinning up Pipeline.
+                    _decision = _ED(
+                        should_enter=should_enter,
+                        entry_type=entry_type,
+                        entry_score=entry_score,
+                        entry_buyer_num=entry_buyer_num,
+                    )
+                    _decision = self._decision.apply_ml_override(
+                        _decision, ml_action, ml_proba, ml_cal,
+                        result, mint_short, reg_pnl_pct=reg_pnl,
+                    )
+                    should_enter = _decision.should_enter
+                    entry_type = _decision.entry_type
+                    entry_score = _decision.entry_score
+                    entry_buyer_num = _decision.entry_buyer_num
+                    # Mirror counters into legacy attributes for parity
+                    # with existing /metrics paths.
+                    self._ml_overrides_buy = self._decision.ml_overrides_buy
+                    self._ml_overrides_skip = self._decision.ml_overrides_skip
                 except Exception as e:
                     # A broken ML policy must not silently sink live
                     # trading — loud WARN + fall back to rules.
@@ -896,40 +1128,27 @@ class Pipeline:
                         exc_info=True,
                     )
 
-            # ── Phase 3 / 5 early-decision override ──────────────────
-            # If the checkpoint loop set a verdict mid-window, apply it
-            # *after* the standard rules+hybrid path so the cumulative
-            # decision history is still logged. Defaults-OFF: verdict is
-            # always None (loop never spawned), this branch is a no-op.
-            cp_verdict = checkpoint_state.get("verdict")
-            if cp_verdict is not None:
-                source = checkpoint_state.get("source", "checkpoint")
-                cp_proba = checkpoint_state.get("proba")
-                if cp_verdict == "BUY_EARLY" and not should_enter:
-                    logger.warning(
-                        "EARLY OVERRIDE %s: rules=SKIP → %s=BUY (proba=%.3f)",
-                        mint_short,
-                        source,
-                        float(cp_proba) if cp_proba is not None else float("nan"),
-                    )
-                    should_enter = True
-                    entry_type = source
-                elif cp_verdict == "BUY_EARLY":
-                    logger.info(
-                        "EARLY agree %s: %s=BUY confirms rules=BUY (proba=%.3f)",
-                        mint_short,
-                        source,
-                        float(cp_proba) if cp_proba is not None else float("nan"),
-                    )
-                    entry_type = source
-                elif cp_verdict == "SKIP_EARLY" and should_enter:
-                    logger.warning(
-                        "EARLY OVERRIDE %s: rules=BUY → %s=SKIP (proba=%.3f)",
-                        mint_short,
-                        source,
-                        float(cp_proba) if cp_proba is not None else float("nan"),
-                    )
-                    should_enter = False
+            # 2026-04-28 (architecture phase B step 1): checkpoint
+            # override delegated to DecisionService — same logic but
+            # tested in isolation, no clobbering of metadata.
+            _decision = _ED(
+                should_enter=should_enter,
+                entry_type=entry_type,
+                entry_score=entry_score,
+                entry_buyer_num=entry_buyer_num,
+            )
+            _decision = self._decision.apply_checkpoint_override(
+                _decision,
+                cp_verdict=checkpoint_state.get("verdict"),
+                cp_proba=checkpoint_state.get("proba"),
+                cp_source=checkpoint_state.get("source", "checkpoint"),
+                all_trades=all_trades,
+                mint_short=mint_short,
+            )
+            should_enter = _decision.should_enter
+            entry_type = _decision.entry_type
+            entry_score = _decision.entry_score
+            entry_buyer_num = _decision.entry_buyer_num
 
             # Reserve a portfolio slot atomically before scheduling the paper
             # trade. asyncio is single-threaded, so the check+increment below
@@ -940,6 +1159,19 @@ class Pipeline:
             # open paper trades — used to accumulate signal data (48-72h
             # target) without contaminating paper_trades during config tuning.
             if self._config.collector_only:
+                should_enter = False
+            # 2026-04-28: gate on entry_price > 0. ML override path was
+            # entering with result.exit_price=0 (token had no observable
+            # trades during scoring window) — produced ~13 of the first
+            # 22 ml_override entries with pnl=+0.0% phantom positions
+            # that never had a real entry price. Skip cleanly.
+            if should_enter and (result.exit_price or 0.0) <= 0.0:
+                logger.warning(
+                    "ML/rules said BUY but exit_price=%.0f for %s — skipping "
+                    "(no observable price; ML override quality gate).",
+                    result.exit_price or 0.0,
+                    mint_short,
+                )
                 should_enter = False
             if should_enter and self._open_slots < self._config.portfolio_max_positions:
                 self._open_slots += 1
@@ -1045,6 +1277,24 @@ class Pipeline:
             now_offset = self._TIMING_FIRST_CHECKPOINT
             t30_done = False
             window_end = float(self._config.observe_seconds)
+            # 2026-04-28 (codex review): event-time watermark.
+            # Earlier this loop slept to ``token.created_at + now_offset``
+            # in wall-clock and made decisions on whatever ``collected``
+            # held at that instant — trades arriving later (provider lag
+            # 100-500 ms is normal on PumpPortal) didn't make it into
+            # the snapshot. The same checkpoint in replay/backtest uses
+            # event-time filtering (``trade.timestamp <= scored_at``) so
+            # live and replay diverged exactly when lag was high.
+            #
+            # Now: after the wall-clock wakeup, also wait until either
+            # (a) ``max(collected.timestamp) >= target_age``, or
+            # (b) we've waited an extra LAG_BUFFER_SEC for slow trades.
+            # Then build the decision input by event-time filter, not
+            # by arrival time. Tunable via PULSE_CHECKPOINT_LAG_BUFFER.
+            import os as _os_lag
+            LAG_BUFFER_SEC = float(
+                _os_lag.environ.get("PULSE_CHECKPOINT_LAG_BUFFER", "0.5")
+            )
             while now_offset < window_end:
                 # Sleep until the next checkpoint relative to token creation.
                 target_wall = float(token.created_at) + now_offset
@@ -1054,41 +1304,178 @@ class Pipeline:
                 if state.get("verdict") is not None:
                     return  # already decided
 
+                # Event-time watermark — wait for trades up to target_age
+                # to actually arrive, bounded by LAG_BUFFER_SEC.
+                target_age = now_offset
+                lag_deadline = time.time() + LAG_BUFFER_SEC
+                while time.time() < lag_deadline:
+                    if not collected:
+                        break  # nothing yet, no point waiting
+                    # max event-time age observed so far
+                    last_age = float(collected[-1].timestamp) - float(token.created_at)
+                    if last_age >= target_age:
+                        break
+                    await asyncio.sleep(0.05)
+                if state.get("verdict") is not None:
+                    return
+
                 # ── T+30 hook (Phase 3) ─────────────────────────────
+                # Two activation modes:
+                #   _entry_t30_active = LIVE (t30 verdict influences decision)
+                #   t30_shadow_enabled() = SHADOW (verdict logged, never acted on)
+                # SHADOW lets us collect production signal for activation gate
+                # before flipping to LIVE.
                 if (
                     not t30_done
-                    and self._entry_t30_active
                     and self._ml_entry_t30_policy is not None
                     and abs(now_offset - 30.0) < 1e-6
+                    and (
+                        self._entry_t30_active
+                        or self._entry_t30_skip_only_active
+                        or shadow.t30_shadow_enabled()
+                    )
                 ):
                     t30_done = True
+                    # Codex 2026-04-28: filter by event-time, not arrival.
+                    # Pass only trades with timestamp <= target_age relative
+                    # to mint creation so live decision input matches what
+                    # build_dataset_t30 sees in training (`WHERE timestamp
+                    # <= scored_at`).
+                    visible_t30 = [
+                        t for t in collected
+                        if (float(t.timestamp) - float(token.created_at)) <= target_age
+                    ]
                     verdict = await self._evaluate_t30_checkpoint(
-                        token, list(collected), creator_snapshot
+                        token, visible_t30, creator_snapshot
                     )
                     if verdict is not None:
                         action, proba = verdict
-                        state["source"] = "t30"
-                        state["proba"] = proba
-                        if action == "BUY":
-                            state["verdict"] = "BUY_EARLY"
-                            return
-                        if action == "SKIP":
+                        # Always log to shadow when shadow flag set, regardless
+                        # of LIVE flag (for backtesting consistency: same row
+                        # written even if a future flip activates LIVE).
+                        if shadow.t30_shadow_enabled():
+                            shadow.record_t30_shadow(
+                                mint=token.mint,
+                                scored_at=token.created_at + 30.0,
+                                proba=proba,
+                                action=action,
+                                model_hash=getattr(
+                                    self._ml_entry_t30_policy,
+                                    "model_hash",
+                                    None,
+                                ),
+                            )
+                        # 2026-04-27: confidence gates added. The earlier
+                        # design fired SKIP/BUY whenever model action ==
+                        # "SKIP"/"BUY" (i.e. proba beyond the meta-tuned
+                        # floor/ceiling). Problem: with a miscalibrated or
+                        # uncertain model, "barely below floor" still
+                        # triggered SKIP and blocked the main T+90 path
+                        # from ever buying. Now we require the proba to be
+                        # in the *extreme tail* — well past the floor /
+                        # ceiling — before overriding rules. Tunable via
+                        # PULSE_T30_SKIP_TAIL / PULSE_T30_BUY_TAIL.
+                        #
+                        # 2026-04-28 retune: skip_tail tightened 0.05 → 0.005.
+                        # Live T+30 distribution shows median proba ≈ 0.021,
+                        # p90 = 0.086 — at 0.05 tail ~80% of tokens triggered
+                        # SKIP_EARLY and blocked main-model ml_override
+                        # entirely (the 04-27 reason for disabling the flag).
+                        # At 0.005 tail only ~20% bottom (truly DOA) get
+                        # short-circuited; main T+90 still sees borderline
+                        # tokens. Test set skip_wr at proba<0.15 = 0.05% so
+                        # missed-winner cost is negligible.
+                        import os as _os_t30
+                        t30_skip_tail = float(
+                            _os_t30.environ.get("PULSE_T30_SKIP_TAIL", "0.005")
+                        )
+                        t30_buy_tail = float(
+                            _os_t30.environ.get("PULSE_T30_BUY_TAIL", "0.85")
+                        )
+                        if self._entry_t30_active:
+                            state["source"] = "t30"
+                            state["proba"] = proba
+                            if action == "BUY" and proba > t30_buy_tail:
+                                state["verdict"] = "BUY_EARLY"
+                                return
+                            if action == "SKIP" and proba < t30_skip_tail:
+                                state["verdict"] = "SKIP_EARLY"
+                                return
+                            # Confidence gate failed — defer to T+90.
+                        elif (
+                            self._entry_t30_skip_only_active
+                            and action == "SKIP"
+                            and proba < t30_skip_tail
+                        ):
+                            state["source"] = "t30_skip"
+                            state["proba"] = proba
                             state["verdict"] = "SKIP_EARLY"
                             return
 
                 # ── Entry-timing hook (Phase 5) ─────────────────────
-                if self._timing_active and self._timing_model_path is not None:
+                # LIVE: _timing_active influences decision (BUY + SKIP).
+                # SKIP-only: _timing_skip_only_active fires SKIP_EARLY only.
+                # SHADOW: shadow.timing_shadow_enabled() → log only.
+                if self._timing_model_path is not None and (
+                    self._timing_active
+                    or self._timing_skip_only_active
+                    or shadow.timing_shadow_enabled()
+                ):
+                    # Same event-time filter as T+30 above (codex review
+                    # 2026-04-28). Critical for replay parity — timing
+                    # snapshots in build_for_token are built with the
+                    # exact same `t.timestamp <= snapshot_t` semantics.
+                    visible_timing = [
+                        t for t in collected
+                        if (float(t.timestamp) - float(token.created_at)) <= target_age
+                    ]
                     verdict = self._evaluate_timing_checkpoint(
-                        token, list(collected), now_offset
+                        token, visible_timing, now_offset
                     )
                     if verdict is not None:
                         action, proba = verdict
-                        state["source"] = "timing"
-                        state["proba"] = proba
-                        if action == "BUY":
-                            state["verdict"] = "BUY_EARLY"
-                            return
-                        if action == "SKIP":
+                        if shadow.timing_shadow_enabled():
+                            shadow.record_timing_shadow(
+                                mint=token.mint,
+                                scored_at=token.created_at + now_offset,
+                                snapshot_t=now_offset,
+                                action=action,
+                                proba=proba,
+                            )
+                        # 2026-05-01: import locally — the outer ``_os_t30``
+                        # symbol only exists if the t30 block ran above, but
+                        # timing can be called without t30 being active.
+                        import os as _os_timing
+                        timing_gate = float(
+                            _os_timing.environ.get("PULSE_TIMING_CONFIDENCE_GATE", "0.85")
+                        )
+                        # Timing is a 3-class softmax — `proba` is the
+                        # CONFIDENCE in the chosen class. Same gate for
+                        # BUY and SKIP — only fire when model is highly
+                        # confident. Tunable via PULSE_TIMING_CONFIDENCE_GATE.
+                        if self._timing_active:
+                            state["source"] = "timing"
+                            state["proba"] = proba
+                            # 2026-04-30 (codex review): BUY-side audit shows
+                            # mean PnL -7.77% on n=259 in [0.60-0.85), and 0
+                            # rows ≥0.85 in shadow. BUY-branch fires only
+                            # under PULSE_TIMING_ACTIVE=1, never under SKIP-
+                            # only. Future retrains may flip the sign — keep
+                            # the branch but guard it on the LIVE flag.
+                            if action == "BUY" and proba > timing_gate:
+                                state["verdict"] = "BUY_EARLY"
+                                return
+                            if action == "SKIP" and proba > timing_gate:
+                                state["verdict"] = "SKIP_EARLY"
+                                return
+                            # Confidence gate failed — silently defer.
+                        elif (
+                            self._timing_skip_only_active
+                            and action == "SKIP"
+                            and proba > timing_gate
+                        ):
+                            state["source"] = "timing_skip"
+                            state["proba"] = proba
                             state["verdict"] = "SKIP_EARLY"
                             return
 
@@ -1143,19 +1530,65 @@ class Pipeline:
             # landed yet when the bot polls). We pass None on miss; the
             # T30 policy zero-fills HELIUS_FEATURES_T30 which mirrors
             # the training-time fallback for late captures.
+            # Holder capture is scheduled at T+30 — same wall-clock as
+            # this hook fires. The Helius RPC call + DB write usually
+            # lands within 200-500ms but can race the policy lookup.
+            # Retry up to 5× spaced 0.4s apart so we typically read the
+            # snapshot the first or second poll without blocking the
+            # checkpoint loop for more than ~2s.
             holder_t30 = None
-            try:
-                holder_t30 = await asyncio.to_thread(
-                    self._fetch_holder_snapshot_t30, token.mint
+            for attempt in range(5):
+                try:
+                    holder_t30 = await asyncio.to_thread(
+                        self._fetch_holder_snapshot_t30, token.mint
+                    )
+                except Exception:
+                    logger.debug(
+                        "t30 holder fetch crash for %s",
+                        token.mint[:12],
+                        exc_info=True,
+                    )
+                    holder_t30 = None
+                if holder_t30 is not None:
+                    break
+                if attempt < 4:
+                    await asyncio.sleep(0.4)
+            # 2026-04-28 (architecture phase F): T+30 hydration via the
+            # same FeatureHydrationService used at T+90. ``visible`` is
+            # event-time-clipped (see codex Issue #1 fix above), so
+            # the service sees the exact slice training pipeline saw.
+            # ``getattr`` keeps tests that bypass ``__init__`` working
+            # (test_pipeline_integrations builds a Pipeline via
+            # ``__new__`` and doesn't run our hydration setup).
+            hydration = getattr(self, "_hydration", None)
+            if hydration is None:
+                from pulse_bot.feature_hydration import FeatureHydrationService
+
+                hydration = FeatureHydrationService(
+                    db=self._db,
+                    holder_fetcher=getattr(
+                        self, "_fetch_holder_snapshot_all",
+                        lambda mint: None,
+                    ),
                 )
-            except Exception:
-                logger.debug(
-                    "t30 holder fetch failed for %s", token.mint[:12], exc_info=True
-                )
+            hydrated_t30 = hydration.hydrate_for_t30(
+                token=token,
+                visible_trades=visible,
+                t30_cutoff=t30_cutoff,
+            )
+            top3_wallets_t30 = hydrated_t30.top_n_wallets
+            wallet_prior_stats_t30 = hydrated_t30.wallet_prior_stats
+            n_snipers_t30 = hydrated_t30.n_buyers_first_5s
+            wallet_cls_t30 = hydrated_t30.wallet_classifications  # v21
             action, proba = policy.decide_with_confidence(
                 partial,
                 holder_snapshot_t30=holder_t30,
                 creator_snapshot=creator_snapshot,
+                wallet_prior_stats=wallet_prior_stats_t30,
+                top3_buyer_wallets=top3_wallets_t30,
+                cutoff_ts=t30_cutoff,
+                n_buyers_first_5s=n_snipers_t30,
+                wallet_classifications=wallet_cls_t30,
             )
             logger.info(
                 "T+30 decision %s: %s proba=%.3f buys=%d (ceiling=%.2f floor=%.2f)",
@@ -1183,10 +1616,10 @@ class Pipeline:
         """
         rows = self._db._sync_query(
             "SELECT top1_pct, top5_pct, top10_pct, holder_count "
-            "FROM holder_snapshots "
+            "FROM token_holders_snapshots "
             "WHERE mint = %s AND capture_at_age_sec = 30.0 "
-            "AND is_negative_row = FALSE LIMIT 1",
-            mint,
+            "AND is_negative_row = 0 LIMIT 1",
+            (mint,),
         )
         if not rows:
             return None
@@ -1197,6 +1630,70 @@ class Pipeline:
             "top10_30": float(r.get("top10_pct") or 0.0),
             "hc_30": float(r.get("holder_count") or 0.0),
         }
+
+    def _fetch_holder_snapshot_all(self, mint: str) -> dict:
+        """Build the flat ``HELIUS_FEATURES`` dict expected by
+        :meth:`EntryMLPolicy.predict_proba` and the scorer at T+90.
+
+        Pulls the T+30 / T+60 / T+120 rows from ``token_holders_snapshots``
+        and synthesises the derived ``*_delta`` and ``hc_velocity`` fields.
+
+        T+120 race: scoring runs at T+90 by ``observe_seconds`` default,
+        but the T+120 capture is scheduled at exactly T+120s — so on every
+        live token the T+120 row is missing at predict time, leaving 4
+        HELIUS + 3 DERIVED features stuck at 0 (~7/82 dead). Linearly
+        extrapolate ``top1_120 / top5_120 / top10_120 / hc_120`` from the
+        observed (T+30, T+60) pair when T+120 is absent. Train/serve are
+        kept consistent — ``build_dataset.py`` learns on the same
+        extrapolated synthetic values when the historical T+120 row is
+        missing.
+        """
+        rows = self._db._sync_query(
+            "SELECT capture_at_age_sec, top1_pct, top5_pct, top10_pct, "
+            "holder_count "
+            "FROM token_holders_snapshots "
+            "WHERE mint = %s AND capture_at_age_sec IN (30, 60, 120) "
+            "AND is_negative_row = 0",
+            (mint,),
+        )
+        by_age: dict[int, dict] = {}
+        for r in rows or []:
+            age = int(r.get("capture_at_age_sec") or 0)
+            by_age[age] = r
+
+        out: dict[str, float] = {}
+        # T+30 + T+60 are real captures (capture rate ~100% by scoring time).
+        for age in (30, 60):
+            r = by_age.get(age)
+            out[f"top1_{age}"] = float((r or {}).get("top1_pct") or 0.0)
+            out[f"top5_{age}"] = float((r or {}).get("top5_pct") or 0.0)
+            out[f"top10_{age}"] = float((r or {}).get("top10_pct") or 0.0)
+            out[f"hc_{age}"] = float((r or {}).get("holder_count") or 0.0)
+
+        # T+120 — prefer real capture; fall back to linear extrapolation
+        # from (T+30, T+60). Pump.fun bonding-curve concentration tends to
+        # be monotonic over 30-120s windows, so linear extension off the
+        # observed slope is a defensible proxy. ``f(120) ≈ f(60) + (f(60)
+        # - f(30)) * (60/30) = 2*f(60) - f(30)``. Holder count uses the
+        # same formula but is clamped to >= max(hc_60, hc_30) since
+        # holders only ever grow on a freshly launched mint.
+        r120 = by_age.get(120)
+        if r120 is not None:
+            out["top1_120"] = float(r120.get("top1_pct") or 0.0)
+            out["top5_120"] = float(r120.get("top5_pct") or 0.0)
+            out["top10_120"] = float(r120.get("top10_pct") or 0.0)
+            out["hc_120"] = float(r120.get("holder_count") or 0.0)
+        else:
+            out["top1_120"] = max(0.0, min(100.0, 2 * out["top1_60"] - out["top1_30"]))
+            out["top5_120"] = max(0.0, min(100.0, 2 * out["top5_60"] - out["top5_30"]))
+            out["top10_120"] = max(0.0, min(100.0, 2 * out["top10_60"] - out["top10_30"]))
+            out["hc_120"] = max(out["hc_30"], out["hc_60"], 2 * out["hc_60"] - out["hc_30"])
+
+        out["top1_delta"] = out["top1_120"] - out["top1_30"]
+        out["top5_delta"] = out["top5_120"] - out["top5_30"]
+        out["top10_delta"] = out["top10_120"] - out["top10_30"]
+        out["hc_velocity"] = (out["hc_120"] - out["hc_30"]) / 90.0
+        return out
 
     def _evaluate_timing_checkpoint(
         self,
@@ -1260,6 +1757,7 @@ class Pipeline:
         runner: Any,
         entry_ts: float,
         now: float,
+        mint: str | None = None,
     ) -> Any:
         """Phase 4B — query the survival model and return an early-exit
         result if predicted remaining life is below the configured floor.
@@ -1268,11 +1766,15 @@ class Pipeline:
         with ``exit_reason='survival_predict'`` set) so
         ``_close_via_runner_result`` can reuse the standard close path.
         Returns ``None`` to keep holding.
+
+        SHADOW: when ``shadow.survival_shadow_enabled()`` is set, the
+        function still runs the model and logs the prediction even if
+        ``self._survival_active`` is False — but never returns a non-
+        None exit signal.
         """
-        # Defaults-OFF gate: if the env switch is off we never even
-        # attempt to load the model. This keeps boot semantically equal
-        # to pre-Phase-4B regardless of any model file on disk.
-        if not self._survival_active:
+        # Defaults-OFF gate (LIVE only): if neither LIVE nor SHADOW is
+        # set we never even attempt to load the model.
+        if not self._survival_active and not shadow.survival_shadow_enabled():
             return None
         try:
             elapsed = max(0.0, now - entry_ts)
@@ -1305,15 +1807,62 @@ class Pipeline:
             from pulse_bot.ml.survival import predict_remaining_life
 
             model, meta = self._survival_model
+            max_horizon = float(meta.get("max_horizon_seconds", 180.0))
+            # 2026-04-30: skip when elapsed exceeds training horizon. Past
+            # max_horizon predict_remaining_life returns an empty
+            # SurvivalPrediction(remaining_life=0); shadow logs of empty
+            # predictions cluttered ~20% of survival rows and would force-
+            # exit every late-observed token if survival became LIVE.
+            if elapsed >= max_horizon:
+                return None
             features_now = self._survival_features_from_runner(runner, elapsed)
+            # 2026-04-30 calibration: threshold=0.10 maximises Spearman ρ
+            # against actual hold times (+0.500 vs +0.423 at default 0.5)
+            # and "kills" only 64% of winners (vs 96% at default).
+            # Threshold parsed once at startup (self._survival_threshold)
+            # so a malformed env value fails loudly at boot instead of
+            # silently dropping every survival tick.
             pred = predict_remaining_life(
                 model,
                 features_now,
                 feature_order=meta["features"],
                 bucket_seconds=float(meta.get("bucket_seconds", 5.0)),
-                max_horizon_seconds=float(meta.get("max_horizon_seconds", 180.0)),
+                max_horizon_seconds=max_horizon,
                 now_elapsed_seconds=elapsed,
+                survival_threshold=self._survival_threshold,
             )
+            # SHADOW: log every survival prediction (every tick) regardless
+            # of LIVE state. Live decision below is gated by _survival_active.
+            if shadow.survival_shadow_enabled() and mint is not None:
+                shadow.record_survival_shadow(
+                    mint=mint,
+                    scored_at=entry_ts,
+                    snapshot_t=elapsed,
+                    remaining_life_seconds=pred.remaining_life_seconds,
+                    confidence=pred.confidence,
+                    hazard_curve=pred.hazard_curve,
+                )
+            if not self._survival_active:
+                return None
+            # 2026-05-06 — confidence gate (Sergey's pull-up): a survival
+            # prediction with `pred.confidence < min_confidence` means
+            # the hazard curve is close to flat-0.5 (max uncertainty).
+            # Acting on it kills positions on noise. Skip the exit and
+            # let the trade reach a natural exit reason (TP/SL/dead_token).
+            if (
+                pred.remaining_life_seconds < 30.0
+                and pred.confidence < self._survival_min_confidence
+            ):
+                logger.info(
+                    "Survival exit SKIPPED (low confidence): "
+                    "predicted_remaining=%.0fs elapsed=%.0fs "
+                    "confidence=%.2f < gate=%.2f — letting trade run",
+                    pred.remaining_life_seconds,
+                    elapsed,
+                    pred.confidence,
+                    self._survival_min_confidence,
+                )
+                return None
             if pred.remaining_life_seconds < 30.0:
                 logger.warning(
                     "Survival exit: predicted_remaining=%.0fs elapsed=%.0fs "
@@ -1402,293 +1951,22 @@ class Pipeline:
         resume_trade_id: int | None = None,
         resume_last_event_ts: float | None = None,
     ) -> None:
-        """Virtual paper trade: open position, monitor with PulseMonitor, close on exit signal.
+        """Paper-trade lifecycle. Implementation lives in
+        pulse_bot/paper_trade_supervisor.py (architecture phase B
+        step 2, codex 2026-04-28). This thin wrapper preserves the
+        existing call sites and signature."""
+        from pulse_bot.paper_trade_supervisor import PaperTradeSupervisor
 
-        ``entry_ts`` is the position-open timestamp in the event-stream clock
-        (Helius/WS trade timestamps for live, replay-virtual trade timestamps
-        for backtest). Using the same clock for both entry and elapsed avoids
-        wall-clock drift against provider event timestamps. ``resume_last_event_ts``
-        (live-only) carries the last-observed activity across restarts so an
-        already-idle position can close via dead_token immediately instead of
-        being granted a fresh inactivity window.
-        """
-        is_replay = self._launchpad.name == "replay"
-
-        if resume_trade_id is not None:
-            trade_id = resume_trade_id
-            logger.info(
-                "PAPER RESUME %s: price=%e buyer#%d",
-                token.symbol,
-                entry_price,
-                entry_buyer_num,
-            )
-            await self._launchpad.subscribe_trades(token.mint)
-        else:
-            trade_id = await self._db.open_paper_trade(
-                {
-                    "mint": token.mint,
-                    "symbol": token.symbol,
-                    "entry_price": entry_price,
-                    "entry_time": entry_ts,
-                    "entry_mcap_sol": entry_mcap,
-                    "entry_buyer_number": entry_buyer_num,
-                    "entry_type": entry_type,
-                    "entry_score": entry_score,
-                    "buy_amount_sol": self._config.buy_amount_sol,
-                }
-            )
-            logger.info(
-                "PAPER BUY %s: price=%e buyer#%d mcap=%.1f type=%s score=%d",
-                token.symbol,
-                entry_price,
-                entry_buyer_num,
-                entry_mcap,
-                entry_type,
-                entry_score,
-            )
-
-        from pulse_bot.core import PaperTradeRunner
-
-        runner = PaperTradeRunner(self._config, entry_price)
-        # Last observed event, in the trade-stream clock. For resume, start
-        # from the DB-recorded activity so a long idle period before restart
-        # is NOT forgiven by a fresh inactivity window.
-        last_event_ts = (
-            resume_last_event_ts if resume_last_event_ts is not None else entry_ts
+        supervisor = PaperTradeSupervisor(self)
+        await supervisor.run(
+            token=token,
+            entry_price=entry_price,
+            entry_mcap=entry_mcap,
+            entry_buyer_num=entry_buyer_num,
+            entry_type=entry_type,
+            entry_score=entry_score,
+            entry_ts=entry_ts,
+            resume_trade_id=resume_trade_id,
+            resume_last_event_ts=resume_last_event_ts,
         )
 
-        # Phase 4A timer-tick infrastructure. The tick task fires every
-        # ``pulse_tick_seconds`` and re-evaluates ExitManager against the
-        # current pulse window — so a quiet token can close on
-        # pulse_dead / no_new_blood without waiting for ``inactivity_timeout``.
-        # Set ``PULSE_TICK_SECONDS=0`` (or via config attr) to disable
-        # and fall back to the pre-Phase-4A behaviour exactly.
-        tick_seconds = self._resolve_tick_seconds()
-        # Single-flight guard so trade-stream and tick task never both
-        # close the same trade. asyncio is single-threaded but we await
-        # DB calls between the check and the close; the lock serialises
-        # those critical sections.
-        close_lock = asyncio.Lock()
-        closed = False
-        # Track the close so the trade-stream coroutine can short-circuit
-        # the post-loop timeout/dead_token branch when the tick path closed
-        # the trade first.
-        close_outcome: dict[str, object] = {}
-
-        async def _close_via_runner_result(
-            result, trade_market_cap: float, exit_time: float
-        ) -> bool:
-            """Atomic close. Returns True if this caller performed the close."""
-            nonlocal closed
-            async with close_lock:
-                if closed:
-                    return False
-                closed = True
-                close_outcome["reason"] = result.exit_reason
-            await self._db.close_paper_trade(
-                trade_id,
-                result.exit_price,
-                result.exit_reason,
-                result.total_buys + result.total_sells,
-                trade_market_cap,
-                entry_price,
-                self._config.buy_amount_sol,
-                exit_time=exit_time,
-                pnl_pct=result.pnl_pct,
-            )
-            logger.info(
-                "PAPER SELL %s: pnl=%+.1f%% reason=%s hold=%.0fs",
-                token.symbol,
-                result.pnl_pct,
-                result.exit_reason,
-                max(exit_time - entry_ts, 0.0),
-            )
-            return True
-
-        deadline = self._config.exit_max_hold_seconds
-        inactivity = self._config.exit_inactivity_seconds
-
-        async def _trade_stream_loop() -> None:
-            """Original per-trade processing path. Closes via lock-guarded helper."""
-            nonlocal last_event_ts
-            async for trade in self._launchpad.stream_trades(
-                token.mint, deadline, inactivity_timeout=inactivity
-            ):
-                if closed:
-                    return
-                last_event_ts = trade.timestamp
-
-                if not is_replay:
-                    await self._db.insert_trades_batch([trade])
-                    try:
-                        await self._db.upsert_wallet_activity_from_trades([trade])
-                    except Exception as exc:
-                        logger.warning(
-                            "wallet_activity upsert (monitor) failed: %s", exc
-                        )
-
-                await self._db.update_paper_trade(
-                    trade_id,
-                    runner.current_price,
-                    entry_price,
-                    runner.total_buys,
-                    runner.total_sells,
-                    trade.market_cap_sol,
-                )
-                await self._db.update_live_price(
-                    token.mint, runner.current_price, entry_price
-                )
-
-                result = runner.process_trade(trade, entry_ts)
-                if result:
-                    await _close_via_runner_result(
-                        result,
-                        trade_market_cap=trade.market_cap_sol,
-                        exit_time=trade.timestamp,
-                    )
-                    return
-
-        async def _tick_loop() -> None:
-            """Periodic ExitManager re-evaluation when stream is quiet.
-
-            No-op when ``tick_seconds <= 0`` (back-compat). Replay sources
-            do not have a real-time clock anyway, but we still gate on the
-            ``replay`` flag so deterministic backtests don't drift.
-
-            Phase 4B hook: when ``PULSE_SURVIVAL_ACTIVE=1`` and a survival
-            model is loadable, every ``_SURVIVAL_TICK_SECONDS`` (10s, to
-            cap XGBoost call cost + log noise) we ask the hazard model
-            for the predicted remaining life. If it dips below 30s and
-            we've already cleared ``exit_ml_min_hold_seconds``, force a
-            ``survival_predict`` close. Defaults-OFF: model never loaded,
-            hot loop exactly matches pre-Phase-4B.
-            """
-            if tick_seconds <= 0 or is_replay:
-                return
-            last_survival_check_ts: float = 0.0
-            try:
-                while not closed:
-                    await asyncio.sleep(tick_seconds)
-                    if closed:
-                        return
-                    now = time.time()
-                    result = runner.tick(now, entry_ts)
-                    if result:
-                        await _close_via_runner_result(
-                            result,
-                            trade_market_cap=0.0,
-                            exit_time=now,
-                        )
-                        return
-                    # Survival model — Phase 4B. Throttled to once per
-                    # _SURVIVAL_TICK_SECONDS to avoid re-running XGBoost
-                    # on every tick when ``tick_seconds`` is very small
-                    # (e.g. tests use 0.05s). ``getattr`` keeps the
-                    # branch inert for tests that bypass __init__ and
-                    # never set ``_survival_active``.
-                    if getattr(self, "_survival_active", False) and (
-                        now - last_survival_check_ts >= self._SURVIVAL_TICK_SECONDS
-                    ):
-                        last_survival_check_ts = now
-                        survived = await self._maybe_survival_exit(
-                            runner=runner,
-                            entry_ts=entry_ts,
-                            now=now,
-                        )
-                        if survived is not None:
-                            await _close_via_runner_result(
-                                survived,
-                                trade_market_cap=0.0,
-                                exit_time=now,
-                            )
-                            return
-            except asyncio.CancelledError:
-                raise
-
-        try:
-            stream_task = asyncio.create_task(_trade_stream_loop())
-            tick_task = asyncio.create_task(_tick_loop())
-            try:
-                done, pending = await asyncio.wait(
-                    {stream_task, tick_task},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                # Cancel the laggard so we don't leave a dangling timer or
-                # half-consumed stream iterator behind.
-                for t in pending:
-                    t.cancel()
-                if pending:
-                    await asyncio.gather(*pending, return_exceptions=True)
-                # Surface exceptions from the completed task(s).
-                for t in done:
-                    exc = t.exception()
-                    if exc is not None:
-                        raise exc
-            finally:
-                if not stream_task.done():
-                    stream_task.cancel()
-                if not tick_task.done():
-                    tick_task.cancel()
-
-            if closed:
-                return
-
-            # Stream ended without an exit decision — timeout / dead_token.
-            exit_ts: float | None
-            if inactivity > 0:
-                reason = "dead_token"
-                exit_ts = last_event_ts + inactivity
-                inactive = float(inactivity)
-            else:
-                reason = "timeout"
-                exit_ts = last_event_ts
-                inactive = 0.0
-
-            timeout = runner.timeout_result()
-            async with close_lock:
-                if closed:
-                    return
-                closed = True
-            await self._db.close_paper_trade(
-                trade_id,
-                timeout.exit_price,
-                reason,
-                timeout.total_buys + timeout.total_sells,
-                0,
-                entry_price,
-                self._config.buy_amount_sol,
-                exit_time=exit_ts,
-                pnl_pct=timeout.pnl_pct,
-            )
-            logger.info(
-                "PAPER %s %s (inactive %.0fs)",
-                reason.upper(),
-                token.symbol,
-                inactive,
-            )
-
-        except Exception:
-            logger.exception("Paper trade error for %s", token.symbol)
-            # Don't double-close: skip if either path already finalised.
-            if not closed:
-                try:
-                    timeout = runner.timeout_result()
-                    await self._db.close_paper_trade(
-                        trade_id,
-                        timeout.exit_price,
-                        "error",
-                        timeout.total_buys + timeout.total_sells,
-                        0,
-                        entry_price,
-                        self._config.buy_amount_sol,
-                        exit_time=last_event_ts,
-                        pnl_pct=timeout.pnl_pct,
-                    )
-                except Exception:
-                    logger.debug("Failed to close errored trade %s", token.symbol)
-        finally:
-            # Release the portfolio slot reserved at entry time. Guard against
-            # going negative in case a resumed trade was double-counted.
-            if self._open_slots > 0:
-                self._open_slots -= 1
-            await self._launchpad.unsubscribe_trades(token.mint)

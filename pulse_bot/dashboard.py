@@ -231,7 +231,47 @@ def render_charts(rows: list[dict]) -> None:
 def render_paper_trades(db: Database) -> None:
     """Show balance summary, open positions, and closed trades tables."""
     open_trades = db.get_paper_trades(status="open")
-    closed_trades = db.get_paper_trades(status="closed")
+    closed_trades_all = db.get_paper_trades(status="closed")
+
+    # 2026-04-27: filter out tracking-only rows. The bot logs a paper_trade
+    # for EVERY scored mint as a "what-if" simulation, regardless of whether
+    # it actually bought. Real entries have entry_type ∈ {'fast', 'full',
+    # ...} and entry_buyer_number > 0. Shadow rows have entry_type=NULL/''
+    # and entry_buyer_number=0. Of 9242 historical closed trades, only ~30
+    # are real bot entries (29 'full' + 1 'fast', avg PnL +32%).
+    show_tracking = st.checkbox(
+        "Show tracking-only rows (shadow simulations)",
+        value=False,
+        help=(
+            "Bot logs a what-if simulation for every scored mint. Only "
+            "rows where entry_buyer_number>0 are actual bot entries — "
+            "rest are shadow-tracking. Hidden by default."
+        ),
+    )
+    if show_tracking:
+        closed_trades = closed_trades_all
+    else:
+        # Real bot entries are identified by entry_type set to a known
+        # value: 'fast', 'full', 'ml_override', 't30', 'timing', etc.
+        # Shadow-tracking rows have entry_type='' / NULL. Also exclude
+        # synthetic seed-data with timestamp 2026-01-01 00:16:40.
+        REAL_TRADES_FROM = 1743465600  # 2026-04-01 00:00 UTC
+        REAL_ENTRY_TYPES = {
+            "fast", "full", "ml_override", "t30", "t30_skip",
+            "timing", "BUY_EARLY",
+        }
+        def _is_real(t: dict) -> bool:
+            etype = (t.get("entry_type") or "").lower()
+            if etype in REAL_ENTRY_TYPES:
+                return True
+            # Legacy fallback for pre-2026-04-28 entries when entry_type
+            # wasn't always set: trust entry_buyer_number > 0.
+            return (t.get("entry_buyer_number", 0) or 0) > 0
+        closed_trades = [
+            t
+            for t in closed_trades_all
+            if _is_real(t) and (t.get("entry_time", 0) or 0) >= REAL_TRADES_FROM
+        ]
 
     if not open_trades and not closed_trades:
         return
@@ -266,6 +306,28 @@ def render_paper_trades(db: Database) -> None:
     scores_by_mint = _load_scores_for_mints(db, all_mints)
 
     # ── Open positions table ──────────────────────────────
+    if not open_trades:
+        # Show diagnostic instead of hiding the section. Helps detect
+        # "bot scoring fine but never buying" vs "bot stuck/dead".
+        try:
+            recent = db._sync_query(
+                "SELECT COUNT(*) AS n, MAX(ml_entry_proba) AS mx, "
+                "AVG(ml_entry_proba) AS av "
+                "FROM token_scores WHERE source = 'live' "
+                "AND scored_at > ? AND ml_entry_proba IS NOT NULL",
+                (time.time() - 1800,),
+            )
+            r = recent[0] if recent else {}
+            n = r.get("n") or 0
+            mx = r.get("mx") or 0.0
+            av = r.get("av") or 0.0
+            st.caption(
+                f"Open Positions (0) — bot scored {n} tokens last 30 min, "
+                f"max ML proba {mx:.3f} / avg {av:.3f} "
+                f"(buy ceiling = {config.entry_ml_proba_ceiling:.2f})"
+            )
+        except Exception:
+            st.caption("Open Positions (0)")
     if open_trades:
         st.caption(f"Open Positions ({len(open_trades)})")
         now = time.time()
@@ -274,18 +336,25 @@ def render_paper_trades(db: Database) -> None:
             pnl = t.get("current_pnl_pct", 0) or 0
             hold = now - (t.get("entry_time", 0) or 0)
             sc = scores_by_mint.get(t.get("mint", ""), {})
+            ml_proba = sc.get("ml_entry_proba")
+            ml_proba_str = f"{float(ml_proba):.2f}" if ml_proba is not None else "—"
+            entry_mc = t.get("entry_mcap_sol", 0) or 0
+            cur_mc = t.get("current_mcap_sol", 0) or 0
+            mc_str = f"{entry_mc:.1f}→{cur_mc:.1f}" if entry_mc else "—"
             open_rows.append(
                 {
                     "Sym": t.get("symbol", "?"),
-                    "Type": t.get("entry_type", "?"),
+                    "Path": _classify_entry_path(t, sc),
                     "Score": t.get("entry_score", 0),
+                    "Pred PnL": _decode_reg_pnl(t),
+                    "ML p": ml_proba_str,
                     "Fast": sc.get("fast_decision", "—"),
                     "Full": sc.get("decision", "—"),
+                    "Why?": _short_reason(sc.get("reasons")),
                     "Uniq": sc.get("unique_buyers", 0),
                     "Vol": f"{sc.get('buy_volume_sol', 0) or 0:.1f}",
-                    "Entry$": fmt_price(t.get("entry_price", 0) or 0),
+                    "MC SOL": mc_str,
                     "Buyer#": t.get("entry_buyer_number", 0),
-                    "Now$": fmt_price(t.get("current_price", 0) or 0),
                     "P&L%": f"{pnl:+.1f}%",
                     "Hold": fmt_age(hold),
                     "B/S": f"{t.get('total_buys', 0)}/{t.get('total_sells', 0)}",
@@ -324,20 +393,27 @@ def render_paper_trades(db: Database) -> None:
             pnl_s = t.get("pnl_sol", 0) or 0
             hold = t.get("hold_seconds", 0) or 0
             sc = scores_by_mint.get(t.get("mint", ""), {})
+            ml_proba = sc.get("ml_entry_proba")
+            ml_proba_str = f"{float(ml_proba):.2f}" if ml_proba is not None else "—"
+            entry_mc = t.get("entry_mcap_sol", 0) or 0
+            exit_mc = t.get("exit_mcap_sol", 0) or 0
+            mc_str = f"{entry_mc:.1f}→{exit_mc:.1f}" if entry_mc else "—"
             closed_rows.append(
                 {
                     "Sym": t.get("symbol", "?"),
-                    "Type": t.get("entry_type", "?"),
+                    "Path": _classify_entry_path(t, sc),
                     "Score": t.get("entry_score", 0),
+                    "Pred PnL": _decode_reg_pnl(t),
+                    "ML p": ml_proba_str,
                     "Fast": sc.get("fast_decision", "—"),
                     "Full": sc.get("decision", "—"),
+                    "Why?": _short_reason(sc.get("reasons")),
                     "Uniq": sc.get("unique_buyers", 0),
                     "Vol": f"{sc.get('buy_volume_sol', 0) or 0:.1f}",
-                    "Entry$": fmt_price(t.get("entry_price", 0) or 0),
+                    "MC SOL": mc_str,
                     "In#": t.get("entry_buyer_number", 0),
-                    "Exit$": fmt_price(t.get("exit_price", 0) or 0),
                     "Out#": t.get("exit_buyer_number", 0),
-                    "Reason": t.get("exit_reason", "?"),
+                    "Exit Reason": t.get("exit_reason", "?"),
                     "P&L%": f"{pnl:+.1f}%",
                     "P&L SOL": f"{pnl_s:+.5f}",
                     "Hold": fmt_age(hold),
@@ -585,17 +661,96 @@ def render_token_table(rows: list[dict], db: Database | None = None) -> None:
 
 
 def _load_scores_for_mints(db: Database, mints: list[str]) -> dict[str, dict]:
-    """Load token_scores for a list of mints. Returns {mint: score_dict}."""
+    """Load token_scores for a list of mints. Returns {mint: score_dict}.
+
+    2026-04-27: extended to include reasoning columns — ml_entry_proba
+    (what ML model said at scoring), reasons + fast_reasons (which hard
+    filters fired), creator_score + creator_reason. Used by Closed Trades
+    panel to expose entry-decision context.
+    """
     if not mints:
         return {}
     placeholders = ",".join(["?"] * len(mints))
     rows = db._sync_query(
         f"SELECT mint, fast_decision, fast_score, decision, total_score, "
-        f"unique_buyers, buy_volume_sol, curve_progress_pct, sell_pressure "
+        f"unique_buyers, buy_volume_sol, curve_progress_pct, sell_pressure, "
+        f"ml_entry_proba, ml_model_hash, reasons, fast_reasons, "
+        f"creator_score, creator_reason "
         f"FROM token_scores WHERE mint IN ({placeholders}) AND source='live'",
         tuple(mints),
     )
     return {r["mint"]: r for r in rows}
+
+
+def _decode_reg_pnl(trade: dict) -> str:
+    """For ml_override entries, decode entry_score back to predicted_pnl_pct.
+
+    Encoding (decision_service.apply_ml_override 2026-04-29):
+        entry_score = round(reg_pnl_pct × 10) + 500  → range [1, 999]
+        decode:        (entry_score - 500) / 10.0
+
+    Returns the decoded forecast as ``"+N.N%"`` string when applicable.
+    For non-ml_override or pre-encoding rows returns ``"—"`` (legacy
+    int(ml_cal × 100) values are in [1, 100] range, not centered on 500,
+    so they decode to nonsensical large negatives — this filter avoids
+    showing misleading data on old rows).
+    """
+    et = (trade.get("entry_type") or "").lower()
+    if et != "ml_override":
+        return "—"
+    score = trade.get("entry_score")
+    if score is None or not isinstance(score, (int, float)):
+        return "—"
+    score = int(score)
+    # New encoding range — sits roughly in [400, 700] for typical
+    # predictions. Old encoding (int(ml_cal*100)) is in [1, 100].
+    # Treat anything below 200 as legacy and skip decoding.
+    if score < 200:
+        return "—"
+    pnl = (score - 500) / 10.0
+    return f"{pnl:+.1f}%"
+
+
+def _classify_entry_path(trade: dict, score: dict) -> str:
+    """Determine how the bot entered this position. Returns short label
+    suitable for a narrow column.
+
+    Possible labels:
+    - "FAST"          — entered via fast-phase BUY at T+5s
+    - "FULL"          — entered via full-phase BUY at T+90s (rules agreed)
+    - "ML_OVERRIDE"   — full said SKIP/BORDERLINE, but ML proba >= ceiling
+                        forced BUY (rules ⇏ buy, ML says yes)
+    - "T30_BUY"       — Phase-3 T+30 model fired early BUY
+    - "?"             — no scoring row found (legacy / lost write)
+    """
+    et = (trade.get("entry_type") or "").lower()
+    full_dec = (score.get("decision") or "").upper() if score else ""
+    if et == "fast":
+        return "FAST"
+    if et == "full" and full_dec == "BUY":
+        return "FULL"
+    if et == "full" and full_dec in ("SKIP", "BORDERLINE", ""):
+        # Bot entered via full path but rules engine said no — must be
+        # ML override (PULSE_POLICY=hybrid + ML BUY) or T+30 early buy.
+        return "ML_OVERRIDE"
+    if not et and not full_dec:
+        return "?"
+    return et.upper() or "?"
+
+
+def _short_reason(reasons_str: str | None, max_chars: int = 30) -> str:
+    """Compact a reasons list (comma-or-semicolon separated) to its
+    first-listed reason — usually the dominant fail. Empty → '—'."""
+    if not reasons_str:
+        return "—"
+    s = str(reasons_str).strip()
+    if not s:
+        return "—"
+    parts = s.replace(";", ",").split(",")
+    first = parts[0].strip()
+    if len(first) > max_chars:
+        return first[:max_chars - 1] + "…"
+    return first
 
 
 def format_ts(ts: float) -> str:

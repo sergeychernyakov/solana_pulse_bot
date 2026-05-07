@@ -159,6 +159,8 @@ class MonitorResult:
 
     ``pnl_pct`` is the final weighted P&L across all partial fills (if any)
     plus the remaining position sold at ``exit_price`` — already fee-adjusted.
+    ``hold_seconds`` = time elapsed from entry to exit (for max_hold quantile
+    training; stays 0.0 for callers that don't pass entry_time).
     """
 
     exit_price: float
@@ -166,6 +168,7 @@ class MonitorResult:
     pnl_pct: float
     total_buys: int
     total_sells: int
+    hold_seconds: float = 0.0
 
 
 class PaperTradeRunner:
@@ -180,6 +183,9 @@ class PaperTradeRunner:
         self,
         config: PulseBotConfig,
         entry_price: float,
+        *,
+        mint: str | None = None,
+        scored_at: float | None = None,
     ) -> None:
         self._config = config
         self._entry_price = entry_price
@@ -192,21 +198,42 @@ class PaperTradeRunner:
         # when task #123 fires. Pipeline already computes ml_proba at
         # entry time, so reviving is a local change here + a param on
         # ExitManager + one line in extract_exit_features.
+        from pulse_bot.ml import shadow as _shadow
         from pulse_bot.ml.policy import (
             load_exit_policy_if_available,
             load_exit_quantile_if_available,
         )
 
         quantile_sl = None
+        quantile_tp = None
+        quantile_max_hold = None
         if getattr(config, "exit_regression_active", False):
             quantile_sl = load_exit_quantile_if_available(
                 Path("data/ml/exit_quantile_sl.ubj")
+            )
+        # TP quantile loaded only for shadow mode (no live tp gate yet).
+        if _shadow.quantile_shadow_enabled():
+            if quantile_sl is None:
+                quantile_sl = load_exit_quantile_if_available(
+                    Path("data/ml/exit_quantile_sl.ubj")
+                )
+            quantile_tp = load_exit_quantile_if_available(
+                Path("data/ml/exit_quantile_tp.ubj")
+            )
+        # 2026-04-30: max_hold quantile loaded when dynamic mode is on.
+        if getattr(config, "exit_max_hold_dynamic", False):
+            quantile_max_hold = load_exit_quantile_if_available(
+                Path("data/ml/exit_quantile_max_hold.ubj")
             )
 
         self._exit_mgr = ExitManager(
             config,
             ml_advisor=load_exit_policy_if_available(),
             quantile_sl_policy=quantile_sl,
+            quantile_tp_policy=quantile_tp,
+            quantile_max_hold_policy=quantile_max_hold,
+            mint=mint,
+            scored_at=scored_at,
         )
         self._total_buys = 0
         self._total_sells = 0
@@ -268,6 +295,7 @@ class PaperTradeRunner:
                 pnl_pct=self._weighted_pnl(stop_price),
                 total_buys=self._total_buys,
                 total_sells=self._total_sells,
+                hold_seconds=max(trade.timestamp - entry_time, 0.0),
             )
 
         # Pulse monitor → exit manager (same code as live)
@@ -297,6 +325,7 @@ class PaperTradeRunner:
                 pnl_pct=self._weighted_pnl(self._current_price),
                 total_buys=self._total_buys,
                 total_sells=self._total_sells,
+                hold_seconds=elapsed,
             )
 
         self._last_trade_ts = trade.timestamp
@@ -339,11 +368,12 @@ class PaperTradeRunner:
                 pnl_pct=self._weighted_pnl(self._current_price),
                 total_buys=self._total_buys,
                 total_sells=self._total_sells,
+                hold_seconds=elapsed,
             )
 
         return None
 
-    def timeout_result(self) -> MonitorResult:
+    def timeout_result(self, hold_seconds: float = 0.0) -> MonitorResult:
         """Build result for timeout/dead_token exit."""
         return MonitorResult(
             exit_price=self._current_price,
@@ -351,6 +381,7 @@ class PaperTradeRunner:
             pnl_pct=self._weighted_pnl(self._current_price),
             total_buys=self._total_buys,
             total_sells=self._total_sells,
+            hold_seconds=hold_seconds,
         )
 
     def _calc_pnl(self) -> float:
