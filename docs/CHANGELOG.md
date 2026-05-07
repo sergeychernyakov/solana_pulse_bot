@@ -11,6 +11,47 @@
 ```
 
 ---
+## 2026-05-07 15:42 — Snapshot `known-good-2026-05-07-paper-profitable`
+
+**Что зафиксировано:** Полный известный-хороший state бота — code + models + runtime knobs. Доступен для откатa в один клик через `restore.sh`.
+
+**Что в snapshot:**
+- **Code**: git tag `known-good-2026-05-07-paper-profitable` → commit `8d1f69b` (regression gate) на вершине `a2fec14` (confidence gates).
+- **Models** (8 .ubj + 8 .meta.json): entry, entry_t30, entry_reg, entry_timing, exit_quantile_sl/tp/max_hold, survival. ~2 MB total.
+- **Runtime knobs**: все `PULSE_*` env vars из `.env` (без секретов — `HELIUS_API_KEYS`, `PULSE_PG_DSN` etc остаются в host).
+- **Manifest**: sha256 каждого файла, проверяется на restore.
+
+**Где хранится:**
+- rich: `~/backups/gg/known-good-2026-05-07-paper-profitable/`
+- mac:  `~/backups/gg/known-good-2026-05-07-paper-profitable/` (rsync redundancy)
+
+**Bot status в момент snapshot:**
+- Paper PnL +2.78 SOL за 19 ч, WR 18.6 %, N=161 closed trades
+- Все 8 ML heads `status=ok`
+- `PULSE_SURVIVAL_ACTIVE=1` + `PULSE_SURVIVAL_MIN_CONFIDENCE=0.50` (confidence gate активен)
+- Regression gate frozen на N=1247 (см. предыдущую запись)
+
+**Как откатиться:**
+```bash
+git checkout known-good-2026-05-07-paper-profitable
+ssh rich "cd ~/www/gg && git fetch && git checkout known-good-2026-05-07-paper-profitable"
+ssh rich "bash ~/backups/gg/known-good-2026-05-07-paper-profitable/restore.sh"
+```
+
+`restore.sh` сам:
+1. Останавливает `pulse-bot.service`
+2. Бэкапит текущие `data/ml/` → `data/ml.before-restore.<TS>/` (откат-restore самого restore возможен)
+3. Копирует snapshot models обратно
+4. Бэкапит `.env` → `.env.before-restore.<TS>`
+5. Заменяет `PULSE_*` строки на snapshot версии (секреты сохраняются)
+6. Проверяет sha256 моделей по manifest
+7. Перезапускает bot + tail 30 строк logs/bot.log
+
+**Документация:** `docs/SNAPSHOTS.md` — полная инструкция как создавать новые snapshots, как откатывать, как promote'ить snapshot до regression-baseline.
+
+**Откат самого snapshot:** не нужен — snapshot files immutable, ничего в проде не изменилось при создании.
+
+---
 ## 2026-05-07 14:23 — Hard regression gate (`scripts/regression_gate.py`)
 
 **Что изменилось:** Добавлен offline-скрипт-гейт, который перед каждым деплоем проверяет что текущий exit-config не делает хуже исторических paper_trades.
