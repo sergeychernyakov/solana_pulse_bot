@@ -11,6 +11,58 @@
 ```
 
 ---
+## 2026-05-07 14:23 — Hard regression gate (`scripts/regression_gate.py`)
+
+**Что изменилось:** Добавлен offline-скрипт-гейт, который перед каждым деплоем проверяет что текущий exit-config не делает хуже исторических paper_trades.
+
+**Как работает:**
+1. Pull последние N=2000 закрытых paper_trades (за 14 дней) из rich PG.
+2. Для каждого трейда fetch все post-entry trades из `trades` table.
+3. Replay через `simulate_exit_batch(current_config, ...)` → получить counterfactual {WR, PnL/trade, profit_factor}.
+4. Сравнить с замороженным baseline в `pulse_bot/ml/regression_baseline.json`.
+5. Verdict:
+   - PASS — все метрики ≥ baseline − 1·SE → exit 0
+   - WARN — любая в [−2·SE, −1·SE) → exit 2
+   - FAIL — любая < baseline − 2·SE → exit 1 (refuses to ship)
+
+**Baseline (frozen 2026-05-07T14:23Z):**
+- N=1247 closed paper_trades (14-day rolling)
+- WR 2.65 % ± 0.45 SE
+- avg PnL 0.00663 SOL ± 0.00032 SE (negative — отражает старые era до survival fix)
+- profit_factor 0.148
+
+(Низкая абсолютная WR/PnL — потому что dataset включает Apr 16-17 era survival-bleeding. Гейт сравнивает _replay_ counterfactual vs baseline counterfactual, не реальный live PnL — это проверка регрессии exit-config, не стратегии в целом.)
+
+**Доказательство что гейт работает (A/B):**
+- Step 1 — `--freeze` snapshot текущего → baseline сохранён, exit 0
+- Step 2 — same config replay → exit 0 (PASS, Δ=0.0000 на всех метриках)
+- Step 3 — manually inflate baseline до WR=20 % (impossible цель) → exit 1 (FAIL, "❌ wr_pct=2.6500 REGRESSED by 17.3500 (37.7·SE) ... refusing to ship")
+- Step 4 — restore real baseline → exit 0 (PASS) again
+
+**Использование:**
+```bash
+# Один раз — заморозить baseline на known-good state:
+ssh rich 'cd ~/www/gg && set -a && source .env && set +a && \
+  PYTHONPATH=. .venv/bin/python scripts/regression_gate.py --freeze'
+
+# Перед каждым деплоем (manual или CI):
+ssh rich 'cd ~/www/gg && set -a && source .env && set +a && \
+  PYTHONPATH=. .venv/bin/python scripts/regression_gate.py'
+```
+
+**Известные ограничения (codex view):**
+1. Только exit-side regression (entry decisions заморожены как-есть).
+2. Selection bias — replay только entries которые принял старый policy.
+3. SE assumes IID, real trades auto-correlated (нужен block-bootstrap).
+4. Tail-dependence на outliers (top-5 winners = 80 % PnL).
+5. Нет live runtime monitor (Layer 2 — отдельная задача).
+6. `--freeze` доверяет оператору без sanity floor.
+
+**Откат:** просто не запускать. Скрипт изолированный, не подключён к pulse-bot.service.
+
+**Не влияет на текущую доходность бота** (+2.78 SOL/19h). Запускается только pre-deploy, к live pipeline не прикасается.
+
+---
 ## 2026-05-06 14:30 — Confidence/sanity gates audit + uniform low-conf safe defaults
 
 **Что изменилось:** Аудит как все 8 моделей реагируют на низкую уверенность; добавлены недостающие защиты по принципу defense-in-depth.

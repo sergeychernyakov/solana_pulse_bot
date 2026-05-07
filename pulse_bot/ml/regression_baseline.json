@@ -1,0 +1,24 @@
+{
+  "frozen_at": "2026-05-07T14:23Z",
+  "git_hash": "unknown",
+  "lookback_days": 14,
+  "limit": 2000,
+  "horizon_seconds": 600.0,
+  "metrics": {
+    "n": 1247,
+    "wr_pct": 2.65,
+    "wr_pct_se": 0.45,
+    "avg_pnl_sol": -0.00663,
+    "avg_pnl_sol_se": 0.00032,
+    "sum_pnl_sol": -8.273,
+    "profit_factor": 0.148,
+    "n_wins": 33,
+    "n_losses": 1214,
+    "exit_reasons": {
+      "timeout": 1156,
+      "hard_stop": 82,
+      "sell_pressure": 3,
+      "near_graduation": 6
+    }
+  }
+}
