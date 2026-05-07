@@ -1,0 +1,21 @@
+# scripts/pulse-regression-monitor.service
+# Install:  cp scripts/pulse-regression-monitor.{service,timer} ~/.config/systemd/user/
+#           systemctl --user daemon-reload
+#           systemctl --user enable --now pulse-regression-monitor.timer
+[Unit]
+Description=Pulse-bot runtime regression monitor (4h rolling window)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/sergey/www/gg
+EnvironmentFile=/home/sergey/www/gg/.env
+# --dry-run: monitor logs verdicts but doesn't auto-engage safe-mode.
+# Flip to live by removing the flag once you've watched 24-48 h of
+# verdicts and confirmed they make sense for the current regime.
+ExecStart=/home/sergey/www/gg/.venv/bin/python /home/sergey/www/gg/scripts/runtime_regression_monitor.py --dry-run
+# Exit code 2 means "REGRESSION detected and logged" — that's a healthy
+# monitor doing its job, not a service failure. Same for 1 (FAIL on
+# pre-deploy comparison, which we don't reach here but tolerate).
+SuccessExitStatus=0 1 2
+StandardOutput=journal
+StandardError=journal

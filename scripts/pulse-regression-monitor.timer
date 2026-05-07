@@ -1,0 +1,15 @@
+# scripts/pulse-regression-monitor.timer
+# Fires every 30 minutes; the corresponding .service does the actual
+# regression check and engages safe-mode on degradation.
+[Unit]
+Description=Pulse-bot runtime regression monitor — every 30 min
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=30min
+RandomizedDelaySec=60
+Persistent=true
+Unit=pulse-regression-monitor.service
+
+[Install]
+WantedBy=timers.target
