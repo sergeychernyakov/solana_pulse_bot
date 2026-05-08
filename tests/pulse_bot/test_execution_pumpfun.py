@@ -681,3 +681,144 @@ def test_build_sell_transaction_no_ata_create():
         recent_blockhash=_make_zero_blockhash(),
     )
     assert len(tx.message.instructions) == 3
+
+
+# ── PumpFunExecution orchestration ─────────────────────────────
+class _FakeRpc:
+    """Stand-in for HeliusRpc that returns scripted state + sim
+    results. Lets us unit-test PumpFunExecution flow without RPC."""
+
+    def __init__(self, *, state=None, blockhash=None, sim_result=None):
+        self._state = state
+        self._blockhash = blockhash
+        self._sim_result = sim_result
+        self.simulate_called_with: str | None = None
+
+    async def fetch_bonding_curve_state(self, mint):
+        return self._state
+
+    async def get_latest_blockhash(self):
+        return self._blockhash
+
+    async def simulate_transaction(self, b64, **kwargs):
+        self.simulate_called_with = b64
+        return self._sim_result
+
+    async def close(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_pump_execution_simulate_buy_returns_success_when_curve_ok():
+    from pulse_bot.execution_pumpfun import (
+        PumpFunExecution,
+        SimulateResult,
+    )
+    rpc = _FakeRpc(
+        state=_make_test_state(),
+        blockhash=_make_zero_blockhash(),
+        sim_result=SimulateResult(
+            success=True, err=None, logs=["Program log: Buy"], units_consumed=42_000,
+        ),
+    )
+    ex = PumpFunExecution(rpc=rpc, keypair=_make_test_keypair())
+    res = await ex.simulate_buy(SAMPLE_MINT, sol_amount_lamports=10_000_000)
+    assert res.side == "buy"
+    assert res.success is True
+    assert res.submitted_live is False
+    assert res.expected_tokens > 0
+    assert res.units_consumed == 42_000
+    assert res.err is None
+    # Verify we actually called simulate (didn't accidentally short-circuit).
+    assert rpc.simulate_called_with is not None
+
+
+@pytest.mark.asyncio
+async def test_pump_execution_simulate_buy_returns_error_when_state_missing():
+    """Mints without a bonding curve account (off-pump.fun, or stale)
+    return success=False with err=bonding_curve_account_missing."""
+    from pulse_bot.execution_pumpfun import PumpFunExecution
+    rpc = _FakeRpc(state=None)
+    ex = PumpFunExecution(rpc=rpc, keypair=_make_test_keypair())
+    res = await ex.simulate_buy(SAMPLE_MINT, sol_amount_lamports=10_000_000)
+    assert res.success is False
+    assert res.err == "bonding_curve_account_missing"
+
+
+@pytest.mark.asyncio
+async def test_pump_execution_simulate_buy_returns_error_when_curve_complete():
+    from pulse_bot.execution_pumpfun import (
+        BondingCurveState,
+        PumpFunExecution,
+    )
+    completed = BondingCurveState(
+        virtual_token_reserves=1, virtual_sol_reserves=1,
+        real_token_reserves=0, real_sol_reserves=85_000_000_000,
+        token_total_supply=1, complete=True,
+    )
+    rpc = _FakeRpc(state=completed)
+    ex = PumpFunExecution(rpc=rpc, keypair=_make_test_keypair())
+    res = await ex.simulate_buy(SAMPLE_MINT, sol_amount_lamports=10_000_000)
+    assert res.success is False
+    assert res.err == "curve_complete_post_graduation"
+
+
+@pytest.mark.asyncio
+async def test_pump_execution_simulate_buy_propagates_revert_err():
+    """When the on-chain simulator returns err, PumpExecuteResult
+    surfaces it as success=False with the same err payload."""
+    from pulse_bot.execution_pumpfun import (
+        PumpFunExecution,
+        SimulateResult,
+    )
+    rpc = _FakeRpc(
+        state=_make_test_state(),
+        blockhash=_make_zero_blockhash(),
+        sim_result=SimulateResult(
+            success=False,
+            err={"InstructionError": [3, {"Custom": 6002}]},
+            logs=["Program log: TooMuchSolRequired"],
+            units_consumed=5000,
+        ),
+    )
+    ex = PumpFunExecution(rpc=rpc, keypair=_make_test_keypair())
+    res = await ex.simulate_buy(SAMPLE_MINT, sol_amount_lamports=10_000_000)
+    assert res.success is False
+    assert res.err is not None
+    assert res.units_consumed == 5000
+
+
+@pytest.mark.asyncio
+async def test_pump_execution_submit_buy_refused_without_allow_live_flag():
+    """Default constructor disallows real on-chain submission. The
+    operator must explicitly pass allow_live_submit=True after a
+    deliberate decision."""
+    from pulse_bot.execution_pumpfun import PumpFunExecution
+    rpc = _FakeRpc()
+    ex = PumpFunExecution(rpc=rpc, keypair=_make_test_keypair())
+    with pytest.raises(RuntimeError, match="allow_live_submit"):
+        await ex.submit_buy(SAMPLE_MINT, sol_amount_lamports=10_000_000)
+
+
+@pytest.mark.asyncio
+async def test_pump_execution_simulate_sell_requests_correct_amounts():
+    from pulse_bot.execution_pumpfun import (
+        PumpFunExecution,
+        SimulateResult,
+        estimate_sell_output_lamports,
+    )
+    state = _make_test_state()
+    rpc = _FakeRpc(
+        state=state,
+        blockhash=_make_zero_blockhash(),
+        sim_result=SimulateResult(
+            success=True, err=None, logs=[], units_consumed=15000,
+        ),
+    )
+    ex = PumpFunExecution(rpc=rpc, keypair=_make_test_keypair())
+    tokens_in = 1_000_000_000_000
+    res = await ex.simulate_sell(SAMPLE_MINT, token_amount_raw=tokens_in)
+    assert res.side == "sell"
+    assert res.success is True
+    # Expected SOL out matches the curve math.
+    assert res.expected_sol_out_lamports == estimate_sell_output_lamports(tokens_in, state)

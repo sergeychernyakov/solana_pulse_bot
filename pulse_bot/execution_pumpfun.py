@@ -430,6 +430,35 @@ class HeliusRpc:
             )
             return None
 
+    async def get_latest_blockhash(self) -> Hash | None:
+        """Fetch the cluster's most recent blockhash for tx signing.
+
+        Returns ``None`` if the RPC call fails — caller should
+        retry or skip.
+        """
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getLatestBlockhash",
+            "params": [{"commitment": "processed"}],
+        }
+        try:
+            resp = await self._post(payload)
+        except Exception as exc:
+            logger.warning("getLatestBlockhash failed: %s", exc)
+            return None
+        value = resp.get("result", {}).get("value")
+        if not value:
+            return None
+        bh_str = value.get("blockhash")
+        if not bh_str:
+            return None
+        try:
+            return Hash.from_string(bh_str)
+        except Exception as exc:
+            logger.warning("blockhash decode failed (%s): %s", bh_str, exc)
+            return None
+
     async def simulate_transaction(
         self,
         signed_tx_base64: str,
@@ -740,6 +769,332 @@ def serialize_signed_tx_base64(tx: VersionedTransaction) -> str:
     """Serialize a signed VersionedTransaction to the base64 string
     expected by ``simulateTransaction`` / ``sendTransaction`` RPCs."""
     return base64.b64encode(bytes(tx)).decode("ascii")
+
+
+# ── Orchestration layer ────────────────────────────────────────
+@dataclass
+class PumpExecuteResult:
+    """High-level outcome of a buy/sell attempt or simulation.
+
+    Captures everything needed for slippage analysis: success flag,
+    estimated tokens/SOL going in, what we would have received,
+    units consumed, and the underlying RPC error if any.
+    """
+
+    side: str  # "buy" | "sell"
+    mint: str
+    submitted_live: bool  # False = simulation, True = real send
+    success: bool
+    sol_amount_lamports: int = 0
+    expected_tokens: int = 0
+    expected_sol_out_lamports: int = 0
+    slippage_bps_cap: int = 0
+    units_consumed: int | None = None
+    err: Any | None = None
+    logs: list[str] | None = None
+
+
+class PumpFunExecution:
+    """High-level controller — fetches state, builds tx, signs,
+    submits to ``simulateTransaction`` (default) or, when explicitly
+    enabled, ``sendTransaction``.
+
+    Default mode is **simulate-only**. The constructor accepts
+    ``allow_live_submit=False``; flipping it to True is the explicit
+    operator action that turns this into real-money trading. The
+    method names ``simulate_buy`` / ``simulate_sell`` never submit.
+    Submitting requires the separate ``submit_buy`` / ``submit_sell``
+    pair, which check the flag and refuse otherwise.
+    """
+
+    def __init__(
+        self,
+        rpc: HeliusRpc,
+        keypair: "Keypair",
+        *,
+        allow_live_submit: bool = False,
+    ):
+        self._rpc = rpc
+        self._keypair = keypair
+        self._allow_live = allow_live_submit
+
+    @classmethod
+    def from_env(cls, *, allow_live_submit: bool = False) -> "PumpFunExecution":
+        """Construct from env: HELIUS_API_KEY + SOL_WALLET_KEYPAIR.
+
+        Same convention as ``LiveExecution.from_env`` — ``SOL_WALLET_KEYPAIR``
+        is a base58-encoded 64-byte secret key string.
+        """
+        import os as _os
+        from solders.keypair import Keypair  # type: ignore
+
+        helius_key = _os.environ.get("HELIUS_API_KEY", "")
+        kp_b58 = _os.environ.get("SOL_WALLET_KEYPAIR", "")
+        if not helius_key:
+            raise RuntimeError("HELIUS_API_KEY env not set")
+        if not kp_b58:
+            raise RuntimeError("SOL_WALLET_KEYPAIR env not set")
+        kp = Keypair.from_base58_string(kp_b58)
+        return cls(
+            rpc=HeliusRpc(api_key=helius_key),
+            keypair=kp,
+            allow_live_submit=allow_live_submit,
+        )
+
+    @property
+    def wallet_pubkey(self) -> Pubkey:
+        return self._keypair.pubkey()
+
+    async def close(self) -> None:
+        await self._rpc.close()
+
+    async def simulate_buy(
+        self,
+        mint: Pubkey | str,
+        sol_amount_lamports: int,
+        *,
+        slippage_bps: int = 100,
+        priority_fee_microlamports_per_cu: int = DEFAULT_PRIORITY_FEE_MICROLAMPORTS_PER_CU,
+    ) -> PumpExecuteResult:
+        """Build the buy tx and run it through ``simulateTransaction``.
+
+        NEVER submits on-chain. Cost: 0 SOL.
+
+        Returns ``PumpExecuteResult`` with:
+          * ``success`` — would the program have accepted the buy?
+          * ``expected_tokens`` — output computed from current curve
+          * ``err`` — on-chain error code if reverted (slippage,
+            insufficient funds, race, etc)
+
+        Use case: backfill replay of historical paper_trade entries
+        to measure REAL fill rate at the chosen slippage cap, with
+        zero financial risk.
+        """
+        return await self._buy_inner(
+            mint=mint,
+            sol_amount_lamports=sol_amount_lamports,
+            slippage_bps=slippage_bps,
+            priority_fee_microlamports_per_cu=priority_fee_microlamports_per_cu,
+            submit_live=False,
+        )
+
+    async def simulate_sell(
+        self,
+        mint: Pubkey | str,
+        token_amount_raw: int,
+        *,
+        slippage_bps: int = 100,
+        priority_fee_microlamports_per_cu: int = DEFAULT_PRIORITY_FEE_MICROLAMPORTS_PER_CU,
+    ) -> PumpExecuteResult:
+        return await self._sell_inner(
+            mint=mint,
+            token_amount_raw=token_amount_raw,
+            slippage_bps=slippage_bps,
+            priority_fee_microlamports_per_cu=priority_fee_microlamports_per_cu,
+            submit_live=False,
+        )
+
+    async def submit_buy(
+        self,
+        mint: Pubkey | str,
+        sol_amount_lamports: int,
+        *,
+        slippage_bps: int = 100,
+        priority_fee_microlamports_per_cu: int = DEFAULT_PRIORITY_FEE_MICROLAMPORTS_PER_CU,
+    ) -> PumpExecuteResult:
+        """REAL on-chain submission. Spends SOL on success and on
+        failure (priority fee paid regardless). Refuses unless
+        ``allow_live_submit=True`` was set at construction time."""
+        if not self._allow_live:
+            raise RuntimeError(
+                "submit_buy refused: allow_live_submit=False at construction. "
+                "Use simulate_buy for dry-run, or build with "
+                "allow_live_submit=True after deliberate operator approval."
+            )
+        return await self._buy_inner(
+            mint=mint,
+            sol_amount_lamports=sol_amount_lamports,
+            slippage_bps=slippage_bps,
+            priority_fee_microlamports_per_cu=priority_fee_microlamports_per_cu,
+            submit_live=True,
+        )
+
+    async def submit_sell(
+        self,
+        mint: Pubkey | str,
+        token_amount_raw: int,
+        *,
+        slippage_bps: int = 100,
+        priority_fee_microlamports_per_cu: int = DEFAULT_PRIORITY_FEE_MICROLAMPORTS_PER_CU,
+    ) -> PumpExecuteResult:
+        if not self._allow_live:
+            raise RuntimeError(
+                "submit_sell refused: allow_live_submit=False at construction"
+            )
+        return await self._sell_inner(
+            mint=mint,
+            token_amount_raw=token_amount_raw,
+            slippage_bps=slippage_bps,
+            priority_fee_microlamports_per_cu=priority_fee_microlamports_per_cu,
+            submit_live=True,
+        )
+
+    # ── Inner shared paths ─────────────────────────────────────
+    async def _buy_inner(
+        self,
+        mint: Pubkey | str,
+        sol_amount_lamports: int,
+        slippage_bps: int,
+        priority_fee_microlamports_per_cu: int,
+        submit_live: bool,
+    ) -> PumpExecuteResult:
+        mint_pk = mint if isinstance(mint, Pubkey) else Pubkey.from_string(mint)
+        # 1. Fetch on-chain bonding-curve state.
+        state = await self._rpc.fetch_bonding_curve_state(mint_pk)
+        if state is None:
+            return PumpExecuteResult(
+                side="buy",
+                mint=str(mint_pk),
+                submitted_live=submit_live,
+                success=False,
+                sol_amount_lamports=sol_amount_lamports,
+                slippage_bps_cap=slippage_bps,
+                err="bonding_curve_account_missing",
+            )
+        if state.complete:
+            return PumpExecuteResult(
+                side="buy",
+                mint=str(mint_pk),
+                submitted_live=submit_live,
+                success=False,
+                sol_amount_lamports=sol_amount_lamports,
+                slippage_bps_cap=slippage_bps,
+                err="curve_complete_post_graduation",
+            )
+        # 2. Get recent blockhash.
+        blockhash = await self._rpc.get_latest_blockhash()
+        if blockhash is None:
+            return PumpExecuteResult(
+                side="buy",
+                mint=str(mint_pk),
+                submitted_live=submit_live,
+                success=False,
+                sol_amount_lamports=sol_amount_lamports,
+                slippage_bps_cap=slippage_bps,
+                err="blockhash_fetch_failed",
+            )
+        # 3. Build + sign tx.
+        try:
+            tx = build_buy_transaction(
+                keypair=self._keypair,
+                mint=mint_pk,
+                sol_amount_lamports=sol_amount_lamports,
+                state=state,
+                recent_blockhash=blockhash,
+                slippage_bps=slippage_bps,
+                priority_fee_microlamports_per_cu=priority_fee_microlamports_per_cu,
+            )
+        except ValueError as exc:
+            return PumpExecuteResult(
+                side="buy",
+                mint=str(mint_pk),
+                submitted_live=submit_live,
+                success=False,
+                sol_amount_lamports=sol_amount_lamports,
+                slippage_bps_cap=slippage_bps,
+                err=f"tx_build_failed:{exc}",
+            )
+        expected_tokens = estimate_buy_output_tokens(sol_amount_lamports, state)
+        b64 = serialize_signed_tx_base64(tx)
+        # 4. Simulate (and only submit if explicit live mode).
+        if submit_live:
+            # Live submission is wired separately; for now we only
+            # ship the simulate path — the entire Phase 5 backfill
+            # uses simulate. Live submit is added in a later commit
+            # after the simulator validates the pipeline end-to-end
+            # on real on-chain state.
+            raise NotImplementedError(
+                "live submit path not yet implemented — "
+                "simulate path only in this build"
+            )
+        sim = await self._rpc.simulate_transaction(b64)
+        return PumpExecuteResult(
+            side="buy",
+            mint=str(mint_pk),
+            submitted_live=False,
+            success=sim.success,
+            sol_amount_lamports=sol_amount_lamports,
+            expected_tokens=expected_tokens,
+            slippage_bps_cap=slippage_bps,
+            units_consumed=sim.units_consumed,
+            err=sim.err,
+            logs=sim.logs,
+        )
+
+    async def _sell_inner(
+        self,
+        mint: Pubkey | str,
+        token_amount_raw: int,
+        slippage_bps: int,
+        priority_fee_microlamports_per_cu: int,
+        submit_live: bool,
+    ) -> PumpExecuteResult:
+        mint_pk = mint if isinstance(mint, Pubkey) else Pubkey.from_string(mint)
+        state = await self._rpc.fetch_bonding_curve_state(mint_pk)
+        if state is None:
+            return PumpExecuteResult(
+                side="sell",
+                mint=str(mint_pk),
+                submitted_live=submit_live,
+                success=False,
+                slippage_bps_cap=slippage_bps,
+                err="bonding_curve_account_missing",
+            )
+        blockhash = await self._rpc.get_latest_blockhash()
+        if blockhash is None:
+            return PumpExecuteResult(
+                side="sell",
+                mint=str(mint_pk),
+                submitted_live=submit_live,
+                success=False,
+                slippage_bps_cap=slippage_bps,
+                err="blockhash_fetch_failed",
+            )
+        try:
+            tx = build_sell_transaction(
+                keypair=self._keypair,
+                mint=mint_pk,
+                token_amount_raw=token_amount_raw,
+                state=state,
+                recent_blockhash=blockhash,
+                slippage_bps=slippage_bps,
+                priority_fee_microlamports_per_cu=priority_fee_microlamports_per_cu,
+            )
+        except ValueError as exc:
+            return PumpExecuteResult(
+                side="sell",
+                mint=str(mint_pk),
+                submitted_live=submit_live,
+                success=False,
+                slippage_bps_cap=slippage_bps,
+                err=f"tx_build_failed:{exc}",
+            )
+        expected_sol = estimate_sell_output_lamports(token_amount_raw, state)
+        b64 = serialize_signed_tx_base64(tx)
+        if submit_live:
+            raise NotImplementedError("live submit path not yet implemented")
+        sim = await self._rpc.simulate_transaction(b64)
+        return PumpExecuteResult(
+            side="sell",
+            mint=str(mint_pk),
+            submitted_live=False,
+            success=sim.success,
+            expected_sol_out_lamports=expected_sol,
+            slippage_bps_cap=slippage_bps,
+            units_consumed=sim.units_consumed,
+            err=sim.err,
+            logs=sim.logs,
+        )
 
 
 def estimate_sell_output_lamports(
