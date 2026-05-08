@@ -290,3 +290,132 @@ def test_estimate_buy_zero_for_zero_input():
     )
     assert estimate_buy_output_tokens(0, state) == 0
     assert estimate_buy_output_tokens(-100, state) == 0
+
+
+# ── Helius RPC client (mocked) ─────────────────────────────────
+class _FakeResponse:
+    def __init__(self, json_payload):
+        self._payload = json_payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    def raise_for_status(self):
+        pass
+
+    async def json(self):
+        return self._payload
+
+
+class _FakeSession:
+    """Minimal aiohttp session stand-in. Records the last request
+    payload so tests can assert what was sent."""
+
+    def __init__(self, response_payload):
+        self._response = response_payload
+        self.last_payload = None
+
+    def post(self, url, json=None, timeout=None):
+        self.last_payload = json
+        return _FakeResponse(self._response)
+
+    async def close(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_rpc_get_account_info_decodes_base64():
+    from pulse_bot.execution_pumpfun import HeliusRpc
+    import base64
+    sample_data = b"\x00" * 49
+    encoded = base64.b64encode(sample_data).decode()
+    fake_resp = {
+        "jsonrpc": "2.0",
+        "result": {
+            "value": {
+                "data": [encoded, "base64"],
+                "executable": False,
+                "lamports": 2_000_000,
+                "owner": "11111111111111111111111111111111",
+                "rentEpoch": 0,
+            },
+        },
+    }
+    rpc = HeliusRpc(api_key="test")
+    rpc._session = _FakeSession(fake_resp)
+    out = await rpc.get_account_info(SAMPLE_MINT)
+    assert out == sample_data
+
+
+@pytest.mark.asyncio
+async def test_rpc_get_account_info_returns_none_when_account_missing():
+    from pulse_bot.execution_pumpfun import HeliusRpc
+    fake_resp = {"jsonrpc": "2.0", "result": {"value": None}}
+    rpc = HeliusRpc(api_key="test")
+    rpc._session = _FakeSession(fake_resp)
+    out = await rpc.get_account_info(SAMPLE_MINT)
+    assert out is None
+
+
+@pytest.mark.asyncio
+async def test_rpc_simulate_transaction_success():
+    """err=None means program succeeded; SimulateResult.success=True."""
+    from pulse_bot.execution_pumpfun import HeliusRpc
+    fake_resp = {
+        "jsonrpc": "2.0",
+        "result": {
+            "value": {
+                "err": None,
+                "logs": ["Program log: Instruction: Buy", "Program log: ok"],
+                "unitsConsumed": 30000,
+            },
+        },
+    }
+    rpc = HeliusRpc(api_key="test")
+    rpc._session = _FakeSession(fake_resp)
+    res = await rpc.simulate_transaction("base64_dummy_tx")
+    assert res.success is True
+    assert res.err is None
+    assert res.units_consumed == 30000
+    assert "Buy" in res.logs[0]
+
+
+@pytest.mark.asyncio
+async def test_rpc_simulate_transaction_slippage_revert():
+    """When the program reverts due to slippage cap, err is non-null
+    and success=False."""
+    from pulse_bot.execution_pumpfun import HeliusRpc
+    fake_resp = {
+        "jsonrpc": "2.0",
+        "result": {
+            "value": {
+                "err": {"InstructionError": [0, {"Custom": 6002}]},  # pump.fun "TooLittleSolReceived"
+                "logs": ["Program log: TooMuchSolRequired"],
+                "unitsConsumed": 5000,
+            },
+        },
+    }
+    rpc = HeliusRpc(api_key="test")
+    rpc._session = _FakeSession(fake_resp)
+    res = await rpc.simulate_transaction("base64_dummy_tx")
+    assert res.success is False
+    assert res.err is not None
+
+
+@pytest.mark.asyncio
+async def test_rpc_simulate_payload_has_expected_options():
+    """Verify we ask Helius for replaceRecentBlockhash so simulation
+    doesn't fail on stale blockhashes from offline-signed txs."""
+    from pulse_bot.execution_pumpfun import HeliusRpc
+    fake_resp = {"jsonrpc": "2.0", "result": {"value": {"err": None, "logs": []}}}
+    fake = _FakeSession(fake_resp)
+    rpc = HeliusRpc(api_key="test")
+    rpc._session = fake
+    await rpc.simulate_transaction("dummy")
+    options = fake.last_payload["params"][1]
+    assert options["replaceRecentBlockhash"] is True
+    assert options["encoding"] == "base64"
+    assert options["commitment"] == "processed"

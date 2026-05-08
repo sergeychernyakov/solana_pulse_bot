@@ -316,6 +316,162 @@ def estimate_buy_output_tokens(
     return max(0, min(tokens_out, state.real_token_reserves))
 
 
+# ── Helius RPC client (read-only + simulate) ──────────────────
+@dataclass
+class SimulateResult:
+    """Outcome of a ``simulateTransaction`` call.
+
+    ``success=False`` means the program would have reverted (e.g.
+    slippage cap tripped, insufficient funds, race-conditioned
+    bonding-curve state). ``logs`` contains the on-chain log lines
+    we can scan for emitted events (post-trade token balance, etc).
+    """
+
+    success: bool
+    err: Any | None = None
+    logs: list[str] | None = None
+    units_consumed: int | None = None
+    raw_response: dict[str, Any] | None = None
+
+
+class HeliusRpc:
+    """Minimal async RPC client around Helius mainnet endpoint.
+
+    Wraps two endpoints we need for pump.fun simulation:
+      * ``getAccountInfo`` — fetch the bonding-curve account state
+      * ``simulateTransaction`` — dry-execute a signed tx
+
+    Uses ``aiohttp`` so the live trading hot path doesn't block the
+    bot's pulse loop. Reuses one ``ClientSession`` per instance;
+    callers should ``await rpc.close()`` on shutdown.
+    """
+
+    def __init__(self, api_key: str, base_url: str | None = None):
+        self._api_key = api_key
+        self._base_url = (
+            base_url or "https://mainnet.helius-rpc.com"
+        )
+        self._url = f"{self._base_url}/?api-key={self._api_key}"
+        self._session: Any = None
+
+    async def _ensure_session(self) -> Any:
+        if self._session is None:
+            import aiohttp  # type: ignore
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def close(self) -> None:
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
+
+    async def _post(self, payload: dict, timeout_sec: float = 5.0) -> dict:
+        sess = await self._ensure_session()
+        async with sess.post(
+            self._url,
+            json=payload,
+            timeout=timeout_sec,
+        ) as resp:
+            resp.raise_for_status()
+            return await resp.json()
+
+    async def get_account_info(
+        self, pubkey: Pubkey, encoding: str = "base64"
+    ) -> bytes | None:
+        """Return the raw account-data bytes, or None if account
+        doesn't exist (most pre-graduation pump.fun mints don't have
+        the bonding curve initialised until the first buy)."""
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [
+                str(pubkey),
+                {"encoding": encoding, "commitment": "processed"},
+            ],
+        }
+        resp = await self._post(payload)
+        value = resp.get("result", {}).get("value")
+        if value is None:
+            return None
+        data_field = value.get("data")
+        if not data_field or not isinstance(data_field, list):
+            return None
+        # data = [base64_string, "base64"]
+        try:
+            return base64.b64decode(data_field[0])
+        except Exception as exc:
+            logger.warning("getAccountInfo decode failed for %s: %s", pubkey, exc)
+            return None
+
+    async def fetch_bonding_curve_state(
+        self, mint: Pubkey
+    ) -> BondingCurveState | None:
+        """Convenience wrapper: PDA-derive + getAccountInfo + parse."""
+        pda = derive_bonding_curve_pda(mint)
+        data = await self.get_account_info(pda)
+        if data is None:
+            return None
+        try:
+            return BondingCurveState.from_account_data(data)
+        except ValueError as exc:
+            logger.warning(
+                "bonding curve %s parse failed (mint=%s): %s",
+                pda, mint, exc,
+            )
+            return None
+
+    async def simulate_transaction(
+        self,
+        signed_tx_base64: str,
+        *,
+        replace_recent_blockhash: bool = True,
+        sig_verify: bool = False,
+    ) -> SimulateResult:
+        """Run ``simulateTransaction`` on a serialised, signed tx.
+
+        Args:
+            signed_tx_base64: Base64-encoded serialised transaction.
+            replace_recent_blockhash: Tell Helius to swap in a fresh
+                blockhash. Without this, simulation often fails with
+                "BlockhashNotFound" because we sign offline.
+            sig_verify: Whether the simulator should verify the
+                signature. Default False — we can simulate against a
+                tx signed with a stale blockhash too.
+
+        Returns:
+            :class:`SimulateResult`. ``success=True`` iff the program
+            instruction would have completed without reverting.
+        """
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "simulateTransaction",
+            "params": [
+                signed_tx_base64,
+                {
+                    "encoding": "base64",
+                    "commitment": "processed",
+                    "sigVerify": sig_verify,
+                    "replaceRecentBlockhash": replace_recent_blockhash,
+                },
+            ],
+        }
+        try:
+            resp = await self._post(payload, timeout_sec=10.0)
+        except Exception as exc:
+            return SimulateResult(success=False, err=str(exc))
+        result = resp.get("result", {}).get("value", {})
+        err = result.get("err")
+        return SimulateResult(
+            success=(err is None),
+            err=err,
+            logs=result.get("logs"),
+            units_consumed=result.get("unitsConsumed"),
+            raw_response=resp,
+        )
+
+
 def estimate_sell_output_lamports(
     token_amount_raw: int,
     state: BondingCurveState,
