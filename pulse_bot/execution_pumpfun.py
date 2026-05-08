@@ -36,12 +36,21 @@ import struct
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from solders.hash import Hash  # type: ignore
+from solders.instruction import AccountMeta, Instruction  # type: ignore
+from solders.message import MessageV0  # type: ignore
 from solders.pubkey import Pubkey  # type: ignore
+from solders.transaction import VersionedTransaction  # type: ignore
 
 if TYPE_CHECKING:
     from solders.keypair import Keypair  # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+# System programs used in transaction assembly.
+COMPUTE_BUDGET_PROGRAM_ID = Pubkey.from_string(
+    "ComputeBudget111111111111111111111111111111"
+)
 
 # Pump.fun trading fee in basis points (1 % paid into the bonding
 # curve to the protocol on every buy and every sell). Hardcoded in
@@ -470,6 +479,267 @@ class HeliusRpc:
             units_consumed=result.get("unitsConsumed"),
             raw_response=resp,
         )
+
+
+# ── Instruction builders ───────────────────────────────────────
+def build_set_compute_unit_limit_ix(units: int) -> Instruction:
+    """Compute Budget program: cap the compute units this tx can use.
+
+    Discriminator byte 0x02 + u32 LE units. Default budget is 200k
+    CU; sniping txs need ~30-50k for the buy itself plus ATA creation.
+    """
+    if units < 0 or units > 1_400_000:
+        raise ValueError(f"compute units out of range: {units}")
+    data = bytes([0x02]) + struct.pack("<I", units)
+    return Instruction(
+        program_id=COMPUTE_BUDGET_PROGRAM_ID,
+        accounts=[],
+        data=data,
+    )
+
+
+def build_set_compute_unit_price_ix(microlamports_per_cu: int) -> Instruction:
+    """Compute Budget program: priority fee in microlamports per CU.
+
+    Discriminator byte 0x03 + u64 LE microlamports. Total priority
+    fee = micro × cu_limit / 1_000_000. At 100k microlamports/CU and
+    200k CU, that's ~0.00002 SOL per attempt — enough for typical
+    pump.fun blocks but bumpable on hot mints.
+    """
+    if microlamports_per_cu < 0:
+        raise ValueError(f"microlamports must be >= 0, got {microlamports_per_cu}")
+    data = bytes([0x03]) + struct.pack("<Q", microlamports_per_cu)
+    return Instruction(
+        program_id=COMPUTE_BUDGET_PROGRAM_ID,
+        accounts=[],
+        data=data,
+    )
+
+
+def build_create_ata_idempotent_ix(
+    payer: Pubkey,
+    owner: Pubkey,
+    mint: Pubkey,
+) -> Instruction:
+    """Associated Token Account program: create-if-not-exists.
+
+    Idempotent variant (instruction byte = 0x01) is safe to issue
+    on every buy — if the ATA already exists, the program returns
+    success without spending rent. Costs ~5k CU.
+
+    Account order is fixed by the SPL ATA program:
+      0. payer (signer, writable)              — funds rent if creating
+      1. ata (writable)                        — the ATA being created
+      2. owner (readonly)                      — the wallet owning the ATA
+      3. mint (readonly)
+      4. system_program (readonly)
+      5. token_program (readonly)
+    """
+    ata = derive_associated_token_account(owner, mint)
+    accounts = [
+        AccountMeta(pubkey=payer, is_signer=True, is_writable=True),
+        AccountMeta(pubkey=ata, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=owner, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=mint, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
+    ]
+    return Instruction(
+        program_id=ATA_PROGRAM_ID,
+        accounts=accounts,
+        data=bytes([0x01]),  # CreateIdempotent
+    )
+
+
+def build_pump_buy_ix(
+    user: Pubkey,
+    mint: Pubkey,
+    token_amount_raw: int,
+    max_sol_cost_lamports: int,
+) -> Instruction:
+    """Build the pump.fun buy instruction.
+
+    Account ordering matches the published IDL (verified against
+    decoded mainnet buy transactions). Each account's signer/writable
+    flags are critical — the on-chain program validates them and
+    reverts on mismatch.
+    """
+    accounts_obj = PumpFunBuyAccounts.for_user_and_mint(user, mint)
+    # is_signer / is_writable flags from decoded mainnet txs:
+    #   1. global                 ro, not signer
+    #   2. fee_recipient          rw, not signer
+    #   3. mint                   ro, not signer
+    #   4. bonding_curve          rw, not signer
+    #   5. associated_bonding_curve  rw, not signer
+    #   6. associated_user        rw, not signer
+    #   7. user                   rw, SIGNER
+    #   8. system_program         ro, not signer
+    #   9. token_program          ro, not signer
+    #  10. rent_sysvar            ro, not signer
+    #  11. event_authority        ro, not signer
+    #  12. program                ro, not signer
+    accounts = [
+        AccountMeta(pubkey=accounts_obj.global_pda, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=accounts_obj.fee_recipient, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=accounts_obj.mint, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=accounts_obj.bonding_curve, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=accounts_obj.associated_bonding_curve, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=accounts_obj.associated_user, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=accounts_obj.user, is_signer=True, is_writable=True),
+        AccountMeta(pubkey=accounts_obj.system_program, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=accounts_obj.token_program, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=accounts_obj.rent_sysvar, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=accounts_obj.event_authority, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=accounts_obj.program, is_signer=False, is_writable=False),
+    ]
+    data = encode_buy_instruction_data(token_amount_raw, max_sol_cost_lamports)
+    return Instruction(
+        program_id=PUMPFUN_PROGRAM_ID,
+        accounts=accounts,
+        data=data,
+    )
+
+
+def build_pump_sell_ix(
+    user: Pubkey,
+    mint: Pubkey,
+    token_amount_raw: int,
+    min_sol_output_lamports: int,
+) -> Instruction:
+    """Build the pump.fun sell instruction.
+
+    Differs from buy in two account-list slots:
+      * No rent_sysvar (pump.fun doesn't reach for rent on sells)
+      * associated_token_program slot present (used for ATA close
+        on sells of full balance — although we don't close it here)
+    """
+    accounts_obj = PumpFunSellAccounts.for_user_and_mint(user, mint)
+    accounts = [
+        AccountMeta(pubkey=accounts_obj.global_pda, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=accounts_obj.fee_recipient, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=accounts_obj.mint, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=accounts_obj.bonding_curve, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=accounts_obj.associated_bonding_curve, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=accounts_obj.associated_user, is_signer=False, is_writable=True),
+        AccountMeta(pubkey=accounts_obj.user, is_signer=True, is_writable=True),
+        AccountMeta(pubkey=accounts_obj.system_program, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=accounts_obj.associated_token_program, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=accounts_obj.token_program, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=accounts_obj.event_authority, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=accounts_obj.program, is_signer=False, is_writable=False),
+    ]
+    data = encode_sell_instruction_data(token_amount_raw, min_sol_output_lamports)
+    return Instruction(
+        program_id=PUMPFUN_PROGRAM_ID,
+        accounts=accounts,
+        data=data,
+    )
+
+
+# ── Transaction assembly ───────────────────────────────────────
+def build_buy_transaction(
+    keypair: "Keypair",
+    mint: Pubkey,
+    sol_amount_lamports: int,
+    state: BondingCurveState,
+    recent_blockhash: Hash,
+    slippage_bps: int = 100,
+    priority_fee_microlamports_per_cu: int = DEFAULT_PRIORITY_FEE_MICROLAMPORTS_PER_CU,
+    compute_unit_limit: int = DEFAULT_COMPUTE_UNIT_LIMIT,
+) -> VersionedTransaction:
+    """Build, sign, and return a complete buy transaction.
+
+    Pipeline:
+      1. Estimate token output from (sol_amount, state) via constant
+         product — establishes the ``amount`` field on the instr.
+      2. Apply slippage: ``max_sol_cost = sol_amount × (1 + slip_bps/10_000)``
+      3. Assemble four instructions:
+           a. ComputeBudget.SetUnitLimit
+           b. ComputeBudget.SetUnitPrice (priority fee)
+           c. ATA.CreateIdempotent (no-op if user ATA exists)
+           d. PumpFun.Buy
+      4. Wrap in MessageV0 with caller-provided recent blockhash
+      5. Sign with the wallet keypair → VersionedTransaction
+
+    Returns a fully-signed transaction ready to either ``simulate``
+    or ``submit``.
+    """
+    user = keypair.pubkey()
+    expected_tokens = estimate_buy_output_tokens(sol_amount_lamports, state)
+    if expected_tokens <= 0:
+        raise ValueError(
+            "buy would yield zero tokens — bonding curve complete or "
+            "sol_amount too small"
+        )
+    max_sol_cost = (
+        sol_amount_lamports * (10_000 + slippage_bps)
+    ) // 10_000
+    instructions = [
+        build_set_compute_unit_limit_ix(compute_unit_limit),
+        build_set_compute_unit_price_ix(priority_fee_microlamports_per_cu),
+        build_create_ata_idempotent_ix(payer=user, owner=user, mint=mint),
+        build_pump_buy_ix(
+            user=user,
+            mint=mint,
+            token_amount_raw=expected_tokens,
+            max_sol_cost_lamports=max_sol_cost,
+        ),
+    ]
+    msg = MessageV0.try_compile(
+        payer=user,
+        instructions=instructions,
+        address_lookup_table_accounts=[],
+        recent_blockhash=recent_blockhash,
+    )
+    return VersionedTransaction(msg, [keypair])
+
+
+def build_sell_transaction(
+    keypair: "Keypair",
+    mint: Pubkey,
+    token_amount_raw: int,
+    state: BondingCurveState,
+    recent_blockhash: Hash,
+    slippage_bps: int = 100,
+    priority_fee_microlamports_per_cu: int = DEFAULT_PRIORITY_FEE_MICROLAMPORTS_PER_CU,
+    compute_unit_limit: int = DEFAULT_COMPUTE_UNIT_LIMIT,
+) -> VersionedTransaction:
+    """Build a sell transaction. Same pattern as buy, no ATA-create
+    (we already own the ATA from the prior buy)."""
+    user = keypair.pubkey()
+    expected_sol = estimate_sell_output_lamports(token_amount_raw, state)
+    if expected_sol <= 0:
+        raise ValueError(
+            "sell would yield zero SOL — bonding curve complete or "
+            "amount too small"
+        )
+    # Slippage on sell goes the OTHER direction: minimum we'll accept.
+    min_sol_output = (
+        expected_sol * (10_000 - slippage_bps)
+    ) // 10_000
+    instructions = [
+        build_set_compute_unit_limit_ix(compute_unit_limit),
+        build_set_compute_unit_price_ix(priority_fee_microlamports_per_cu),
+        build_pump_sell_ix(
+            user=user,
+            mint=mint,
+            token_amount_raw=token_amount_raw,
+            min_sol_output_lamports=min_sol_output,
+        ),
+    ]
+    msg = MessageV0.try_compile(
+        payer=user,
+        instructions=instructions,
+        address_lookup_table_accounts=[],
+        recent_blockhash=recent_blockhash,
+    )
+    return VersionedTransaction(msg, [keypair])
+
+
+def serialize_signed_tx_base64(tx: VersionedTransaction) -> str:
+    """Serialize a signed VersionedTransaction to the base64 string
+    expected by ``simulateTransaction`` / ``sendTransaction`` RPCs."""
+    return base64.b64encode(bytes(tx)).decode("ascii")
 
 
 def estimate_sell_output_lamports(

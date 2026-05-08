@@ -419,3 +419,265 @@ async def test_rpc_simulate_payload_has_expected_options():
     assert options["replaceRecentBlockhash"] is True
     assert options["encoding"] == "base64"
     assert options["commitment"] == "processed"
+
+
+# ── Compute Budget instruction encoding ──────────────────────
+def test_set_compute_unit_limit_ix_format():
+    """[0x02] + u32 LE units. Program: ComputeBudget111…"""
+    from pulse_bot.execution_pumpfun import (
+        COMPUTE_BUDGET_PROGRAM_ID,
+        build_set_compute_unit_limit_ix,
+    )
+    ix = build_set_compute_unit_limit_ix(200_000)
+    assert ix.program_id == COMPUTE_BUDGET_PROGRAM_ID
+    assert len(ix.accounts) == 0
+    import struct
+    assert ix.data[0] == 0x02
+    units, = struct.unpack("<I", ix.data[1:5])
+    assert units == 200_000
+
+
+def test_set_compute_unit_price_ix_format():
+    """[0x03] + u64 LE microlamports."""
+    from pulse_bot.execution_pumpfun import build_set_compute_unit_price_ix
+    ix = build_set_compute_unit_price_ix(100_000)
+    assert ix.data[0] == 0x03
+    import struct
+    fee, = struct.unpack("<Q", ix.data[1:9])
+    assert fee == 100_000
+
+
+def test_compute_unit_limit_validates_range():
+    from pulse_bot.execution_pumpfun import build_set_compute_unit_limit_ix
+    with pytest.raises(ValueError):
+        build_set_compute_unit_limit_ix(-1)
+    with pytest.raises(ValueError):
+        build_set_compute_unit_limit_ix(2_000_000)  # > Solana cap
+
+
+# ── ATA create-idempotent ─────────────────────────────────────
+def test_create_ata_idempotent_ix_layout():
+    """Program: ATA program. Discriminator byte 0x01 (idempotent
+    variant). 6 accounts in fixed SPL order."""
+    from pulse_bot.execution_pumpfun import (
+        ATA_PROGRAM_ID,
+        SYSTEM_PROGRAM_ID,
+        TOKEN_PROGRAM_ID,
+        build_create_ata_idempotent_ix,
+        derive_associated_token_account,
+    )
+    ix = build_create_ata_idempotent_ix(SAMPLE_USER, SAMPLE_USER, SAMPLE_MINT)
+    assert ix.program_id == ATA_PROGRAM_ID
+    assert ix.data == bytes([0x01])
+    assert len(ix.accounts) == 6
+    payer, ata, owner, mint, sys, token = ix.accounts
+    assert payer.pubkey == SAMPLE_USER
+    assert payer.is_signer is True
+    assert payer.is_writable is True
+    assert ata.pubkey == derive_associated_token_account(SAMPLE_USER, SAMPLE_MINT)
+    assert ata.is_writable is True
+    assert sys.pubkey == SYSTEM_PROGRAM_ID
+    assert token.pubkey == TOKEN_PROGRAM_ID
+
+
+# ── Pump.fun buy/sell instruction with full account list ─────
+def test_pump_buy_ix_account_count_and_signer_flags():
+    """12 accounts in fixed order; user (idx 6) is the signer/writable.
+    Program: pump.fun mainnet program."""
+    from pulse_bot.execution_pumpfun import (
+        PUMPFUN_PROGRAM_ID,
+        build_pump_buy_ix,
+    )
+    ix = build_pump_buy_ix(
+        user=SAMPLE_USER,
+        mint=SAMPLE_MINT,
+        token_amount_raw=1_000_000_000,
+        max_sol_cost_lamports=10_000_000,
+    )
+    assert ix.program_id == PUMPFUN_PROGRAM_ID
+    assert len(ix.accounts) == 12
+
+    # User at index 6: is_signer=True, is_writable=True.
+    user_acct = ix.accounts[6]
+    assert user_acct.pubkey == SAMPLE_USER
+    assert user_acct.is_signer is True
+    assert user_acct.is_writable is True
+
+    # Mint at index 2: readonly.
+    assert ix.accounts[2].pubkey == SAMPLE_MINT
+    assert ix.accounts[2].is_signer is False
+    assert ix.accounts[2].is_writable is False
+
+    # Bonding curve at index 3: writable.
+    assert ix.accounts[3].is_writable is True
+
+    # No other signers — only the user signs.
+    assert sum(1 for a in ix.accounts if a.is_signer) == 1
+
+
+def test_pump_sell_ix_account_count():
+    """12 accounts; sell instruction has associated_token_program at
+    slot 8 (vs rent at slot 9 for buy)."""
+    from pulse_bot.execution_pumpfun import (
+        ATA_PROGRAM_ID,
+        PUMPFUN_PROGRAM_ID,
+        build_pump_sell_ix,
+    )
+    ix = build_pump_sell_ix(
+        user=SAMPLE_USER,
+        mint=SAMPLE_MINT,
+        token_amount_raw=500_000_000,
+        min_sol_output_lamports=4_500_000,
+    )
+    assert ix.program_id == PUMPFUN_PROGRAM_ID
+    assert len(ix.accounts) == 12
+    # User still index 6, signer/writable.
+    assert ix.accounts[6].pubkey == SAMPLE_USER
+    assert ix.accounts[6].is_signer is True
+    # Slot 8 is ATA program for sell (was rent for buy).
+    assert ix.accounts[8].pubkey == ATA_PROGRAM_ID
+
+
+# ── Full transaction assembly ─────────────────────────────────
+def _make_test_keypair():
+    from solders.keypair import Keypair
+    # Deterministic for test reproducibility.
+    return Keypair.from_seed(bytes(range(32)))
+
+
+def _make_zero_blockhash():
+    from solders.hash import Hash
+    return Hash.default()
+
+
+def _make_test_state():
+    from pulse_bot.execution_pumpfun import BondingCurveState
+    return BondingCurveState(
+        virtual_token_reserves=1_073_000_000_000_000,
+        virtual_sol_reserves=30_000_000_000,
+        real_token_reserves=793_100_000_000_000,
+        real_sol_reserves=10_000_000_000,
+        token_total_supply=1_000_000_000_000_000,
+        complete=False,
+    )
+
+
+def test_build_buy_transaction_assembles_and_signs():
+    from pulse_bot.execution_pumpfun import (
+        build_buy_transaction,
+        serialize_signed_tx_base64,
+    )
+    kp = _make_test_keypair()
+    tx = build_buy_transaction(
+        keypair=kp,
+        mint=SAMPLE_MINT,
+        sol_amount_lamports=10_000_000,  # 0.01 SOL
+        state=_make_test_state(),
+        recent_blockhash=_make_zero_blockhash(),
+        slippage_bps=100,
+    )
+    # Has 4 instructions: 2 compute budget + 1 ATA create + 1 buy.
+    assert len(tx.message.instructions) == 4
+
+    # Serialise to base64 — same shape we'd send to RPC.
+    b64 = serialize_signed_tx_base64(tx)
+    assert isinstance(b64, str)
+    assert len(b64) > 0
+
+    # Round-trip decode to verify it's valid base64.
+    import base64
+    decoded = base64.b64decode(b64)
+    assert len(decoded) > 100  # non-trivial size
+
+
+def test_build_buy_transaction_applies_slippage_to_max_sol_cost():
+    """1 % slippage on 0.01 SOL → max_sol_cost = 0.01 × 1.01 = 0.0101 SOL."""
+    from pulse_bot.execution_pumpfun import (
+        BUY_DISCRIMINATOR,
+        build_buy_transaction,
+    )
+    kp = _make_test_keypair()
+    sol_in = 10_000_000  # 0.01 SOL
+    tx = build_buy_transaction(
+        keypair=kp,
+        mint=SAMPLE_MINT,
+        sol_amount_lamports=sol_in,
+        state=_make_test_state(),
+        recent_blockhash=_make_zero_blockhash(),
+        slippage_bps=100,  # 1 %
+    )
+    # Last instruction (idx 3) is the pump buy.
+    pump_ix = tx.message.instructions[-1]
+    # pump_ix.data is a bytes-like object.
+    data = bytes(pump_ix.data)
+    assert data[:8] == BUY_DISCRIMINATOR
+    import struct
+    _amount, max_sol = struct.unpack("<QQ", data[8:24])
+    expected_max = sol_in * 101 // 100  # +1 %
+    assert max_sol == expected_max
+
+
+def test_build_buy_transaction_rejects_complete_curve():
+    from pulse_bot.execution_pumpfun import (
+        BondingCurveState,
+        build_buy_transaction,
+    )
+    kp = _make_test_keypair()
+    completed_state = BondingCurveState(
+        virtual_token_reserves=0, virtual_sol_reserves=0,
+        real_token_reserves=0, real_sol_reserves=85_000_000_000,
+        token_total_supply=1_000_000_000_000_000, complete=True,
+    )
+    with pytest.raises(ValueError):
+        build_buy_transaction(
+            keypair=kp,
+            mint=SAMPLE_MINT,
+            sol_amount_lamports=10_000_000,
+            state=completed_state,
+            recent_blockhash=_make_zero_blockhash(),
+        )
+
+
+def test_build_sell_transaction_applies_slippage_to_min_sol_output():
+    """1 % slippage on sell → min_sol_output = expected × 0.99."""
+    from pulse_bot.execution_pumpfun import (
+        SELL_DISCRIMINATOR,
+        build_sell_transaction,
+        estimate_sell_output_lamports,
+    )
+    kp = _make_test_keypair()
+    state = _make_test_state()
+    tokens_in = 1_000_000_000_000  # 1e12 raw tokens
+    expected_sol = estimate_sell_output_lamports(tokens_in, state)
+
+    tx = build_sell_transaction(
+        keypair=kp,
+        mint=SAMPLE_MINT,
+        token_amount_raw=tokens_in,
+        state=state,
+        recent_blockhash=_make_zero_blockhash(),
+        slippage_bps=100,
+    )
+    # Last instruction is the pump sell.
+    pump_ix = tx.message.instructions[-1]
+    data = bytes(pump_ix.data)
+    assert data[:8] == SELL_DISCRIMINATOR
+    import struct
+    _amount, min_sol = struct.unpack("<QQ", data[8:24])
+    expected_min = expected_sol * 99 // 100  # −1 %
+    assert min_sol == expected_min
+
+
+def test_build_sell_transaction_no_ata_create():
+    """Sell tx skips ATA-create — caller already owns the ATA from
+    prior buy. Should have only 3 instructions (2 cu + 1 sell)."""
+    from pulse_bot.execution_pumpfun import build_sell_transaction
+    kp = _make_test_keypair()
+    tx = build_sell_transaction(
+        keypair=kp,
+        mint=SAMPLE_MINT,
+        token_amount_raw=1_000_000_000_000,
+        state=_make_test_state(),
+        recent_blockhash=_make_zero_blockhash(),
+    )
+    assert len(tx.message.instructions) == 3
