@@ -11,6 +11,34 @@
 ```
 
 ---
+## 2026-05-08 12:23 — Time-of-day pattern observed; monitor instrumented for validation
+
+**Что найдено** (post-fix 3-day data, N=318):
+| Zone (UTC) | Trades | Total PnL | Avg/trade | WR |
+|---|---|---|---|---|
+| **09-16 (DEAD)** | 150 | **−0.85 SOL** | −0.0057 | 4-11 % |
+| **17-22 (PROFIT)** | 131 | **+2.29 SOL** | +0.0175 | 16-22 % |
+| **23-08 (QUIET)** | 37 | +0.83 SOL | +0.0224 | 20-50 % |
+
+48h rolling sample (N=414) confirms: DEAD-09-16 = -1.09 SOL, PROFIT-17-22 = +2.26 SOL.
+
+**Гипотеза:** memecoin volume падает в US market hours (09-16 UTC = 04-11 EST). Бот теряет деньги на slow trading. Pausing this window projected **+1.09 SOL preservation** (+51 % vs current).
+
+**14d window НЕ подтверждает паттерн** — все zones негативны (включает pre-fix survival-bleeding era). Только post-fix данные показывают pattern.
+
+**Действие — INSTRUMENTATION ONLY, не deploy:**
+- `scripts/runtime_regression_monitor.py` теперь трекает TOD breakdown (`tod_dead_09_16_*`, `tod_profit_17_22_*`, `tod_quiet_23_08_*` поля в каждом VERDICT log).
+- На 14+ дней post-fix data (через ~11 дней) если pattern persists → propose `PULSE_SKIP_HOURS_UTC=09,10,11,12,13,14,15,16` env var + код change в pipeline.
+- Если pattern flips за неделю — drop hypothesis, no harm done.
+
+**Что НЕ сделано (per "не проеби прибыльность" rule):**
+- ❌ pause-by-hour код change — N=3 дня недостаточно
+- ❌ изменение entry sizing ladder — codex был неправ, ladder это partial-exit (working as designed). Entry sizing fixed at 0.10 SOL by design — добавление entry-side ladder это новая фича, не fix
+- ❌ wallet classifier criteria adjustment — 3/8 high-precision wallets не получили `is_smart_money=1` после re-run, criteria threshold нужно tune (отдельная задача)
+
+**Snapshot integrity preserved.** Бот в проде без изменений. Только observability обновлена.
+
+---
 ## 2026-05-08 07:09 — Retrain candidate DROPPED — calibration shift on same-data test
 
 **Что произошло:** Перетренил entry_model на свежем датасете (115365 rows, +4.6K vs prior 110K). Новая модель прошла встроенный health check (`Saved model to data/ml/entry_model.ubj (health=ok)`) — но **same-data comparison через `scripts/same_data_compare.py` показал** что новая модель **хуже** на всех операционных порогах.

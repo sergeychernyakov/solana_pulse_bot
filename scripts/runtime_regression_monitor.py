@@ -147,6 +147,35 @@ def _aggregate_live(rows: list[dict]) -> dict[str, Any]:
     sum_pnl = sum(pnls)
     hard_stop = sum(1 for r in rows if r["exit_reason"] == "hard_stop")
     surv = sum(1 for r in rows if r["exit_reason"] == "survival_predict")
+    # 2026-05-08 — time-of-day breakdown. Post-fix data (~3 days)
+    # showed sharp 09-16 UTC dead zone (-0.85 SOL on N≈150) and
+    # 17-22 UTC profit zone (+2.29 SOL on N≈131). Track here so we
+    # can validate the pattern over 14+ days before considering a
+    # pause-by-hour env-var change. Observability only — no action.
+    from datetime import datetime, timezone
+    dead_pnl = 0.0
+    dead_n = 0
+    profit_pnl = 0.0
+    profit_n = 0
+    quiet_pnl = 0.0
+    quiet_n = 0
+    for r in rows:
+        try:
+            hr = datetime.fromtimestamp(
+                float(r["entry_time"]), tz=timezone.utc
+            ).hour
+        except Exception:
+            continue
+        p = float(r["pnl_sol"] or 0.0)
+        if 9 <= hr <= 16:
+            dead_pnl += p
+            dead_n += 1
+        elif 17 <= hr <= 22:
+            profit_pnl += p
+            profit_n += 1
+        else:
+            quiet_pnl += p
+            quiet_n += 1
     return {
         "n": n,
         "wr_pct": round(wr_pct, 2),
@@ -154,6 +183,12 @@ def _aggregate_live(rows: list[dict]) -> dict[str, Any]:
         "avg_pnl_sol": round(sum_pnl / n, 5),
         "hard_stop_ratio": round(hard_stop / n, 3),
         "survival_predict_ratio": round(surv / n, 3),
+        "tod_dead_09_16_pnl": round(dead_pnl, 4),
+        "tod_dead_09_16_n": dead_n,
+        "tod_profit_17_22_pnl": round(profit_pnl, 4),
+        "tod_profit_17_22_n": profit_n,
+        "tod_quiet_23_08_pnl": round(quiet_pnl, 4),
+        "tod_quiet_23_08_n": quiet_n,
     }
 
 
