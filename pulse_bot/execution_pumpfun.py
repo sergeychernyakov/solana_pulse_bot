@@ -84,6 +84,15 @@ SYSTEM_PROGRAM_ID = Pubkey.from_string("11111111111111111111111111111111")
 TOKEN_PROGRAM_ID = Pubkey.from_string(
     "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 )
+# Token-2022 program — pump.fun (as of 2026) mints all tokens under
+# Token-2022, NOT the legacy SPL Token program. Verified empirically
+# 2026-05-08: 10/10 sampled mints owned by Token-2022. Using legacy
+# Token program produces ``IncorrectProgramId`` at simulation time
+# because the ATA derivation seed differs and the on-chain ATA
+# program rejects the mismatch.
+TOKEN_2022_PROGRAM_ID = Pubkey.from_string(
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+)
 ATA_PROGRAM_ID = Pubkey.from_string(
     "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
 )
@@ -133,15 +142,21 @@ def derive_event_authority_pda() -> Pubkey:
     return pda
 
 
-def derive_associated_token_account(owner: Pubkey, mint: Pubkey) -> Pubkey:
+def derive_associated_token_account(
+    owner: Pubkey,
+    mint: Pubkey,
+    token_program: Pubkey = TOKEN_2022_PROGRAM_ID,
+) -> Pubkey:
     """Derive the ATA (Associated Token Account) for an owner+mint.
 
-    Seed: ``[owner, TOKEN_PROGRAM, mint]`` under
-    ``ATA_PROGRAM_ID``. Standard SPL Token ATA derivation —
-    every wallet's pump.fun token holdings live at this address.
+    Seed: ``[owner, token_program, mint]`` under ``ATA_PROGRAM_ID``.
+
+    ``token_program`` defaults to **Token-2022** because that's what
+    pump.fun mints use as of 2026 (verified by sampling on-chain).
+    Pass ``TOKEN_PROGRAM_ID`` explicitly for legacy SPL-Token mints.
     """
     pda, _bump = Pubkey.find_program_address(
-        [bytes(owner), bytes(TOKEN_PROGRAM_ID), bytes(mint)],
+        [bytes(owner), bytes(token_program), bytes(mint)],
         ATA_PROGRAM_ID,
     )
     return pda
@@ -223,7 +238,8 @@ class PumpFunBuyAccounts:
     def for_user_and_mint(cls, user: Pubkey, mint: Pubkey) -> "PumpFunBuyAccounts":
         """Build a complete account list given just the user wallet
         and the target mint. All PDAs derived; SPL/system/rent
-        constants pulled from module-level."""
+        constants pulled from module-level. Token program defaults
+        to **Token-2022** because pump.fun mints use it."""
         bonding = derive_bonding_curve_pda(mint)
         return cls(
             global_pda=derive_global_pda(),
@@ -234,7 +250,7 @@ class PumpFunBuyAccounts:
             associated_user=derive_associated_token_account(user, mint),
             user=user,
             system_program=SYSTEM_PROGRAM_ID,
-            token_program=TOKEN_PROGRAM_ID,
+            token_program=TOKEN_2022_PROGRAM_ID,
             rent_sysvar=RENT_SYSVAR_ID,
             event_authority=derive_event_authority_pda(),
             program=PUMPFUN_PROGRAM_ID,
@@ -552,31 +568,20 @@ def build_create_ata_idempotent_ix(
 ) -> Instruction:
     """Associated Token Account program: create-if-not-exists.
 
-    Idempotent variant (instruction byte = 0x01) is safe to issue
-    on every buy — if the ATA already exists, the program returns
-    success without spending rent. Costs ~5k CU.
-
-    Account order is fixed by the SPL ATA program:
-      0. payer (signer, writable)              — funds rent if creating
-      1. ata (writable)                        — the ATA being created
-      2. owner (readonly)                      — the wallet owning the ATA
-      3. mint (readonly)
-      4. system_program (readonly)
-      5. token_program (readonly)
+    Delegates to the canonical SPL helper to avoid hand-rolling the
+    instruction layout — earlier hand-rolled version produced a
+    cryptic ``IncorrectProgramId`` error on simulation, presumably
+    from a missing account slot or wrong discriminator. The SPL
+    helper is the source of truth.
     """
-    ata = derive_associated_token_account(owner, mint)
-    accounts = [
-        AccountMeta(pubkey=payer, is_signer=True, is_writable=True),
-        AccountMeta(pubkey=ata, is_signer=False, is_writable=True),
-        AccountMeta(pubkey=owner, is_signer=False, is_writable=False),
-        AccountMeta(pubkey=mint, is_signer=False, is_writable=False),
-        AccountMeta(pubkey=SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
-        AccountMeta(pubkey=TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
-    ]
-    return Instruction(
-        program_id=ATA_PROGRAM_ID,
-        accounts=accounts,
-        data=bytes([0x01]),  # CreateIdempotent
+    from spl.token.instructions import (  # type: ignore
+        create_idempotent_associated_token_account,
+    )
+    return create_idempotent_associated_token_account(
+        payer=payer,
+        owner=owner,
+        mint=mint,
+        token_program_id=TOKEN_2022_PROGRAM_ID,
     )
 
 
@@ -822,24 +827,76 @@ class PumpFunExecution:
     def from_env(cls, *, allow_live_submit: bool = False) -> "PumpFunExecution":
         """Construct from env: HELIUS_API_KEY + SOL_WALLET_KEYPAIR.
 
-        Same convention as ``LiveExecution.from_env`` — ``SOL_WALLET_KEYPAIR``
-        is a base58-encoded 64-byte secret key string.
+        ``SOL_WALLET_KEYPAIR`` accepts three formats:
+          1. **Path to a JSON keypair file** (Solana CLI convention,
+             e.g. ``~/.config/solana/id.json``) — file contains a
+             JSON array of 64 byte values.
+          2. **JSON array string** (the same content, inline).
+          3. **base58 secret-key string** (Phantom export format).
+
+        Detection is by-shape: starts with ``[`` → JSON array;
+        ends with ``.json`` → file path; else assume base58.
         """
+        import json as _json
         import os as _os
         from solders.keypair import Keypair  # type: ignore
 
         helius_key = _os.environ.get("HELIUS_API_KEY", "")
-        kp_b58 = _os.environ.get("SOL_WALLET_KEYPAIR", "")
+        kp_value = _os.environ.get("SOL_WALLET_KEYPAIR", "").strip()
         if not helius_key:
             raise RuntimeError("HELIUS_API_KEY env not set")
-        if not kp_b58:
+        if not kp_value:
             raise RuntimeError("SOL_WALLET_KEYPAIR env not set")
-        kp = Keypair.from_base58_string(kp_b58)
+
+        kp = cls._load_keypair_any(kp_value, _json, Keypair)
         return cls(
             rpc=HeliusRpc(api_key=helius_key),
             keypair=kp,
             allow_live_submit=allow_live_submit,
         )
+
+    @staticmethod
+    def _load_keypair_any(value: str, json_module: Any, KeypairCls: Any) -> Any:
+        """Detect keypair encoding and load. Raises with a clear
+        message on malformed input — easier to debug than the cryptic
+        ``InvalidChar`` from the bare base58 path."""
+        # 1. JSON array inline.
+        if value.startswith("[") and value.endswith("]"):
+            try:
+                arr = json_module.loads(value)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"SOL_WALLET_KEYPAIR looks like JSON but failed to parse: {exc}"
+                ) from exc
+            return KeypairCls.from_bytes(bytes(arr))
+        # 2. File path (Solana CLI convention).
+        if value.endswith(".json") or "/" in value or "\\" in value:
+            from pathlib import Path
+            p = Path(value).expanduser()
+            if not p.exists():
+                # Resolve relative to the gg/ repo if not absolute.
+                alt = Path(__file__).resolve().parents[1] / value
+                if alt.exists():
+                    p = alt
+                else:
+                    raise RuntimeError(
+                        f"SOL_WALLET_KEYPAIR points to a file that doesn't exist: {value}"
+                    )
+            try:
+                arr = json_module.loads(p.read_text())
+            except Exception as exc:
+                raise RuntimeError(
+                    f"SOL_WALLET_KEYPAIR file {p} is not valid JSON: {exc}"
+                ) from exc
+            return KeypairCls.from_bytes(bytes(arr))
+        # 3. Fall through: assume base58.
+        try:
+            return KeypairCls.from_base58_string(value)
+        except Exception as exc:
+            raise RuntimeError(
+                f"SOL_WALLET_KEYPAIR is not a recognised format "
+                f"(JSON array / .json file path / base58 string): {exc}"
+            ) from exc
 
     @property
     def wallet_pubkey(self) -> Pubkey:
@@ -1156,7 +1213,7 @@ class PumpFunSellAccounts:
             user=user,
             system_program=SYSTEM_PROGRAM_ID,
             associated_token_program=ATA_PROGRAM_ID,
-            token_program=TOKEN_PROGRAM_ID,
+            token_program=TOKEN_2022_PROGRAM_ID,
             event_authority=derive_event_authority_pda(),
             program=PUMPFUN_PROGRAM_ID,
         )

@@ -25,7 +25,7 @@ from pulse_bot.execution_pumpfun import (  # noqa: E402
     PUMPFUN_PROGRAM_ID,
     SELL_DISCRIMINATOR,
     SYSTEM_PROGRAM_ID,
-    TOKEN_PROGRAM_ID,
+    TOKEN_2022_PROGRAM_ID,
     PumpFunBuyAccounts,
     PumpFunSellAccounts,
     derive_associated_token_account,
@@ -152,7 +152,7 @@ def test_buy_accounts_have_expected_count_and_constants():
     # Constants are pinned to module-level singletons.
     assert acc.fee_recipient == PUMPFUN_FEE_RECIPIENT
     assert acc.system_program == SYSTEM_PROGRAM_ID
-    assert acc.token_program == TOKEN_PROGRAM_ID
+    assert acc.token_program == TOKEN_2022_PROGRAM_ID
     assert acc.program == PUMPFUN_PROGRAM_ID
     # User and mint pass through.
     assert acc.user == SAMPLE_USER
@@ -173,7 +173,7 @@ def test_sell_accounts_have_expected_count_and_constants():
     acc = PumpFunSellAccounts.for_user_and_mint(SAMPLE_USER, SAMPLE_MINT)
     assert acc.fee_recipient == PUMPFUN_FEE_RECIPIENT
     assert acc.system_program == SYSTEM_PROGRAM_ID
-    assert acc.token_program == TOKEN_PROGRAM_ID
+    assert acc.token_program == TOKEN_2022_PROGRAM_ID
     assert acc.program == PUMPFUN_PROGRAM_ID
     assert acc.bonding_curve == derive_bonding_curve_pda(SAMPLE_MINT)
 
@@ -462,7 +462,7 @@ def test_create_ata_idempotent_ix_layout():
     from pulse_bot.execution_pumpfun import (
         ATA_PROGRAM_ID,
         SYSTEM_PROGRAM_ID,
-        TOKEN_PROGRAM_ID,
+        TOKEN_2022_PROGRAM_ID,
         build_create_ata_idempotent_ix,
         derive_associated_token_account,
     )
@@ -477,7 +477,7 @@ def test_create_ata_idempotent_ix_layout():
     assert ata.pubkey == derive_associated_token_account(SAMPLE_USER, SAMPLE_MINT)
     assert ata.is_writable is True
     assert sys.pubkey == SYSTEM_PROGRAM_ID
-    assert token.pubkey == TOKEN_PROGRAM_ID
+    assert token.pubkey == TOKEN_2022_PROGRAM_ID
 
 
 # ── Pump.fun buy/sell instruction with full account list ─────
