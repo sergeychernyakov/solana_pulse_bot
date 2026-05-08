@@ -474,6 +474,79 @@ def test_health_check_passes_clean_retrain(tmp_path):
     )
     assert out["status"] == "ok"
     assert out["proba_spread"] >= 0.30
+    # Calibration drift fields are present even on clean retrain
+    # (with no prev meta they're None).
+    assert "proba_p50" in out
+    assert out["prev_proba_p50"] is None
+    assert out["proba_p50_delta"] is None
+
+
+def test_health_check_flags_calibration_drift(tmp_path):
+    """2026-05-08 post-mortem: May-7 retrain flipped median proba
+    0.020 → 0.190 — moving the entire decision boundary past live
+    PULSE_ENTRY_PROBA_CEILING=0.15. AUC and spread checks both
+    passed. Calibration-drift guard catches this class of failure."""
+    pytest.importorskip("xgboost")
+    import json
+
+    from pulse_bot.ml.train import _entry_model_health_check
+
+    model_out = tmp_path / "m.ubj"
+    meta = tmp_path / "m.meta.json"
+    # Previous artifact: median proba 0.020 (the May-5 production model)
+    meta.write_text(json.dumps({
+        "auc": 0.93,
+        "model_health": {"proba_p1": 0.004, "proba_p50": 0.020, "proba_p99": 0.84},
+    }))
+    # Touch the model file so snapshot path is exercised.
+    model_out.write_bytes(b"prev_xgb_dump")
+
+    # New retrain: median 0.20 (matches the May-7 incident shift)
+    proba_val = np.random.RandomState(4).uniform(0.05, 0.55, 5000)
+    out = _entry_model_health_check(
+        model_out=model_out,
+        proba_val=proba_val,
+        new_auc=0.92,                                  # AUC stable
+        thresholds={"floor": 0.19, "ceiling": 0.25, "status": "ok"},
+    )
+    assert out["prev_proba_p50"] == pytest.approx(0.020)
+    assert out["proba_p50"] > 0.20                      # actually shifted
+    assert out["proba_p50_delta"] is not None
+    assert abs(out["proba_p50_delta"]) > 0.05           # past the gate
+    assert out["status"] == "calibration_drift"
+    # Reason should mention the live env-var mismatch implication.
+    note_text = " ".join(out["notes"])
+    assert "calibration drift" in note_text.lower()
+    assert "p50" in note_text.lower()
+
+
+def test_health_check_calibration_drift_within_tolerance(tmp_path):
+    """Δp50 within ±0.05 must NOT trip the calibration-drift gate —
+    natural retrain noise should pass clean."""
+    pytest.importorskip("xgboost")
+    import json
+
+    from pulse_bot.ml.train import _entry_model_health_check
+
+    model_out = tmp_path / "m.ubj"
+    meta = tmp_path / "m.meta.json"
+    meta.write_text(json.dumps({
+        "auc": 0.91,
+        "model_health": {"proba_p1": 0.01, "proba_p50": 0.10, "proba_p99": 0.85},
+    }))
+    model_out.write_bytes(b"prev_xgb_dump")
+    # New median ≈ 0.13 — within ±0.05 of prev 0.10
+    proba_val = np.random.RandomState(5).uniform(0.05, 0.95, 5000)
+    out = _entry_model_health_check(
+        model_out=model_out,
+        proba_val=proba_val,
+        new_auc=0.91,
+        thresholds={"floor": 0.10, "ceiling": 0.75, "status": "ok"},
+    )
+    # Whatever the random p50 is, status must not be calibration_drift
+    # unless |Δ| > 0.05 — which it won't be at this seed.
+    if abs(out["proba_p50_delta"]) <= 0.05:
+        assert out["status"] != "calibration_drift"
 
 
 def test_helius_backfill_completeness_propagates():

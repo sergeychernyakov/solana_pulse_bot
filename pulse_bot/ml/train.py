@@ -855,7 +855,7 @@ def _entry_model_health_check(
     thresholds: dict,
 ) -> dict:
     """Codex review 2026-04-28: pre-save sanity gates on a freshly-trained
-    entry model. Three signals:
+    entry model. Four signals:
 
     - **proba_spread** (p99 − p1 on val): if < 0.30 the model outputs a
       narrow band → no ranking power regardless of holdout AUC. Today's
@@ -866,20 +866,29 @@ def _entry_model_health_check(
     - **auc_regression**: compare against previous meta.json AUC. If the
       new run dropped by >2pp, mark for rollback (caller decides). Today
       we silently overwrote 0.905 → 0.891 → 0.825.
+    - **calibration_drift** (added 2026-05-08): if proba_p50 shifts > 0.05
+      vs previous meta, the threshold semantics break — same env-var
+      ceiling now catches a different fraction of tokens. May-7 retrain
+      missed every other check (auc Δ −0.011, spread 0.42 — both within
+      tolerance) but had p50 shift 0.020 → 0.190 = entire decision boundary
+      moved past the live ceiling=0.15. Documented post-mortem in
+      ``docs/CHANGELOG.md`` 2026-05-08.
 
     Returns ``{status, proba_spread, prev_auc, auc_delta, threshold_status,
     notes}``. ``status`` ∈ {"ok", "degenerate", "narrow_proba_spread",
-    "auc_regression"}. The live policy reads this and disables ML override
-    when status != "ok".
+    "auc_regression", "calibration_drift"}. The live policy reads this
+    and disables ML override when status != "ok".
     """
     import numpy as _np
 
     out: dict = {}
     # 1. proba spread on val
     p_lo = float(_np.quantile(proba_val, 0.01))
+    p50 = float(_np.quantile(proba_val, 0.50))
     p_hi = float(_np.quantile(proba_val, 0.99))
     spread = p_hi - p_lo
     out["proba_p1"] = p_lo
+    out["proba_p50"] = p50
     out["proba_p99"] = p_hi
     out["proba_spread"] = spread
 
@@ -889,14 +898,24 @@ def _entry_model_health_check(
     # 3. AUC regression vs prior meta
     meta_prev = model_out.with_suffix(".meta.json")
     prev_auc = None
+    prev_p50 = None
     if meta_prev.exists():
         try:
             prev = json.loads(meta_prev.read_text())
             prev_auc = float(prev.get("auc") or 0.0)
+            # prev model_health may not exist on legacy artifacts —
+            # treat missing as "no comparison available" (skip the
+            # calibration-drift check rather than fail the build).
+            prev_health = prev.get("model_health") or {}
+            prev_p50_raw = prev_health.get("proba_p50")
+            prev_p50 = float(prev_p50_raw) if prev_p50_raw is not None else None
         except Exception:
             prev_auc = None
+            prev_p50 = None
     out["prev_auc"] = prev_auc
     out["auc_delta"] = (new_auc - prev_auc) if prev_auc is not None else None
+    out["prev_proba_p50"] = prev_p50
+    out["proba_p50_delta"] = (p50 - prev_p50) if prev_p50 is not None else None
 
     # Decide overall status (most-severe wins).
     notes: list[str] = []
@@ -917,6 +936,21 @@ def _entry_model_health_check(
         notes.append(
             f"AUC dropped {prev_auc:.4f} → {new_auc:.4f} (Δ={new_auc - prev_auc:+.4f}) "
             "— consider rollback to .prev artifact"
+        )
+    # 4. Calibration drift (codex 2026-05-08). Threshold 0.05 catches
+    # subtle shifts before they become critical; the May-7 incident
+    # had Δp50 = +0.17 — far above 0.05 but missed by every other
+    # check.
+    if prev_p50 is not None and abs(p50 - prev_p50) > 0.05:
+        if status == "ok":
+            status = "calibration_drift"
+        notes.append(
+            f"calibration drift: proba_p50 {prev_p50:.3f} → {p50:.3f} "
+            f"(Δ={p50 - prev_p50:+.3f}, max=±0.05) — live env-var "
+            "thresholds (PULSE_ENTRY_PROBA_CEILING etc) calibrated "
+            "against the OLD distribution will catch a different "
+            "fraction of tokens with this model. Re-tune env vars "
+            "BEFORE deploying, or rollback to .prev."
         )
     out["status"] = status
     out["notes"] = notes
@@ -949,11 +983,17 @@ def _entry_model_health_check(
         )
         logger.warning("=" * 60)
     else:
+        delta_p50_str = (
+            f", Δp50={out['proba_p50_delta']:+.3f}"
+            if out.get("proba_p50_delta") is not None
+            else ""
+        )
         logger.info(
-            "Model health: OK (spread=%.3f, threshold=%s, ΔAUC=%s)",
+            "Model health: OK (spread=%.3f, threshold=%s, ΔAUC=%s%s)",
             spread,
             out["threshold_status"],
             f"{out['auc_delta']:+.4f}" if out["auc_delta"] is not None else "n/a",
+            delta_p50_str,
         )
     return out
 
