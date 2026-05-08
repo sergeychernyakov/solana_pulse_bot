@@ -11,6 +11,58 @@
 ```
 
 ---
+## 2026-05-08 07:09 — Retrain candidate DROPPED — calibration shift on same-data test
+
+**Что произошло:** Перетренил entry_model на свежем датасете (115365 rows, +4.6K vs prior 110K). Новая модель прошла встроенный health check (`Saved model to data/ml/entry_model.ubj (health=ok)`) — но **same-data comparison через `scripts/same_data_compare.py` показал** что новая модель **хуже** на всех операционных порогах.
+
+**Diff:**
+| Metric | OLD (May-5) | NEW (May-7) | Δ |
+|---|---|---|---|
+| AUC holdout | 0.9329 | 0.9220 | −1.1 pp |
+| Precision@top10 | 2.03 % | 3.13 % | +1.1 pp |
+| Train rows | 77 547 | 80 755 | +4 % |
+| Proba p50 | 0.020 | **0.190** | **+0.17** ← critical drift |
+| Proba p99 | 0.604 | 0.584 | −0.02 |
+| EV-grid | fallback | OK (0.190/0.252) | improvement |
+
+**Killer finding:** NEW model имеет **median proba = 0.190**, выше live `PULSE_ENTRY_PROBA_CEILING=0.15`. Развернули бы новую модель без обновления env — бот купил бы **100 %** токенов (вся holdout выборка прошла бы порог).
+
+**Same-data comparison (chronological holdout 17 305 rows, threshold=0.15):**
+- OLD: 1 197 BUYs, WR 3.68 %, avg PnL −0.95 %
+- NEW: 17 305 BUYs (100 %!), WR 0.41 %, avg PnL −0.19 %
+
+На любых разумных operating points OLD выше WR:
+- @0.252: OLD 5.54 % vs NEW 2.31 %
+- @0.190: OLD 4.63 % vs NEW 0.94 %
+- @0.110: OLD 3.06 % vs NEW 0.41 %
+
+**Action — REVERT на диске:**
+```bash
+cp data/ml/entry_model.ubj data/ml/entry_model_candidate.ubj   # preserve
+cp data/ml/entry_model.ubj.prev data/ml/entry_model.ubj         # revert disk
+cp data/ml/entry_model.meta.json.prev data/ml/entry_model.meta.json
+```
+
+Бот в памяти держит OLD (May-5), disk = OLD (sha256 verified match), candidate сохранён `entry_model_candidate.{ubj,meta.json}` для архива и пост-мортема. Snapshot `known-good-2026-05-07-paper-profitable` integrity preserved — никаких реальных изменений в production.
+
+**Root cause гипотеза:**
+- NEW dataset включает свежие paper_trades с другим class balance (test_base_rate 0.41 % vs 0.25 %)
+- Class balance shift → calibration shift на softmax output
+- `_save_with_health_check` смотрит на `proba_spread > 0.05` и `auc_delta > -0.05` — оба прошли. Calibration drift (median proba shift) **не проверяется**.
+
+**Следующий шаг (отдельная задача):** добавить calibration-drift check в `_save_with_health_check`:
+```python
+prev_p50 = prev_meta.get("model_health", {}).get("proba_p50")
+if prev_p50 is not None and abs(curr_p50 - prev_p50) > 0.05:
+    health["status"] = "fail"
+    health["notes"].append(f"calibration drift: p50 {prev_p50:.3f} → {curr_p50:.3f}")
+```
+
+**Tooling commit:** `scripts/same_data_compare.py` — proper apples-to-apples retrain validation для будущих ML changes. Должен запускаться **перед** деплоем любого нового model artifact.
+
+**Откат отката:** не нужен — никаких деплой-эффектов не было. Candidate файлы можно удалить через 7 дней если post-mortem не нужен.
+
+---
 ## 2026-05-07 15:42 — Snapshot `known-good-2026-05-07-paper-profitable`
 
 **Что зафиксировано:** Полный известный-хороший state бота — code + models + runtime knobs. Доступен для откатa в один клик через `restore.sh`.
