@@ -132,10 +132,7 @@ def critic_node(state: AnalysisState) -> AnalysisState:
                 )
             ),
             HumanMessage(
-                content=(
-                    f"Trade: {dict(trade)}\n\n"
-                    f"Analyst view: {analyst_view}"
-                )
+                content=(f"Trade: {dict(trade)}\n\n" f"Analyst view: {analyst_view}")
             ),
         ]
     )
@@ -168,9 +165,7 @@ def synthesizer_node(state: AnalysisState) -> AnalysisState:
                     "FOLLOW_UP: <one short action or 'monitor only'>"
                 )
             ),
-            HumanMessage(
-                content=f"Trade: {dict(trade)}\n\n{body}"
-            ),
+            HumanMessage(content=f"Trade: {dict(trade)}\n\n{body}"),
         ]
     )
     raw = str(msg.content).strip()

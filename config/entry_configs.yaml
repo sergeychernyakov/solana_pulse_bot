@@ -1,0 +1,70 @@
+# config/entry_configs.yaml
+# Multi-config A/B framework — 2026-05-13, reworked 2026-05-14.
+#
+# Each `config` defines one entry-decision policy. The bot loads them all
+# at startup and evaluates EACH config in parallel for every scored token.
+# Every paper trade row carries config_id so live PnL is queryable per-config.
+#
+# The "live" config is selected by env var PULSE_LIVE_CONFIG_ID (default: LIVE).
+# The live config is the one whose decisions drive any *real* (non-paper)
+# downstream actions. All other configs are paper-only shadow portfolios.
+#
+# Adding/removing/changing configs:
+#   * NEVER recycle a config_id. If you want a different param set, add a NEW id.
+#   * Old paper_trades rows always resolve their full param history via the
+#     entry_configs DB table (synced from this YAML at bot startup).
+#
+# 2026-05-14: the A/B knob is now `p_cal_floor` — a per-config minimum on
+# the entry classifier's calibrated probability. The previous reg_floor
+# sweep was retired: the regression head's target is degenerate (95%+
+# exactly 0.0 — dead tokens exit at entry price), so no objective passes
+# the universal skill-gate and the reg head is disabled at load. The
+# classifier, by contrast, ranks winners at auc_sign≈0.92 — so p_cal is a
+# real selectivity knob. This sweep answers: does requiring higher
+# calibrated confidence improve WR enough to justify fewer trades?
+
+configs:
+  - config_id: LIVE
+    name: "Live (production)"
+    description: "Production baseline — no extra p_cal floor (classifier meta ceiling only). Drives real bot decisions."
+    p_cal_floor: 0.0
+    bot_cluster_hard_skip_n: 3
+    wash_cluster_skip_n: 2
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50
+
+  - config_id: PCAL01
+    name: "p_cal floor 0.01"
+    description: "Same as LIVE but ml_override BUY requires calibrated proba >= 0.01."
+    p_cal_floor: 0.01
+    bot_cluster_hard_skip_n: 3
+    wash_cluster_skip_n: 2
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50
+
+  - config_id: PCAL02
+    name: "p_cal floor 0.02"
+    description: "Same as LIVE but ml_override BUY requires calibrated proba >= 0.02."
+    p_cal_floor: 0.02
+    bot_cluster_hard_skip_n: 3
+    wash_cluster_skip_n: 2
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50
+
+  - config_id: PCAL04
+    name: "p_cal floor 0.04"
+    description: "Same as LIVE but ml_override BUY requires calibrated proba >= 0.04."
+    p_cal_floor: 0.04
+    bot_cluster_hard_skip_n: 3
+    wash_cluster_skip_n: 2
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50
+
+  - config_id: PCAL08
+    name: "p_cal floor 0.08"
+    description: "Strictest — ml_override BUY requires calibrated proba >= 0.08. Few trades, should have highest WR if p_cal is informative."
+    p_cal_floor: 0.08
+    bot_cluster_hard_skip_n: 3
+    wash_cluster_skip_n: 2
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50

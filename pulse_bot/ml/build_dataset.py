@@ -35,7 +35,6 @@ from pulse_bot.ml.features import SCORER_FEATURES
 from pulse_bot.ml.simulate_exit import simulate_exit
 from pulse_bot.models import Trade
 
-
 _CACHED_CONFIG = None
 
 
@@ -70,7 +69,9 @@ def _df_rows_to_trades(
                 token_amount=float(r.token_amount or 0.0),
                 new_token_balance=0.0,
                 bonding_curve_key="",
-                v_sol_in_bonding_curve=float(getattr(r, "v_sol_in_bonding_curve", 0.0) or 0.0),
+                v_sol_in_bonding_curve=float(
+                    getattr(r, "v_sol_in_bonding_curve", 0.0) or 0.0
+                ),
                 v_tokens_in_bonding_curve=0.0,
                 market_cap_sol=float(r.market_cap_sol or 0.0),
                 timestamp=float(r.timestamp),
@@ -298,13 +299,17 @@ def build_entry_dataset(
     # Linear projection: f(120) ≈ 2*f(60) - f(30). Pump.fun bonding-curve
     # concentration is mostly monotonic in the first 2 minutes — this is a
     # defensible proxy. holder_count clamped to >= max(hc_30, hc_60).
-    needs_extrap = base["top1_120"].isna() & ~base["top1_60"].isna() & ~base["top1_30"].isna()
+    needs_extrap = (
+        base["top1_120"].isna() & ~base["top1_60"].isna() & ~base["top1_30"].isna()
+    )
     if needs_extrap.any():
         n_extrap = int(needs_extrap.sum())
-        logger.info("Extrapolating T+120 holder snapshot for %d / %d rows", n_extrap, len(base))
+        logger.info(
+            "Extrapolating T+120 holder snapshot for %d / %d rows", n_extrap, len(base)
+        )
         for col_30, col_60, col_120 in [
-            ("top1_30",  "top1_60",  "top1_120"),
-            ("top5_30",  "top5_60",  "top5_120"),
+            ("top1_30", "top1_60", "top1_120"),
+            ("top5_30", "top5_60", "top5_120"),
             ("top10_30", "top10_60", "top10_120"),
         ]:
             base.loc[needs_extrap, col_120] = (
@@ -316,7 +321,9 @@ def build_entry_dataset(
             2.0 * base.loc[needs_extrap, "hc_60"] - base.loc[needs_extrap, "hc_30"]
         )
         hc_floor = base.loc[needs_extrap, ["hc_30", "hc_60"]].max(axis=1)
-        base.loc[needs_extrap, "hc_120"] = pd.concat([hc_extrap, hc_floor], axis=1).max(axis=1)
+        base.loc[needs_extrap, "hc_120"] = pd.concat([hc_extrap, hc_floor], axis=1).max(
+            axis=1
+        )
 
     base["top1_delta"] = base["top1_120"] - base["top1_30"]
     base["top5_delta"] = base["top5_120"] - base["top5_30"]
@@ -428,21 +435,18 @@ def build_entry_dataset(
         # of live creators are solo (single-token wallets).
         creator_zero_fill = {
             "creator_total_prior_tokens",  # legitimate count; 0 for solo
-            "creator_graduated_count",     # legitimate count
+            "creator_graduated_count",  # legitimate count
         }
         creator_nan_for_solo = {
             "creator_median_peak_mc_sol",
             "creator_inter_token_interval_sec",
-        }
-        creator_keep_real = {
-            "creator_age_days",
-            "creator_balance_sol",
         }
         if "creator_total_prior_tokens" in base.columns:
             solo_mask = base["creator_total_prior_tokens"].fillna(0).lt(2)
             for c in creator_nan_for_solo:
                 if c in base.columns:
                     import numpy as _np
+
                     base.loc[solo_mask, c] = _np.nan
         # Counts → 0-fill (no snapshot ≡ no observed priors).
         for c in creator_zero_fill:
@@ -486,9 +490,7 @@ def build_entry_dataset(
     nz_wallet_feat_count = 0
     # Pre-load mint→created_at map for n_buyers_first_5s computation.
     mint_created_map: dict[str, float] = {}
-    for mrow in _pg_exec(
-        conn, "SELECT mint, created_at FROM tokens"
-    ).fetchall():
+    for mrow in _pg_exec(conn, "SELECT mint, created_at FROM tokens").fetchall():
         mint_created_map[mrow[0]] = float(mrow[1] or 0.0)
 
     # 2026-04-28 perf fix: replace ~88k per-mint trade queries with a
@@ -496,15 +498,16 @@ def build_entry_dataset(
     # rich (88k roundtrips × ~20 ms each). New path fetches all
     # ts<=max(scored_at) trades for the mints we care about in one
     # pass and indexes into a dict — runtime drops to ~2 min.
-    logger.info("Bulk-fetching trade rows for %d mints (replaces per-row "
-                "loop)...", len(base))
+    logger.info(
+        "Bulk-fetching trade rows for %d mints (replaces per-row " "loop)...", len(base)
+    )
     base_mints = base["mint"].tolist()
     max_scored = float(base["scored_at"].max()) if len(base) else 0.0
     trades_by_mint: dict[str, list[dict]] = {m: [] for m in base_mints}
     chunk = 5000
     fetched = 0
     for i in range(0, len(base_mints), chunk):
-        chunk_mints = base_mints[i:i + chunk]
+        chunk_mints = base_mints[i : i + chunk]
         placeholders = ",".join("?" * len(chunk_mints))
         cur = _pg_exec(
             conn,
@@ -517,15 +520,20 @@ def build_entry_dataset(
         for tr in cur.fetchall():
             mint = tr[0]
             if mint in trades_by_mint:
-                trades_by_mint[mint].append({
-                    "tx_type": tr[1],
-                    "wallet": tr[2],
-                    "sol_amount": tr[3],
-                    "timestamp": tr[4],
-                })
+                trades_by_mint[mint].append(
+                    {
+                        "tx_type": tr[1],
+                        "wallet": tr[2],
+                        "sol_amount": tr[3],
+                        "timestamp": tr[4],
+                    }
+                )
                 fetched += 1
-    logger.info("Bulk-fetched %d trade rows (avg %.1f per mint)",
-                fetched, fetched / max(len(base_mints), 1))
+    logger.info(
+        "Bulk-fetched %d trade rows (avg %.1f per mint)",
+        fetched,
+        fetched / max(len(base_mints), 1),
+    )
 
     # Pre-collect all top-10 buyer wallets across mints and bulk-query
     # wallet_activity once (instead of per-mint subqueries). Filter by
@@ -551,7 +559,7 @@ def build_entry_dataset(
     if all_wallets and wa_row_count > 0:
         wallets_list = list(all_wallets)
         for i in range(0, len(wallets_list), chunk):
-            chunk_w = wallets_list[i:i + chunk]
+            chunk_w = wallets_list[i : i + chunk]
             placeholders = ",".join("?" * len(chunk_w))
             cur = _pg_exec(
                 conn,
@@ -562,15 +570,18 @@ def build_entry_dataset(
                 tuple(chunk_w),
             )
             for r in cur.fetchall():
-                wallet_activity_rows[r[0]].append({
-                    "mint": r[1],
-                    "first_buy_ts": float(r[2] or 0.0),
-                    "last_trade_ts": float(r[3] or 0.0),
-                    "buy_volume_sol": float(r[4] or 0.0),
-                    "sell_volume_sol": float(r[5] or 0.0),
-                })
-    logger.info("Bulk-pulled wallet_activity for %d distinct top-10 wallets",
-                len(all_wallets))
+                wallet_activity_rows[r[0]].append(
+                    {
+                        "mint": r[1],
+                        "first_buy_ts": float(r[2] or 0.0),
+                        "last_trade_ts": float(r[3] or 0.0),
+                        "buy_volume_sol": float(r[4] or 0.0),
+                        "sell_volume_sol": float(r[5] or 0.0),
+                    }
+                )
+    logger.info(
+        "Bulk-pulled wallet_activity for %d distinct top-10 wallets", len(all_wallets)
+    )
 
     # v21 (2026-04-28): bulk-pull wallet_classifications for sniper /
     # smart_money / bot / cluster flags. One query for the whole top-10
@@ -580,7 +591,7 @@ def build_entry_dataset(
         try:
             wallets_list = list(all_wallets)
             for i in range(0, len(wallets_list), chunk):
-                chunk_w = wallets_list[i:i + chunk]
+                chunk_w = wallets_list[i : i + chunk]
                 placeholders = ",".join("?" * len(chunk_w))
                 cur = _pg_exec(
                     conn,
@@ -604,7 +615,8 @@ def build_entry_dataset(
         except Exception as exc:
             logger.warning(
                 "wallet_classifications JOIN failed (continuing w/o v21 "
-                "features): %s", exc,
+                "features): %s",
+                exc,
             )
 
     for _, row in base.iterrows():
@@ -619,7 +631,8 @@ def build_entry_dataset(
         stats_map: dict[str, dict] = {}
         for w in top10:
             rows_w = [
-                r for r in wallet_activity_rows.get(w, [])
+                r
+                for r in wallet_activity_rows.get(w, [])
                 if r["mint"] != mint and r["last_trade_ts"] < scored_at
             ]
             if not rows_w:
@@ -627,9 +640,12 @@ def build_entry_dataset(
             all_mc = len(rows_w)
             closed_rows = [r for r in rows_w if r["sell_volume_sol"] > 0]
             closed_mc = len(closed_rows)
-            total_pnl = sum(r["sell_volume_sol"] - r["buy_volume_sol"] for r in closed_rows)
+            total_pnl = sum(
+                r["sell_volume_sol"] - r["buy_volume_sol"] for r in closed_rows
+            )
             wins = sum(
-                1 for r in closed_rows
+                1
+                for r in closed_rows
                 if (r["sell_volume_sol"] - r["buy_volume_sol"]) > 0
             )
             max_pnl = max(
@@ -642,14 +658,18 @@ def build_entry_dataset(
                 "closed_mint_count": closed_mc,
                 "wr": (wins / closed_mc) if closed_mc > 0 else float("nan"),
                 "total_pnl_sol": float(total_pnl),
-                "max_pnl_sol": (float(max_pnl) if max_pnl is not None else float("nan")),
+                "max_pnl_sol": (
+                    float(max_pnl) if max_pnl is not None else float("nan")
+                ),
                 "first_seen_ts": float(first_seen),
             }
 
         # v21 — pass classification subset for top10 to extractor.
         cls_subset = {w: classifications[w] for w in top10 if w in classifications}
         feats = _extract_wallet_prior_features(
-            stats_map, top10, scored_at,
+            stats_map,
+            top10,
+            scored_at,
             wallet_classifications=cls_subset,
         )
         feats["n_buyers_first_5s"] = compute_n_buyers_first_5s(
@@ -829,7 +849,9 @@ def build_entry_dataset(
     labels: list[int | None] = []
     realized_pnls: list[float | None] = []
     exit_reasons: list[str | None] = []
-    trades_by_mint: dict[str, list[Trade]] = {}
+    # Distinct from the earlier raw-row map of the same name — that one is
+    # fully consumed before this point; this is the Trade-object map.
+    trades_by_mint: dict[str, list[Trade]] = {}  # type: ignore[no-redef]
     entries_by_mint: dict[str, tuple[float, float]] = {}
     # Pre-flagged DOA mints: skip the simulator entirely (label=0 / 0.0 PnL,
     # exit_reason set explicitly so the simulator's "timeout" doesn't mask
@@ -1015,7 +1037,9 @@ def build_exit_dataset(
     rows: list[dict] = []
     for _, c in candidates.iterrows():
         mint, entry_ts = c["mint"], c["entry_ts"]
-        creator_wallet = c.get("creator_wallet") if hasattr(c, "get") else c["creator_wallet"]
+        creator_wallet = (
+            c.get("creator_wallet") if hasattr(c, "get") else c["creator_wallet"]
+        )
         trades = pd.read_sql_query(
             """SELECT timestamp, tx_type, sol_amount, token_amount,
                       market_cap_sol, v_sol_in_bonding_curve, wallet

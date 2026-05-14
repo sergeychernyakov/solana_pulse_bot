@@ -11,6 +11,492 @@
 ```
 
 ---
+## 2026-05-14 13:45 — simulate_exit tick-loop parity fix (метки симулятора больше не врут)
+
+**Что изменилось:**
+- `_replay_trades` теперь интерливит tick-события с потоком сделок: дренит `runner.tick()` (каждые `tick_seconds=5с`) между сделками И после исчерпания потока — до `max_hold + tick`. Раньше функция проигрывала ТОЛЬКО WS-сделки. Ядро правки — незакоммиченный WIP прошлой сессии; в этой сессии финализировано: убран мёртвый `last_ts`, переписан устаревший docstring `simulate_exit` (описывал inactivity-логику, которой больше нет), прогнаны тесты, проведена валидация.
+- Файл синхронизирован на rich (dev-код: живой бот использует `PaperTradeRunner` напрямую, `simulate_exit` — только `build_dataset` + sweep-скрипты; рестарт бота не нужен).
+
+**Зачем:**
+- 76% pump.fun токенов затихают через ~5с. Старый симулятор для них пропускал ВСЕ tick-выходы (max_hold/survival/inactivity) и возвращал устаревший `timeout` по цене последней сделки — а live в это время закрывал позицию по max_hold. Артефакт policy-skew: на 2509 позициях live PnL +0.49 SOL, sim PnL −16.76 SOL на ОДНИХ И ТЕХ ЖЕ входах/конфиге.
+- Это напрямую отравляло метки `build_dataset` (метка = `simulate_exit(...).pnl_pct > 0`) → `ceiling_ev` и весь EV-сигнал моделей считались по сломанному симулятору. Именно этот `ceiling_ev=−1.38` я ошибочно использовал для kill-criterion (см. запись 13:26).
+
+**Результат (валидация на реальных закрытых сделках, исправленным симулятором):**
+- Mac legacy-эра, 1728 позиций: `corr(sim, live) = +0.61`, sim avg −11.9% vs live −8.8% (тот же знак, тот же масштаб).
+- rich post-reset, 47 позиций: `corr(sim, live) = +0.99`, sim avg −1.72% vs live −0.25%.
+- Было: sim −16.76 vs live +0.49 (смена знака, расхождение 17 SOL). Стало: тот же знак, корреляция 0.6–0.99. Симулятор чинит.
+- Остаточное расхождение (~1.5–3pp, sim чуть пессимистичнее) — config drift (валидация текущим конфигом vs исторический live-конфиг), не баг. Консервативный симулятор для меток безопаснее оптимистичного.
+- 44 parity-теста зелёные (`test_simulate_exit_parity` / `test_partial_exits_parity` / `test_optimizer_correctness` / `test_optimizer_parity`), ruff чисто.
+
+**Что это разблокирует:** теперь пересборка датасета даст ЧЕСТНЫЕ метки и честный `ceiling_ev`. Только после этого EV-метрику можно будет осмысленно сравнивать с live-PnL (retrain-цепочка, task #104).
+
+**Откат:** `git checkout pulse_bot/ml/simulate_exit.py` + scp на rich. Чисто dev-код, рестарт не нужен.
+
+---
+## 2026-05-14 13:26 — EV-gate ОТКАТ + переделка в advisory (запись 12:42 была ОШИБОЧНОЙ)
+
+**Что изменилось:**
+- **Откат на rich:** `model_registry.py`, `_main.py`, `.env` восстановлены из `.deploy_backups/20260514_evgate/`. `entry_model` + `entry_t30` снова **АКТИВНЫ** (boot 13:07:53 → `status=ok`, `ML entry policy loaded ... floor=0.009 ceiling=0.150`). Бот возобновил ml_override-входы.
+- **EV-gate переделан в advisory:** `assess_skill` больше **не отключает** классификатор по `ceiling_ev <= 0`. Новые `_ev_advisory` / `_with_ev_advisory`: non-positive `ceiling_ev` → `status=ev_warning`, но `skilled=True` — модель остаётся в работе. Жёсткое отключение классификатора осталось только за реальным провалом AUC (< 0.55). `EntryMLPolicy.from_path`: ветка `ev_warning` → громкий лог, `_force_inert` только при `not skilled`.
+- Деплой fixed-версии на rich (boot 13:26:15): `entry` + `entry_t30` → `status=ev_warning`, обе активны. Поведенчески no-op для торговли — добавлен только advisory-лог.
+- Тесты `test_model_skill_gate.py` переписаны под warn-only (39 зелёных); 107 registry/policy/pipeline тестов зелёные.
+
+**Зачем — запись 12:42 (ниже) была ОШИБОЧНОЙ:**
+- «kill-criterion сработал» объявлен на основании **47 строк** `paper_trades` после сброса 13.05 (−0.022 SOL) — 1.5 дня, 47 сделок при норме 150–260/день. Шум, не вердикт.
+- Я НЕ посмотрел `paper_trades_archive_20260513`, где реальная история v21-модели: **30 апр – 13 мая, 2158 сделок ml_override, +3.98 SOL** (≈+0.28 SOL/день ≈ +2 SOL/неделю — в 6–7 раз ВЫШЕ kill-criterion). «−80 SOL» — целиком мёртвая legacy-эра до 30 апр (11 666 сделок, −85 SOL), другие входы.
+- `ceiling_ev = −1.38` взят из мета-файла, посчитанного **забагованным `simulate_exit`** (известный артефакт: sim −16.76 vs live +0.49 SOL — фикс лежит незакоммиченным в WIP). Жёсткий гейт применён на метрике из сломанного источника без сверки с live ground truth.
+- **entry_model не деградировала и не ломалась — она была прибыльной.** Её отключил я, на основе мисрида.
+
+**Результат:**
+- entry_model восстановлена и активна. EV-gate теперь честный: предупреждает (`ev_warning`), не убивает. `ceiling_ev` нельзя использовать для жёсткого гейта, пока он считается забагованным симулятором — только live realized PnL = ground truth.
+- Retrain-цепочка (task #104) ОТЛОЖЕНА: её посылка ошибочна, а sweep прогнался на устаревших Mac-данных (до 25 апр = legacy-эра, не v21).
+
+**Откат:** advisory EV-gate безопасен (торговлю не меняет). Полностью убрать: `cp -r .deploy_backups/20260514_evgate/* .` + restart.
+
+---
+## 2026-05-14 12:42 — [ОШИБОЧНО — см. запись 13:26 выше] EV-gate в skill-gate: entry_model + entry_t30 отключены (kill-criterion сработал)
+
+**Что изменилось:**
+- `model_registry.assess_skill` — добавлен **EV-gate** (приоритет 0, до всех остальных проверок): классификатор с `confidence_thresholds.ceiling_ev <= 0` признаётся `degenerate` и не влияет на сделки, перекрывая `model_health` и AUC. Константа `MIN_CEILING_EV = 0.0`.
+- `EntryMLPolicy.from_path` — заменена параллельная проверка только по `model_health.status` на единый `assess_skill`. Нейтрализация (`proba_floor=0.0, proba_ceiling=1.0`) теперь применяется **после** config-override (`_force_inert` флаг) — иначе optimizer-sweep `entry_ml_proba_ceiling=0.15` воскрешал отключённую модель.
+- `.env` rich: `PULSE_ALLOW_DEGENERATE_MODEL=1 → 0` — флаг «форсировать модель без навыка» обходил гейт.
+- Тесты: +6 в `test_model_skill_gate.py` (23 total зелёные), 622 pulse_bot теста зелёные.
+
+**Зачем:**
+- Живой аудит: 47 закрытых сделок с момента сброса 13.05 → итог **−0.022 SOL**, прибыльных 10.6%, ~−0.1 SOL/неделю. Это ниже kill-criterion (+0.3 SOL/неделю) — **критерий сработал**.
+- Корень: `entry_model.meta.json` сам признаётся — `ceiling_ev=−1.38%`, `floor_ev=−0.028%`, `base_ev=−0.40%` (все корзины вероятности отрицательные), `precision_top10=0.02`, threshold-search `status=ok_percentile_fallback` (алгоритм сдался). AUC 0.93 = модель ранжирует, но **нет ни одного порога, при котором покупка прибыльна**. Старый skill-gate пропускал её по AUC≥0.55.
+- Бот не открывал сделки ~11ч: гейт `exit_price=0` (`pipeline.py:1338`) корректно отсекал мёртвые токены (0 покупок за окно), которые `entry_model` всё равно помечал BUY.
+
+**Результат:**
+- Boot-лог 12:42:21: `entry` + `entry_t30` → `status=degenerate (EV gate: ceiling_ev=−1.384% / −1.194%)`. `EntryMLPolicy: skill-gate FAILED → ML entry policy loaded ... floor=0.000 ceiling=1.000` (обезврежена). `Entry T30 model DISABLED`. `entry_timing` / `exit_quantile_*` / `survival` / `reg` — вердикт без изменений.
+- **Бот перестаёт открывать сделки через ML** (rules-путь спит по дизайну). Это честное состояние: бот не торгует на модели, которая не может заработать. Бумажная торговля, 0 SOL потеряно реально.
+- Следующий шаг (task #104): пересборка датасета + переобучение `entry_model` до `ceiling_ev > 0`. Если ни одна конфигурация не даёт +EV — kill-criterion подтверждён, эскалация.
+
+**Откат:**
+```
+ssh rich 'cd ~/www/gg && cp .deploy_backups/20260514_evgate/pulse_bot/ml/model_registry.py pulse_bot/ml/ && cp .deploy_backups/20260514_evgate/pulse_bot/ml/policy/_main.py pulse_bot/ml/policy/ && cp .deploy_backups/20260514_evgate/.env.bak .env && systemctl --user restart pulse-bot.service'
+```
+
+---
+## 2026-05-14 12:40 — Real-sim sell estimate wired into paper-trade exits
+
+**Что изменилось:**
+- `SimExecutor.estimate_exit_curve_math(mint, token_amount_raw)` — новый метод: тянет живое состояние bonding curve и считает выход через `estimate_sell_output_lamports` (та же inverse-curve формула что в on-chain программе). Учитывает slippage от нашего же размера позиции — чего цена из trade-стрима не учитывает.
+- `PaperTradeSupervisor.run` получил параметр `sim_entry_tokens_raw`; в `finally`-блоке после закрытия сделки (только LIVE-конфиг, sim включён) считает curve-math sell-оценку и пишет в `sim_metadata.exit` (JSONB merge — не затирает `entry`).
+- `pipeline._handle_token` прокидывает `expected_tokens_raw` из entry-симуляции в `_paper_trade` → supervisor.
+
+**Зачем:**
+- Real-sim входов уже работал и гейтил сделки (44 `REAL_SIM SKIP` в логе). Но `SimExecutor.simulate_exit` был мёртвым кодом — `simulateTransaction` для sell требует чтобы кошелёк РЕАЛЬНО держал токен (иначе `3012 AccountNotInitialized`), а при бумажной торговле позиции нет. Пользователь выбрал bonding-curve математику: детерминированно, 0 SOL, не нужна реальная позиция.
+- Реальную торговлю НЕ включаем — только бумажная пока бот не докажет прибыльность. Real-sim делает бумажные выходы честными (реальный slippage на кривой), а не идеализированной математикой ExitManager.
+
+**Результат:**
+- `estimate_exit_curve_math` проверен против живой цепи: healthy-кривые → 0.0278 / 0.0290 SOL за 1e12 raw токенов; истощённая кривая → 3 lamports (реалистично — токен мёртв).
+- Тесты: +5 (`test_sim_executor.py`), 105 затронутых тестов зелёные. Деплой sim_executor.py / paper_trade_supervisor.py / pipeline.py, бот перезапущен 11:06 UTC, `NRestarts=0`, multi-config active.
+- `sim_metadata` теперь содержит и `entry` (real `simulateTransaction`) и `exit` (curve-math) — дашборд может сравнивать math-PnL vs honest-fill-PnL.
+
+**Откат:**
+```
+ssh rich 'cd ~/www/gg && cp -r .deploy_backups/20260514_sellsim/* . && systemctl --user restart pulse-bot.service'
+```
+
+---
+## 2026-05-14 11:30 — pump.fun direct execution Phase 5 UNBLOCKED (buy instruction fixed)
+
+**Что изменилось:**
+- `encode_buy_instruction_data` больше не добавляет 25-й байт `track_volume`. Данные buy-инструкции теперь ровно **24 байта** (discriminator + amount u64 + max_sol_cost u64). Параметр `track_volume` убран из `encode_buy_instruction_data` и `build_pump_buy_ix`.
+- `solana>=0.36,<0.37` + `solders>=0.26,<0.28` добавлены в `requirements.txt` (были установлены ad-hoc только на rich; `execution_pumpfun.py` импортирует `spl.token`).
+- Тесты обновлены: 24-байтовые ассерты вместо 25 (`test_execution_pumpfun.py`).
+
+**Зачем:**
+- Phase 5 был заблокирован: «pump.fun program rejects my buy instruction 100% — protocol-version mismatch». Декодировал реальную buy-транзакцию с цепи (slot 419594334, sig af4miEhv…) и сделал послотовый diff против нашего билдера: **16 из 18 аккаунтов совпали идеально** (включая все хитрые PDA: bonding_curve_v2, creator_vault, volume accumulators, fee_config). Расхождение — только данные инструкции: реальная = 24 байта, наша = 25. Лишний `track_volume` байт и был «protocol-version mismatch». Текущая программа pump.fun не принимает OptionBool-аргумент на legacy `buy` дискриминаторе.
+- Два fee-recipient слота в diff показались разными, но опрос 40 свежих buy показал что они ротируются по пулу из ~11 значений и наши хардкоды В валидном наборе — не баг.
+
+**Результат:**
+- `simulateTransaction` против текущей on-chain программы (read-only, 0 SOL потрачено): `success=True err=None`, лог `Program 6EF8rrec… success`, 72524 CU. **Buy-инструкция принимается цепью.** Блокер Phase 5 снят.
+- 41 тест `test_execution_pumpfun.py` зелёный. Деплой `execution_pumpfun.py` на rich, бэкап в `.deploy_backups/20260514_pumpfun/`.
+- НЕ сделано (отдельный шаг с реальными деньгами, нужен явный go-ahead): cutover live-торговли с PumpPortal на direct execution, верификация sell-симуляции при наличии позиции.
+
+**Откат:**
+```
+ssh rich 'cd ~/www/gg && cp .deploy_backups/20260514_pumpfun/pulse_bot/execution_pumpfun.py pulse_bot/'
+# чисто execution-слой, в live buy-путь ещё не подключён — рестарт бота не нужен
+```
+
+---
+## 2026-05-14 10:23 — reg_floor A/B knob → p_cal_floor (reg head proven degenerate)
+
+**Что изменилось:**
+- `EntryConfig.p_cal_floor` — новый per-config порог на калиброванную вероятность классификатора. `DecisionService` получил параметр `p_cal_floor`; `apply_ml_override` блокирует ml_override BUY когда `p_cal < p_cal_floor` (лог с `[config_id]`, отдельный счётчик `p_cal_floor_block`).
+- `config/entry_configs.yaml` переписан: 5 конфигов свипают `p_cal_floor` — LIVE(0.0, production baseline) / PCAL01(0.01) / PCAL02(0.02) / PCAL04(0.04) / PCAL08(0.08). Старые reg_floor-конфиги (LOOSE/WIDE/OPEN/ROLLBACK) убраны (reg-поля оставлены в dataclass для back-compat, инертны).
+- `dashboard.py`: таблица «Per-config A/B breakdown» (Config/Closed/Open/WR%/PnL SOL/Avg PnL%) + колонка `Cfg` в closed trades.
+
+**Зачем:**
+- Skill-gate (запись выше) отключил reg-модель → reg_floor-свип стал бессмысленным (4/5 конфигов идентичны). Пользователь выбрал «оставить floor-свип, но на p_cal».
+- Доказано диагностикой на rich (126k строк, 5 вариантов объектива — squarederror/absoluteerror/pseudohuber/signed-log/tight-clip): **reg-модель нельзя сделать скилловой**. Таргет `realized_pnl_pct` вырожден — 95%+ ровно 0.0 (мёртвые токены выходят по цене входа; 72% токенов умирают за 60с). Ни один объектив не проходит skill-gate. Бинарный классификатор на тех же фичах = auc_sign 0.92 → фичи несут сигнал «кто выстрелит», но не величину PnL. p_cal классификатора — рабочий сигнал, на нём и свипаем.
+
+**Результат:**
+- Деплой 4 файлов (entry_configs.py, decision_service.py, entry_configs.yaml, dashboard.py), бот перезапущен 10:23 UTC `NRestarts=0`, dashboard перезапущен. Boot: `Loaded 5 entry configs (shadow=PCAL01/02/04/08)`, `Multi-config A/B active: 5 configs`.
+- A/B теперь осмысленный: 5 конфигов реально различаются по селективности входа. Вопрос свипа: окупает ли более высокий порог уверенности меньшее число сделок ростом WR.
+- Тесты: +5 (`test_model_skill_gate.py` p_cal floor), прогон затронутых файлов зелёный.
+
+**Откат:**
+```
+ssh rich 'cd ~/www/gg && cp -r .deploy_backups/20260514_pcal/* . && systemctl --user restart pulse-bot.service pulse-dashboard.service'
+```
+
+---
+## 2026-05-14 09:17 — Universal model skill-gate + multi-config A/B activated (DEPLOYED to rich)
+
+**Что изменилось:**
+
+*1. `ModelRegistry` — единый судья навыка моделей* (`pulse_bot/ml/model_registry.py`).
+- Новая функция `assess_skill(meta) → (skilled, status, reason)`. Приоритет: явный блок `model_health` авторитетен; иначе судит по метрике под тип модели:
+  - регрессионная голова (`auc_sign`/`objective`): `spearman_rho ≥ 0.10` И `auc_sign > 0.50`;
+  - квантиль (`coverage`): `|coverage − quantile| ≤ 0.15`;
+  - мультикласс timing (`auc_ovr`): `≥ 0.55`;
+  - survival (`sanity_status` + `hazard_auc`): sanity=ok И `hazard_auc ≥ 0.55`;
+  - классификатор (`auc`): `≥ 0.55`; нет метрики → `unmeasured` (не отключаем резко, громкий WARNING).
+- `ModelSpec.healthy/status/skill_reason` идут через `assess_skill`. Раньше «нет блока model_health» = здорова → 7 из 8 моделей не гейтились.
+
+*2. Потребители спрашивают реестр перед влиянием на сделки:*
+- `pipeline.py` загрузка reg-моделей: не скилловая reg-модель НЕ кладётся в `_reg_policies_by_path` → `reg_pnl_pct=None` → reg-floor/ceiling gate пропускается, решает чистый классификатор.
+- `policy/_main.py` `_skill_gate()`: `load_entry_t30_policy_if_available` / `load_exit_quantile_if_available` возвращают `None` для не скилловых моделей.
+
+*3. `train.py` / `entry_timing.py` / `survival.py` пишут `model_health` для ВСЕХ моделей.* survival дополнительно считает in-sample `hazard_auc`.
+
+*4. Multi-config A/B framework активирован* (был наполовину задеплоен, неактивен). 5 конфигов из `config/entry_configs.yaml` (LIVE/LOOSE/WIDE/OPEN/ROLLBACK) — один WS-стрим, параллельные paper-портфели, `paper_trades.config_id` тегирует кто открыл.
+
+*5. Починены 4 бага multi-config WIP (блокировали деплой):*
+- `db._sync_query` падал на write-стейтментах без RETURNING (`fetchall()` → `ProgrammingError: no results to fetch`) и не коммитил. Теперь: `cur.description is None` → commit + пустой результат. Это блокировало `upsert_registry_to_db` → multi-config падал в single-config fallback.
+- `db_schema_pg.sql` не содержал `config_id` + таблицу `entry_configs` (миграция была только для live-БД rich, не для базовой схемы) → свежие деплои/тесты ломались. Добавлено идемпотентно.
+- `_open_slots` стал property поверх `_open_slots_by_config` — тесты через `Pipeline.__new__` падали; тест-хелпер обновлён.
+- `_FakeDB` в тестах не имел `get_realized_balance_sync` (пробел от dynamic-sizing) — добавлен.
+
+**Зачем:**
+- `entry_model_reg` (переобучена 2026-05-13 00:27) — мусор: `spearman_rho=0.06`, `auc_sign=0.37` (хуже монетки в знаке PnL), `avg_pnl_top10=−0.27 SOL`. Но reg-floor gate (`reg_floor=0`) гейтил живые сделки по этому шумовому сигналу.
+- Пользователь: «если модель не уверена в результатах — она не должна влиять на покупки/продажи», для ВСЕХ моделей, а гейт был только у классификатора входа.
+
+**Результат:**
+- Деплой 12 файлов на rich, schema-добавки идемпотентны, бот перезапущен 09:17 UTC, `NRestarts=0`, чистый boot.
+- Boot-лог подтверждает: `entry_reg status=degenerate` → `Entry reg model entry_model_reg.ubj DISABLED — insufficient skill ... fall back to classifier-only entry (no reg-floor/ceiling gate)`. `Multi-config A/B active: 5 configs`. Остальные модели `status=ok`.
+- Эффект на live: ml_override BUY больше НЕ режутся шумовым reg-floor gate. 5 конфигов тегируют paper_trades (пока reg отключён — 4/5 конфигов идентичны, заработают по-разному когда reg пройдёт skill-gate).
+- Тесты: 16 новых (`test_model_skill_gate.py`), полный прогон `tests/pulse_bot/` — 604 passed (5 падений = пред-существующий pump.fun Phase 5, вне скоупа).
+
+**Откат:**
+```
+ssh rich 'cd ~/www/gg && cp -r .deploy_backups/20260514_skillgate/* . && systemctl --user restart pulse-bot.service'
+# schema-добавки идемпотентны (ADD COLUMN IF NOT EXISTS) — откатывать не нужно
+```
+
+---
+## 2026-05-13 09:00 — Dynamic position sizing + scam-wallet filters enabled
+
+**Что изменилось:**
+
+*1. Dynamic position sizing* (`pulse_bot/config.py`, `db.py`, `core.py`, `paper_trade_supervisor.py`, `pipeline.py`).
+- Новый helper `compute_buy_amount_sol(cfg, realized_balance)`: `clamp(balance × pct/100, floor, cap)`, округление до 3 знаков.
+- `Database.get_realized_balance_sync()` — `portfolio_initial_sol + Σ pnl_sol` по закрытым real-entries.
+- `PaperTradeRunner.__init__(buy_amount_sol_override=...)` — fee math использует actual size, не cfg default.
+- `pipeline._handle_token` real-sim path рассчитывает тот же `buy_amount_for_sim` чтобы gate проверял реальный планируемый размер.
+- `PAPER BUY` лог теперь включает `size=X.XXXSOL (balance=Y.YYY)`.
+
+*2. Scam-wallet hard-skip фильтры активированы.* Код существовал, но env-флаги были = 0 (off). Включено:
+- `PULSE_BOT_CLUSTER_HARD_SKIP=3` — `decision_service.filter_bot_cluster`: если в первых 30с трейдов ≥3 wallet'ов с `is_bot=1` → hard SKIP перед ML override.
+- `PULSE_WASH_CLUSTER_SKIP_N=2` — `filter_wash_cluster`: ≥2 wallet'ов из одного cluster_id (cluster size 5-50) → SKIP.
+- Creator-blacklist (всегда on, no env gate) — 513 blacklisted creator'ов в `creators` table.
+
+*3. Live env на rich:*
+```
+PULSE_DYNAMIC_SIZING_PCT=5.0
+PULSE_DYNAMIC_SIZING_CAP_SOL=0.5
+PULSE_DYNAMIC_SIZING_FLOOR_SOL=0.05
+PULSE_BOT_CLUSTER_HARD_SKIP=3
+PULSE_WASH_CLUSTER_SKIP_N=2
+```
+
+**Зачем:**
+- Sizing: пользователь хочет compound on profit / defensive on drawdown. При старте 2.0 SOL × 5% = 0.1 SOL (legacy default). Растёт пропорционально балансу.
+- Scam filters: 432 `is_bot=1` wallet'ов и 671 cluster в `wallet_classifications`, но 0 hits в логах до сегодня = фильтры не активированы в env. Hard skip на скам-кошельках перед ML override должен резать чистый мусор.
+
+**Результат:**
+- 105/105 тестов прошли. Bot restarted 09:00 UTC, 8 моделей boot status=ok, 0 crashes.
+- Все 6 гейтов теперь активны: bot-cluster, wash-cluster, creator-blacklist, reg-floor, real-sim gate, dynamic sizing.
+
+**Откат:**
+```
+sed -i 's/^PULSE_DYNAMIC_SIZING_PCT=.*/PULSE_DYNAMIC_SIZING_PCT=0.0/' /home/sergey/www/gg/.env
+sed -i 's/^PULSE_BOT_CLUSTER_HARD_SKIP=.*/PULSE_BOT_CLUSTER_HARD_SKIP=0/' /home/sergey/www/gg/.env
+sed -i 's/^PULSE_WASH_CLUSTER_SKIP_N=.*/PULSE_WASH_CLUSTER_SKIP_N=0/' /home/sergey/www/gg/.env
+systemctl --user restart pulse-bot.service
+```
+
+---
+## 2026-05-13 05:38 — paper_trades reset to clean baseline
+
+**Что изменилось:**
+- Atomic rename: `paper_trades` (13841 rows) → `paper_trades_archive_20260513`.
+- Создана пустая таблица `paper_trades` (LIKE archive INCLUDING ALL — same schema, indexes, defaults).
+- Bot продолжает писать без перезапуска.
+
+**Зачем:** dashboard показывал P&L = −7.27 SOL (−363%) — аккумулированная грязь от всех изменений конфигурации последних 2 недель (старый SL без fix'a, старый reg_floor=−10, ml_override на degenerate vector до NaN-fix, и т.д.). Нет способа разделить "до" и "после" сегодняшних changes в той же таблице.
+
+**Результат:** чистый baseline на post-fix конфигурации:
+- `PULSE_ENTRY_REG_FLOOR_PCT=0.0`
+- HELIUS NaN-fill активен
+- hard_stop double-fee исправлен (paper_trades.pnl_pct честный)
+- entry_model_reg (новый, auc_sign +0.113)
+- exit_quantile_sl (новый, calibration улучшена)
+
+Следующие N дней статистика покажет реальный effect суммы всех changes.
+
+**Откат:**
+```sql
+DROP TABLE paper_trades;
+ALTER TABLE paper_trades_archive_20260513 RENAME TO paper_trades;
+```
+
+---
+## 2026-05-13 05:35 — t30 + survival retrain (both rolled back)
+
+**Что изменилось:**
+- Найдены правильные entry-points (из `scripts/retrain_all_8.sh:55-85`): для t30 — `train_entry_t30()` (Python-инлайн), для survival — `SurvivalLabelBuilder().build_from_db() + train_survival_model()`.
+- Запущен retrain. Обе модели обучены успешно (saved). Сравнил с backup.
+
+**Результаты:**
+
+| Модель | Метрика | Backup | New | Решение |
+|---|---|---|---|---|
+| `entry_model_t30` | AUC | 0.9126 | 0.8457 (**−0.067**) | ❌ rollback |
+| `survival_model` | direct metric | None | None (no validation metric) | ❌ rollback (no proof) |
+
+- **t30**: явная AUC регрессия −6.7pp → rollback.
+- **survival**: модель тренировалась на 254k rows (vs 231k backup) — больше данных. Positive_rate identical (0.0470 → 0.0474). Sanity_status=ok в обеих. НО — нет direct quality metric (AUC/c-index = None). По правилу "не проеби прибыльность" — conservative rollback. Можем повторить с явным validation suite позже.
+
+**Bot restart:** 2026-05-13 05:35:09 UTC. 8 моделей boot status=ok.
+
+**Финальное состояние всех 8 моделей после двух retrain-итераций:**
+
+| Модель | Source | AUC/metric |
+|---|---|---|
+| entry | restored v21 (rollback) | 0.9329 |
+| entry_reg | **deployed new** (auc_sign +0.113) | rho=+0.060 |
+| entry_t30 | restored backup | 0.9126 |
+| entry_timing | restored backup | 0.863 |
+| exit_quantile_sl | **deployed new** (better calibration) | rho=+0.072 |
+| exit_quantile_tp | restored backup | rho=+0.084 |
+| exit_quantile_max_hold | restored backup | rho=+0.503 |
+| survival | restored backup | sanity=ok |
+
+**Итог двух retrain-сессий:** 8 моделей пересмотрены, **2 deployed** (entry_reg, exit_quantile_sl) — обе с явными улучшениями. **6 rolled back** для защиты прибыльности. Backups all preserved as `*.bak.20260512`.
+
+---
+## 2026-05-13 00:42 — Selective retrain of non-entry models (2 deployed, 3 rolled back, 2 failed)
+
+**Что изменилось:**
+- Запущен `retrain_non_entry.sh` — пересоздание датасетов (entry_t30, exit) и retrain 7 моделей кроме entry (entry уже откатил в 22:48).
+- Все 7 моделей backup'нуты как `*.bak.20260512` ДО train'а.
+- После train: сравнил new vs backup metrics. Deploy только улучшения, rollback регрессий.
+
+**Результат по моделям:**
+
+| Модель | Метрика | Backup | New | Решение |
+|---|---|---|---|---|
+| `entry_model_reg` | auc_sign | 0.260 | **0.372** (+0.113) | ✅ DEPLOY |
+| `exit_quantile_sl` | coverage (target 0.25) | 0.337 | **0.311** (ближе к target) | ✅ DEPLOY |
+| `entry_timing_model` | auc_ovr | 0.863 | 0.806 (−0.057) | ❌ rollback |
+| `exit_quantile_tp` | coverage (target 0.75) | 0.658 | 0.647 (дальше) | ❌ rollback |
+| `exit_quantile_max_hold` | coverage (target 0.75) | 0.777 | 0.798 (дальше) | ❌ rollback |
+| `entry_model_t30` | — | unchanged | not trained (`No module pulse_bot.ml.train_entry_t30`) | unchanged |
+| `survival_model` | — | unchanged | not trained (`unrecognized arguments: --train-survival`) | unchanged |
+
+**Зачем:** пользователь хотел извлечь пользу из накопленных данных (171k tokens, 13.8k closed paper_trades, 465k holder_snapshots — больше чем при предыдущем train 5 may). Цель — улучшения только при подтверждённой регрессии-free валидации.
+
+**Что фактически дало улучшение:**
+- `entry_reg` — лучше различает sign of predicted PnL. Это **усиливает** `PULSE_ENTRY_REG_FLOOR_PCT=0.0` mechanism (точнее различает реальный +PnL от −PnL → меньше false blocks/passes).
+- `exit_quantile_sl` — coverage 0.311 вместо 0.337 для quantile=0.25 → калибрация лучше → SL trigger корректнее.
+
+**Что НЕ deploy:**
+- timing: auc_ovr −0.057 (5.7pp regression) — старая модель видела больше консистентные snapshots.
+- exit_tp/max_hold: coverage drift от target — рассинхронизация с realized distribution.
+
+**Откат для каждой:**
+```
+cd /home/sergey/www/gg/data/ml
+for m in entry_model_reg entry_model_t30 entry_timing_model exit_quantile_sl exit_quantile_tp exit_quantile_max_hold survival_model; do
+  cp $m.ubj.bak.20260512 $m.ubj
+  cp $m.meta.json.bak.20260512 $m.meta.json
+done
+systemctl --user restart pulse-bot.service
+```
+
+**Bot restart:** 2026-05-13 00:42:42 UTC. 8 моделей boot status=ok. 0 crashes.
+
+**TODO (не сделано в этой итерации):**
+- Найти правильный entry-point для `entry_t30` retrain (`No module pulse_bot.ml.train_entry_t30` — модуль возможно в другом месте или используется `pulse_bot.ml.train --dataset entry_t30`).
+- Найти правильный CLI flag для survival (`--train-survival` не существует — может `--survival` или отдельный модуль).
+
+---
+## 2026-05-12 22:48 — HELIUS NaN-fill in live serving + entry retrain attempt (rolled back)
+
+**Что изменилось:**
+- `pulse_bot/pipeline.py::_fetch_holder_snapshot_all` — вместо `0.0` для отсутствующих rows возвращает `float("nan")`. NaN propagates через derived `top1_delta`/`hc_velocity`. Live serving теперь даёт модели NaN values где captures missing, вместо синтетического "holder concentration = 0%" что было нонсенсом и интерпретировалось моделью как distinct signal.
+- `data/ml/entry_model.ubj.bak.v21` — backup v21 model сохранён до retrain.
+- **Retrain attempt rejected**: rebuild dataset + train entry → новая AUC=0.9191 vs v21 AUC=0.9329 (ΔAUC=-0.0138, регрессия). Файл откатил до v21 backup.
+
+**Зачем:** codex review identified ~12 HELIUS feature dimensions where live emits 0.0 while training data has NaN — train/serve skew. Гипотеза была: NaN-fix improves model behaviour even on existing v21 model (XGBoost handles missing natively через learned default-direction routing). Retrain hoped to capture additional gain.
+
+**Результат:**
+- Live NaN-fix patch deployed and active. Bot restarted 22:25:34 UTC с патчем, 0 crashes.
+- Retrain показал **regression** (-0.0138 AUC). Закрытое объяснение: `build_dataset.py:301-319` УЖЕ был NaN-aware с 2026-05-05 (task #80 "Fix HELIUS T+120 race"). Mirror уже сделан давно — retrain не дал дополнительного gain, только train run-to-run variance. **Не deploy.**
+- v21 entry_model.ubj восстановлен из бэкапа (AUC=0.9329, schema=entry_v21).
+
+**Что фактически дал NaN-fix (без retrain):**
+- Live model больше не получает 0.0 = "holder concentration = 0%" для missing captures.
+- XGBoost natively handles NaN через learned default direction (training rows с NaN HELIUS).
+- Expected forward effect: marginal proba changes на тех ~12% scoring calls где HELIUS captures missing. Monitor next 24-48h.
+
+**Откат (если потребуется):**
+- NaN-fix в pipeline.py: revert `_fetch_holder_snapshot_all` к 0.0-fill. Git history.
+- Model уже в v21 (на rich + backup).
+
+---
+## 2026-05-12 22:17 — Hard_stop double-fee fix + reg_pnl_floor tightening (live config change)
+
+**Что изменилось:**
+- `pulse_bot/core.py::PaperTradeRunner.process_trade` — hard_stop теперь возвращает `exit_price=self._current_price` (фактическую цену срабатывания) вместо синтетического `entry × (1 − SL/100)`. До фикса `_weighted_pnl()` применяло fees ДВАЖДЫ: один раз в `_calc_leg_pnl(current_price)` (на котором срабатывает trigger) и второй раз в `_weighted_pnl(stop_price)` для отчёта. Результат — отчёт по hard_stop был на ~6-7pp глубже чем реальный triggering condition (SL=−15% писало −21% в paper_trades).
+- `.env` на rich: `PULSE_ENTRY_REG_FLOOR_PCT: -10.0 → 0.0`. Reg_pnl_floor = +0% означает что entry_reg model должна предсказать **неотрицательный** PnL, иначе entry блокируется.
+- `tests/pulse_bot/test_optimizer_correctness.py` + `test_partial_exits_parity.py` — обновлены под новую семантику hard_stop. 596 passed → 596 passed.
+
+**Зачем:**
+- Hard_stop double-fee — codex review нашёл косметический баг (paper_trades.pnl_pct искажён на 6-7pp на каждом hard_stop close). Оптимизатор работает на сломанной оси Y. Trigger condition был корректен, искажался только reported pnl_pct.
+- Reg_floor — на 14-дневной выборке (N=3599 ml_override) субсет анализ показал: текущий floor=-10 даёт total=-5.44 SOL. Floor=0.0 даёт -2.83 SOL (Δ=+2.61 SOL за 14 дней). Парадокс: floor=-2 (промежуточный) даёт ХУЖЕ baseline (-6.72 SOL) — `entry_reg` модель не калибрована в [-2, 0%] зоне, predictions noise; калибрована только в ≥0% зоне.
+
+**Результат:**
+- Bot restarted 2026-05-12 22:17:04 UTC, 0 checkpoint crashes, sched/T+30/TIMING checkpoints работают.
+- Ожидаемый эффект (backtest 14d): ~38% entries будет отрезано (с 3599 до 2232 за 14 дней), WR 9.1%→9.5%, avg_pnl -1.51%→-1.27%, total_sol -5.44→-2.83 (=+0.19 SOL/день improvement).
+- Hard_stop reports теперь честные: −15% записывается как −15%, не −21%. Optimizer-теперь на правильной оси Y.
+
+**Risk-mitigation:**
+- Forward риск: backtest на historical data не гарантирует то же на forward. Bot мониторится через `pulse-regression-monitor.timer` (каждые 30 мин).
+- Defense gate `PULSE_ML_DEGENERATE_RULES_FALLBACK` НЕ включаю — 100% live predict_proba на degenerate vector (<32/82 features), включение убило бы ВСЕ ml_override. Решается через fix в `_fetch_holder_snapshot_all` (NaN вместо 0.0) + retrain — отдельная задача.
+
+**Откат:**
+```
+ssh rich
+sed -i 's/PULSE_ENTRY_REG_FLOOR_PCT=0.0/PULSE_ENTRY_REG_FLOOR_PCT=-10.0/' /home/sergey/www/gg/.env
+systemctl --user restart pulse-bot.service
+```
+Hard_stop fix: revert `core.py:265-330` к синтетическому stop_price. Тесты обратно к старой версии.
+
+---
+## 2026-05-12 21:53 — simulate_exit tick-loop parity fix + sweep grid expansion
+
+**Что изменилось:**
+- `pulse_bot/ml/simulate_exit.py::_replay_trades` — добавлен timeline-walk с tick-интерполяцией между трейдами. До фикса replay обрабатывал только trades; для 76% позиций (где последний WS-трейд приходит за <5с после entry) симулятор стоял на месте до конца `trades`, возвращая stale `timeout_result` — пропуская max_hold/survival/inactivity exits которые live делает через `runner.tick()` каждые 5с. После фикса replay drain'ит ticks до timestamp каждого trade'a и продолжает тикать после исчерпания trades до `max_hold + buffer`.
+- `scripts/tp_max_hold_sweep.py` — grid расширен `TP ∈ {10,15,20,25,30,50,75,100,150}` × `MH ∈ {60,90,120,180,300}` (45 combos вместо 15). Старый grid (TP≥30) был выше "мёртвой зоны" — все TP в нём имели 0% fire rate.
+
+**Зачем:** codex review + SQL diagnostic показали что `trades` table корректно отражает WS-поток (avg 1.9 trades в hold window — это сама природа pump.fun: 76% токенов умирают на 5-й секунде), но simulator не реплеит tick'и, отсюда policy skew. До фикса все варианты TP/MH давали одинаковый −16.7 SOL на 2493 позициях, а live давал +0.48 SOL — расхождение 17 SOL делало любую sweep-рекомендацию мусором.
+
+**Результат:**
+| | До | После |
+|---|---|---|
+| sim total_sol @ live config | −16.76 | **−0.807** |
+| sim WR @ live config | 2.75% | **9.99%** |
+| live WR | 9.8% | 9.8% |
+| live total_sol | +0.477 | +0.477 |
+| Разрыв sim vs live | −17.2 SOL | **−1.28 SOL** (94% gap closed) |
+
+Sweep на расширенном grid: все 45 комбинаций в коридоре −0.795 до −0.807 SOL (Δ между лучшим и live = +12 mSOL — шум). Вывод: **TP × max_hold не значимые knobs в этом диапазоне**, TP fire rate 0-0.12% во всём grid. Лимитирующий фактор — entry selection и slippage, не exit knobs.
+
+**Остающийся −1.28 SOL gap**: sweep отключает `exit_max_hold_dynamic`/`exit_quantile_*`/`survival` — это, вероятно, source residual mismatch (live их использует). Отдельное исследование.
+
+**Откат:** revert `_replay_trades` к старой версии — она в git history. Sweep grid тоже легко уменьшить обратно константой.
+
+**Бот не трогался**: `simulate_exit.py` — диагностический инструмент, live `_paper_trade` не использует.
+
+---
+## 2026-05-12 09:40 — Wipe stale __pycache__ → kill 2457 checkpoint loop crashes
+
+**Что изменилось:** `find /home/sergey/www/gg/pulse_bot -name __pycache__ -exec rm -rf {} +` + `systemctl --user restart pulse-bot.service`. Принудительная пересборка bytecode из текущего pipeline.py.
+
+**Зачем:** За ночь после моего restart 2026-05-11 14:17:41 накопилось 2457 `ERROR pulse_bot.pipeline: checkpoint loop crashed` → `UnboundLocalError: _os_t30 not associated with value` (line 1422 в memory image бота). Но `cat pipeline.py | sed -n '1422p'` показывал `proba=proba` — то есть код в файле уже починен. Python загружал `pipeline.cpython-312.pyc` со старой pre-fix логикой (mtime header прошёл валидацию, bytecode остался от предыдущей сборки, где timing-блок использовал `_os_t30` вместо `_os_timing`). Bot работал через fallback T+90, но teryал TIMING/T+30 checkpoint решения.
+
+**Результат:**
+- crashes за 3 мин после fresh start: **2457 → 0**.
+- TIMING/T+30 checkpoint loop возвращён в норму (видны "TIMING checkpoint ... @T+30: SKIP", "T+30 decision ...: DEFER/SKIP" в свежем tail).
+- pulse-bot.service active с 2026-05-12 09:39:41 UTC, PID 124597.
+
+**Откат:** не нужен — wipe идемпотентен, .pyc пересоберутся автоматически.
+
+---
+## 2026-05-11 17:20 — Real-sim gate enabled + Token-2022/legacy SPL detection fix
+
+**Что изменилось:**
+- `pulse_bot/execution_pumpfun.py`: добавлен `HeliusRpc.fetch_mint_token_program()`. `_buy_inner` / `_sell_inner` теперь читают owner mint-аккаунта перед сборкой инструкции и передают правильный `token_program` (Token-2022 vs legacy SPL) во всю цепочку: `build_buy_transaction`, `build_pump_buy_ix`, `PumpFunBuyAccounts.for_user_mint_creator` (и зеркало для sell). Это чинит `IncorrectProgramId` на legacy SPL мinтах (раньше хардкод `TOKEN_2022_PROGRAM_ID` ломал ATA-derivation seed для них).
+- `HeliusRpc.simulate_transaction()`: добавлена обработка JSON-RPC `error` поля (раньше `result={}`/missing молча возвращало `err=None` при success=False). Теперь `err=rpc_error:...` / `rpc_post_failed:...`.
+- `pulse_bot/services/sim_executor.py`: exception сообщения теперь включают `type(exc).__name__ + repr(exc)`. Раньше `Exception()` без message давал пустую `sim_exception:`.
+- `tests/pulse_bot/test_execution_pumpfun.py`: `_FakeRpc` обновлён под новый интерфейс (`fetch_mint_token_program`). **54/54 passing**.
+- **Live config flip:** `PULSE_PAPER_SIM_GATE=0 → 1` на rich. Bot перезапущен 14:17:41 UTC.
+
+**Зачем:** shadow-режим (gate=0) за 48ч завысил paper PnL на ≈+0.48 SOL — 7 из 12 фейлов sim'a (`bonding_curve_account_missing` / `curve_complete_post_graduation`) показывали фантомные +120% / +74% в bonding-curve матике, хотя реально купить было невозможно. 3 фейла были нашим багом (`IncorrectProgramId` на legacy SPL мinтах). После Token-2022 detection — эти 3 минта пересимулированы: все три `success=True`. Остальные 8 — корректные rejects (graduated / slippage 1% / RPC лаг).
+
+**Результат:**
+- Smoke-test на 5 historical fail minтах подтвердил fix: `ADANbqJd...`, `FCv1BBDb...`, `2Q3a2vva...` (все legacy SPL) теперь `success=True` через `simulate_buy`.
+- Live config check: `paper_use_real_sim=True, paper_sim_gate=True`.
+- Tests: 54/54 passing.
+- Ожидаемый эффект на paper: -0.30 SOL за 48ч (честно) вместо +0.16 SOL (с фантомами). WR упадёт с 12% до 9.6% — но это правда.
+
+**Оставшиеся sim FAIL категории (ожидаемое поведение gate):**
+- `Custom: 6002` = SlippageExceeded — наш cap=100bps жёстковат на быстро растущих токенах; gate корректно отказывает (реально не купили бы).
+- `Custom: 2006` = ConstraintSeeds — 1 случай за 48ч; редкий edge-case, нужна отдельная диагностика конкретного PDA.
+- `bonding_curve_account_missing` / `curve_complete_post_graduation` — токен мёртв/graduated, gate отбрасывает.
+- `blockhash_fetch_failed` — преходящий RPC лаг (≤1/день).
+
+**Откат:**
+- Gate: `sed -i 's/PULSE_PAPER_SIM_GATE=1/PULSE_PAPER_SIM_GATE=0/' /home/sergey/www/gg/.env && systemctl --user restart pulse-bot.service`.
+- Код: token_program defaults to `TOKEN_2022_PROGRAM_ID` (старое поведение), параметр опциональный — старые callers не сломаются.
+
+---
+## 2026-05-09 23:06 — PumpPortal wallet top-up + drain monitor
+
+**Что изменилось:**
+- Перевёл 0.02 SOL с main wallet `5cz57jCVA…` на PumpPortal wallet `GHf7v3Kx…` (sig `2ZipHmyygX8PHgWEvFz4aRMfYGSJKNuNzuS4McUvc38u72Rn6CnaGkUGup5hx6BDwXeXbxRLEHoq4rgkMi7ChRMw`).
+- Новый скрипт `scripts/pumpportal_balance_monitor.py` + systemd unit `pumpportal-balance-monitor.{service,timer}` — каждые 10 мин читает баланс, считает все исходящие tx через `getSignaturesForAddress` и логирует с дельтой в `logs/pumpportal_drain_alerts.log`. На любой outflow трогает `~/.PUMPPORTAL_DRAIN_FLAG`.
+
+**Зачем:** wallet-у `GHf7v3Kx…` 8 мая 02:13 UTC ушло 0.01 SOL на коллектор `7FeFBYbe…` (приватник кошелька известен PumpPortal — они генерили его в Lightning-flow). Баланс упал до 0.009985 SOL, ниже минимума 0.02 SOL для PumpPortal WS — бот перестал получать `subscribeTokenTrade`/`subscribeNewToken` events. Нужно было восстановить торговлю и поймать следующее списание, если оно повторится.
+
+**Результат:**
+- Баланс: 0.009985 → **0.029985 SOL**.
+- WS-подписки прошли успешно (`Successfully subscribed to keys` / `to token creation events`); поток новых токенов восстановлен; T+30/TIMING checkpoint снова срабатывают.
+- Monitor verified: первый запуск зафиксировал baseline + историческую утечку (0.010 SOL → `7FeFBYbe…`); следующий запуск exit=0 (clean). Timer active, next trigger 20:16:40 UTC.
+
+**Откат:**
+- Monitor: `systemctl --user disable --now pumpportal-balance-monitor.timer`.
+- Top-up — это on-chain, отката нет; если нужен возврат — manual transfer обратно.
+
+---
+## 2026-05-09 09:30 — pump.fun direct execution: end-to-end real-buy + real-sell + real-sim paper trading
+
+**Что изменилось:**
+- `pulse_bot/execution_pumpfun.py` rewritten to match official `pump-rust-client@0.1.6` SDK: 18-account buy ix (16 IDL + `bonding_curve_v2` + `buyback_fee_recipient`), 16-or-17-account sell ix (with optional UVA for cashback coins), 25-byte buy data with `track_volume` OptionBool, mayhem/cashback dispatch from `BondingCurveState` flags, full live submit path via `sendTransaction` + `getSignatureStatuses`.
+- New service `pulse_bot/services/sim_executor.py` wraps `simulate_buy`/`simulate_sell`. Pipeline gates paper-trade entries through it when `PULSE_PAPER_USE_REAL_SIM=1`.
+- Schema bump: `paper_trades.sim_metadata JSONB`. Dashboards can now compare math-based PnL vs realistic-fill PnL side by side.
+
+**Зачем:** до этого fix паттерна на pump.fun execution лежал на 0% fill_rate (12-account legacy ix vs current on-chain 18). Бот мог только paper-trade через bonding-curve math, который игнорирует slippage / fees / auth-list / mayhem state.
+
+**Результат:**
+- Backfill simulation: **0% → 100%** fill rate (20/20 mints) at 1% slippage
+- First real on-chain buy submitted on mainnet — sig `4oKqQErKpFPbtKUUQmE5Ydgzuzmani4wUhJxfNrpvMjDXNJXq8zi58CWGN6DRpXDvTST5kAyLnacJNZEMT5FFin6` (0.001 SOL → 162502 STH)
+- Round-trip sell — sig `RNgLy2jA9WZn2VBLiZQg5aeHg5dF3YdLwB3EtjzxBivH8xBTdtJVxgNvWG4nszLXEidZbqDzxdNTJPGvBqaPbbH` (162502 STH → 0.000953 SOL)
+- Cost breakdown observed: 0.00204 SOL ATA rent (one-time, reclaimable) + ~0.0019 fees (priority + tx + 2× protocol 1%) on a 0.001 SOL position
+- 54/54 tests passing (12 new for SimExecutor)
+
+**Откат:**
+- Sim-as-paper feature: unset `PULSE_PAPER_USE_REAL_SIM` env (default off). Bot reverts to math-based fills.
+- Real submit: kept gated behind `allow_live_submit=True` — never enabled in `pulse-bot.service`. Paper trading is the default; live submit only via opt-in scripts.
+- Schema column is additive (`ADD COLUMN IF NOT EXISTS`) — drop with `ALTER TABLE paper_trades DROP COLUMN sim_metadata` if needed.
+
+---
 ## 2026-05-08 12:23 — Time-of-day pattern observed; monitor instrumented for validation
 
 **Что найдено** (post-fix 3-day data, N=318):

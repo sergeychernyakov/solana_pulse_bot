@@ -39,6 +39,175 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+# ─────────────────────────── skill thresholds ──────────────────────────
+# A model below these bars has no demonstrated ability to separate
+# winners from losers (or, for quantile heads, is not calibrated), so it
+# must not influence live buy/sell decisions. These are code-health
+# guards, NOT trading parameters — they gate whether a model is trusted
+# at all, they do not tune entry/exit behaviour.
+MIN_CLASSIFIER_AUC = 0.55
+MIN_REG_SPEARMAN = 0.10
+# auc_sign <= 0.50 means the regression head is worse than a coin flip at
+# predicting whether realized PnL is positive — an unambiguous "no skill".
+MIN_REG_AUC_SIGN = 0.50
+QUANTILE_COVERAGE_TOLERANCE = 0.15
+# Multiclass (entry_timing: WAIT_MORE / BUY_NOW / SKIP) — one-vs-rest AUC.
+MIN_TIMING_AUC_OVR = 0.55
+# Entry classifiers: advisory threshold on the most-confident proba
+# bucket's expected value (``ceiling_ev`` — mean realized PnL%, fees +
+# slippage applied). A non-positive value is a flag to INVESTIGATE, not
+# proof of no skill: ``ceiling_ev`` is derived from ``simulate_exit`` run
+# over training labels, which can be wrong (simulator bugs, train/serve
+# skew, a stale exit config). The only ground truth for "does this model
+# make money" is LIVE realized PnL. So the EV check is advisory — it
+# warns loudly, it never disables a model on its own.
+MIN_CEILING_EV = 0.0
+
+
+def _ev_advisory(meta: dict[str, Any]) -> str | None:
+    """Advisory check on a classifier's training-label EV.
+
+    Returns a human-readable warning when the most-confident proba
+    bucket's ``ceiling_ev`` is non-positive, else ``None``. This is NOT a
+    skill verdict — see :data:`MIN_CEILING_EV` for why the metric is not
+    trustworthy enough to gate on. Callers surface the warning; disabling
+    a model on EV grounds requires corroboration from live realized PnL.
+    """
+    ct = meta.get("confidence_thresholds") or None
+    if ct is None or ct.get("objective") != "ev" or "ceiling_ev" not in ct:
+        return None
+    ceiling_ev = float(ct.get("ceiling_ev") or 0.0)
+    if ceiling_ev > MIN_CEILING_EV:
+        return None
+    base_ev = float(ct.get("val_base_ev") or 0.0)
+    return (
+        f"training-label EV non-positive (ceiling_ev={ceiling_ev:+.3f}%, "
+        f"base {base_ev:+.3f}%) — ADVISORY ONLY; cross-check against live "
+        f"realized PnL before trusting (may be a simulator artifact)"
+    )
+
+
+def _with_ev_advisory(
+    skilled: bool, status: str, reason: str, meta: dict[str, Any]
+) -> tuple[bool, str, str]:
+    """Fold the EV advisory into a classifier verdict WITHOUT changing
+    ``skilled``. A passing model whose training-label EV is non-positive
+    gets status ``ev_warning`` (visible in logs / boot summary) but stays
+    usable — the EV metric is advisory, never authoritative."""
+    ev_warn = _ev_advisory(meta)
+    if ev_warn is None:
+        return skilled, status, reason
+    reason = f"{reason}; EV advisory: {ev_warn}"
+    if skilled and status == "ok":
+        status = "ev_warning"
+    return skilled, status, reason
+
+
+def assess_skill(meta: dict[str, Any]) -> tuple[bool, str, str]:
+    """Judge whether a model has enough demonstrated skill to influence
+    live buy/sell decisions.
+
+    Returns ``(skilled, status, reason)``:
+        * ``skilled`` — True iff the model may influence decisions.
+        * ``status``  — ``ok`` / ``ev_warning`` / ``degenerate`` /
+          ``unmeasured``.
+        * ``reason``  — human-readable explanation for logs.
+
+    Precedence:
+        1. An explicit ``model_health`` block (written by train.py for
+           models that compute it) is authoritative for the skill
+           verdict.
+        2. Otherwise judge from whatever skill metric the meta carries,
+           detected by model type: regression head (``auc_sign`` /
+           ``objective``), quantile regressor (``coverage``), or plain
+           classifier (``auc``).
+        3. A model carrying no skill metric at all → ``unmeasured``.
+           Left usable (``skilled=True``) so a working model is not
+           abruptly disabled — but callers should log a warning, and
+           train.py should be taught to emit a metric (task #96).
+
+    EV advisory: for classifiers, a non-positive training-label
+    ``ceiling_ev`` downgrades status to ``ev_warning`` but does NOT set
+    ``skilled=False`` — the metric comes from ``simulate_exit`` over
+    training labels and can be wrong; only live realized PnL is ground
+    truth. See :func:`_ev_advisory`.
+    """
+    health = meta.get("model_health") or None
+    if health is not None:
+        status = health.get("status", "ok")
+        skilled = status in ("ok", "ok_percentile_fallback")
+        notes = health.get("notes") or []
+        reason = "model_health.status=%s%s" % (
+            status,
+            (" — " + "; ".join(notes)) if notes else "",
+        )
+        return _with_ev_advisory(skilled, ("ok" if skilled else status), reason, meta)
+
+    # Regression head — judged by rank correlation AND sign accuracy.
+    if "auc_sign" in meta or meta.get("objective") == "reg:squarederror":
+        rho = float(meta.get("spearman_rho") or 0.0)
+        auc_sign = float(meta.get("auc_sign") or 0.0)
+        skilled = auc_sign > MIN_REG_AUC_SIGN and rho >= MIN_REG_SPEARMAN
+        reason = (
+            f"regression head: spearman_rho={rho:+.3f} "
+            f"(need >={MIN_REG_SPEARMAN}), auc_sign={auc_sign:.3f} "
+            f"(need >{MIN_REG_AUC_SIGN})"
+        )
+        return skilled, ("ok" if skilled else "degenerate"), reason
+
+    # Quantile regressor — judged by calibration (achieved coverage close
+    # to the target quantile level).
+    if "coverage" in meta:
+        coverage = float(meta.get("coverage") or 0.0)
+        quantile = float(meta.get("quantile") or 0.5)
+        drift = abs(coverage - quantile)
+        skilled = drift <= QUANTILE_COVERAGE_TOLERANCE
+        reason = (
+            f"quantile q={quantile}: coverage={coverage:.3f} "
+            f"(drift {drift:.3f}, tol {QUANTILE_COVERAGE_TOLERANCE})"
+        )
+        return skilled, ("ok" if skilled else "degenerate"), reason
+
+    # Multiclass classifier (entry_timing) — judged by one-vs-rest AUC.
+    if "auc_ovr" in meta:
+        auc_ovr = meta.get("auc_ovr")
+        if auc_ovr is None:
+            return False, "degenerate", "multiclass: auc_ovr could not be computed"
+        auc_ovr = float(auc_ovr)
+        skilled = auc_ovr >= MIN_TIMING_AUC_OVR
+        reason = f"multiclass: auc_ovr={auc_ovr:.4f} (need >={MIN_TIMING_AUC_OVR})"
+        return skilled, ("ok" if skilled else "degenerate"), reason
+
+    # Survival hazard model — judged by the degeneracy sanity test and,
+    # when available, the in-sample hazard discrimination AUC.
+    if "sanity_status" in meta:
+        sane = meta.get("sanity_status") == "ok"
+        hazard_auc = meta.get("hazard_auc")
+        if hazard_auc is not None:
+            hazard_auc = float(hazard_auc)
+            skilled = sane and hazard_auc >= MIN_CLASSIFIER_AUC
+            reason = (
+                f"survival: sanity={meta.get('sanity_status')}, "
+                f"hazard_auc={hazard_auc:.4f} (need >={MIN_CLASSIFIER_AUC})"
+            )
+        else:
+            skilled = sane
+            reason = f"survival: sanity={meta.get('sanity_status')} (no hazard_auc)"
+        return skilled, ("ok" if skilled else "degenerate"), reason
+
+    # Plain classifier without a model_health block — judged by AUC.
+    if "auc" in meta:
+        auc = float(meta.get("auc") or 0.0)
+        skilled = auc >= MIN_CLASSIFIER_AUC
+        reason = f"classifier: auc={auc:.4f} (need >={MIN_CLASSIFIER_AUC})"
+        return _with_ev_advisory(
+            skilled, ("ok" if skilled else "degenerate"), reason, meta
+        )
+
+    # No skill metric at all.
+    return True, "unmeasured", "no skill metric in meta — running ungated"
+
+
 # Model name → on-disk artifact name (without extension).
 # Single canonical mapping replaces scattered Path("data/ml/...") calls.
 DEFAULT_NAMES: dict[str, str] = {
@@ -57,35 +226,41 @@ DEFAULT_NAMES: dict[str, str] = {
 class ModelSpec:
     """Resolved info about one model artifact."""
 
-    name: str            # logical name (e.g. "entry")
-    path: Path           # .ubj file
-    meta_path: Path      # .meta.json file
-    exists: bool         # both files present
+    name: str  # logical name (e.g. "entry")
+    path: Path  # .ubj file
+    meta_path: Path  # .meta.json file
+    exists: bool  # both files present
     schema_version: str | None = None
     auc: float | None = None
     p_at_top10: float | None = None
     spearman_rho: float | None = None
+    auc_sign: float | None = None
+    coverage: float | None = None
+    quantile: float | None = None
     health: dict[str, Any] = field(default_factory=dict)
     raw_meta: dict[str, Any] = field(default_factory=dict)
 
     @property
     def healthy(self) -> bool:
-        """True iff the model has model_health.status == 'ok' (or no
-        health field at all — legacy artifacts trained before health
-        gate). False when degenerate / narrow_proba_spread /
-        auc_regression / anti_correlated."""
+        """True iff the model has demonstrated enough skill to influence
+        live buy/sell decisions. See :func:`assess_skill` for the per-
+        model-type rules. ``False`` for missing artifacts."""
         if not self.exists:
             return False
-        status = self.health.get("status")
-        if status is None:
-            return True  # legacy — no gate ever ran, assume usable
-        return status == "ok"
+        return assess_skill(self.raw_meta)[0]
 
     @property
     def status(self) -> str:
         if not self.exists:
             return "missing"
-        return self.health.get("status") or "ok"
+        return assess_skill(self.raw_meta)[1]
+
+    @property
+    def skill_reason(self) -> str:
+        """Human-readable explanation of the skill verdict."""
+        if not self.exists:
+            return "artifact missing"
+        return assess_skill(self.raw_meta)[2]
 
     def summary(self) -> str:
         """One-line human-readable summary suitable for boot logs."""
@@ -98,7 +273,12 @@ class ModelSpec:
             bits.append(f"P@10={self.p_at_top10*100:.1f}%")
         if self.spearman_rho is not None:
             bits.append(f"rho={self.spearman_rho:+.3f}")
-        bits.append(f"status={self.status}")
+        if self.auc_sign is not None:
+            bits.append(f"auc_sign={self.auc_sign:.3f}")
+        status = self.status
+        bits.append(f"status={status}")
+        if status != "ok":
+            bits.append(f"({self.skill_reason})")
         return "  ".join(bits)
 
 
@@ -154,6 +334,12 @@ class ModelRegistry:
             spec.p_at_top10 = float(meta["precision_top10"])
         if "spearman_rho" in meta:
             spec.spearman_rho = float(meta["spearman_rho"])
+        if "auc_sign" in meta:
+            spec.auc_sign = float(meta["auc_sign"])
+        if "coverage" in meta:
+            spec.coverage = float(meta["coverage"])
+        if "quantile" in meta:
+            spec.quantile = float(meta["quantile"])
         spec.health = meta.get("model_health") or {}
         return spec
 
@@ -178,10 +364,10 @@ class ModelRegistry:
         to see why ML override might refuse to act."""
         spec = self.get(name)
         if spec.exists and not spec.healthy:
-            notes = spec.health.get("notes") or []
             logger.warning(
                 "MODEL %s status=%s — %s",
-                name, spec.status,
-                "; ".join(notes) if notes else "(no notes)",
+                name,
+                spec.status,
+                spec.skill_reason,
             )
         return spec

@@ -136,6 +136,45 @@ def _first_mismatch(expected: list[str], got: list[str]) -> str:
     return "no per-index mismatch (ordering identical — check schema_version)"
 
 
+def _skill_gate(model_path: Path, label: str) -> bool:
+    """Universal skill gate for model loaders.
+
+    Reads the model's ``.meta.json`` and asks
+    :func:`pulse_bot.ml.model_registry.assess_skill` whether the model
+    has demonstrated enough skill to influence live decisions. Returns
+    ``True`` if the model may be used, ``False`` if the caller should
+    drop it (return ``None``) so decisions fall back to rules.
+
+    A model with no skill metric at all (``unmeasured``) is left usable
+    but logged loudly — train.py owns teaching it to emit one.
+    """
+    try:
+        from pulse_bot.ml.model_registry import assess_skill
+
+        meta = json.loads(model_path.with_suffix(".meta.json").read_text())
+        skilled, status, reason = assess_skill(meta)
+    except Exception as exc:  # noqa: BLE001 — never block load on this
+        logger.debug("Skill assessment skipped for %s: %s", model_path, exc)
+        return True
+    if not skilled:
+        logger.warning(
+            "%s %s DISABLED — insufficient skill (%s). Decisions fall "
+            "back to rules.",
+            label,
+            model_path.name,
+            reason,
+        )
+        return False
+    if status == "unmeasured":
+        logger.warning(
+            "%s %s running UNGATED — %s. Retrain to emit a skill metric.",
+            label,
+            model_path.name,
+            reason,
+        )
+    return True
+
+
 class EntryMLPolicy:
     """Load entry model once, predict on demand.
 
@@ -235,7 +274,10 @@ class EntryMLPolicy:
         proba_floor = None
         proba_ceiling = None
         calibration = None
-        model_health: dict | None = None
+        # Set True when the universal skill-gate fails — the model is
+        # then forced inert AFTER the config-override block below, so an
+        # optimizer proba sweep cannot resurrect an unskilled model.
+        _force_inert = False
         if meta_path.exists():
             meta = json.loads(meta_path.read_text())
             conf = meta.get("confidence_thresholds")
@@ -243,48 +285,49 @@ class EntryMLPolicy:
                 proba_floor = conf.get("floor")
                 proba_ceiling = conf.get("ceiling")
             calibration = meta.get("calibration")
-            # Codex 2026-04-28: read model_health from meta. If the
-            # training pipeline marked the model as degenerate /
-            # narrow_proba_spread / auc_regression, REFUSE ML override
-            # at runtime (we don't want to fire BUY/SKIP off a model
-            # that can't separate winners from losers). PULSE_
-            # ALLOW_DEGENERATE_MODEL=1 forces load anyway (unsafe).
-            model_health = meta.get("model_health") or None
-            if model_health is not None:
-                status = model_health.get("status", "ok")
-                # 2026-04-28 train.py update: ok_percentile_fallback is
-                # a healthy state — EV-search collapsed (typical on
-                # memecoin datasets where avg_pnl is skewed) but the
-                # model still ranks. Percentile-based gates work the
-                # same way for live decisions.
-                healthy = status in ("ok", "ok_percentile_fallback")
-                if not healthy:
-                    notes = model_health.get("notes") or []
+            # Universal skill-gate (model_registry.assess_skill) is the
+            # single judge — it folds in the model_health block AND the
+            # EV gate: a classifier's most-confident proba bucket must
+            # have ceiling_ev > 0. A model that ranks winners from losers
+            # (high AUC, model_health.status="ok") yet whose confident
+            # picks still lose money net of fees has NO skill at making a
+            # profitable buy — refuse to fire BUY/SKIP overrides off it.
+            # PULSE_ALLOW_DEGENERATE_MODEL=1 forces it on anyway (unsafe).
+            from pulse_bot.ml.model_registry import assess_skill
+
+            skilled, skill_status, skill_reason = assess_skill(meta)
+            if not skilled:
+                logger.warning(
+                    "EntryMLPolicy: skill-gate FAILED (%s) — %s",
+                    skill_status,
+                    skill_reason,
+                )
+                if os.environ.get("PULSE_ALLOW_DEGENERATE_MODEL", "0") != "1":
                     logger.warning(
-                        "EntryMLPolicy: model_health=%s — %s",
-                        status,
-                        "; ".join(notes) if notes else "(no notes)",
+                        "EntryMLPolicy: refusing to act — set "
+                        "PULSE_ALLOW_DEGENERATE_MODEL=1 to override "
+                        "(kill-switch for ML BUY/SKIP overrides; rules "
+                        "path is unaffected)."
                     )
-                    import os as _os_health
-                    if _os_health.environ.get(
-                        "PULSE_ALLOW_DEGENERATE_MODEL", "0"
-                    ) != "1":
-                        logger.warning(
-                            "EntryMLPolicy: refusing to act — set "
-                            "PULSE_ALLOW_DEGENERATE_MODEL=1 to override "
-                            "(this is a kill-switch for ML BUY/SKIP "
-                            "overrides; rules path is unaffected)."
-                        )
-                        # Force decide_with_confidence to return RULES
-                        # for everything: floor=0 means nothing falls
-                        # below, ceiling=1 means nothing clears above.
-                        proba_floor = 0.0
-                        proba_ceiling = 1.0
-                elif status == "ok_percentile_fallback":
-                    logger.info(
-                        "EntryMLPolicy: model healthy via percentile "
-                        "fallback (EV-search flat but ranking confirmed)."
-                    )
+                    _force_inert = True
+            elif skill_status == "ev_warning":
+                # Training-label EV is non-positive — but that metric
+                # comes from simulate_exit and can be wrong. Model stays
+                # ACTIVE; the warning is a prompt to verify against live
+                # realized PnL, not a kill-switch.
+                logger.warning(
+                    "EntryMLPolicy: %s — model stays ACTIVE (training-label "
+                    "EV is advisory only); watch live realized PnL to decide "
+                    "whether a retrain is warranted.",
+                    skill_reason,
+                )
+            elif (meta.get("model_health") or {}).get(
+                "status"
+            ) == "ok_percentile_fallback":
+                logger.info(
+                    "EntryMLPolicy: model passed skill-gate via percentile "
+                    "fallback (EV-search flat but ranking confirmed)."
+                )
         # 2026-04-24: config can override meta.json thresholds at startup
         # (optimizer uses this to sweep proba gating without retraining).
         # Precedence: config override > meta.json > hardcoded default.
@@ -316,6 +359,14 @@ class EntryMLPolicy:
                 proba_ceiling = cfg.entry_ml_proba_ceiling
         except Exception as exc:
             logger.debug("EntryMLPolicy config override skipped: %s", exc)
+        # Skill-gate kill-switch has the FINAL word — applied AFTER the
+        # config override so an optimizer proba sweep cannot resurrect a
+        # model that failed the skill-gate. floor=0 → nothing falls below,
+        # ceiling=1 → nothing clears above → decide_with_confidence
+        # returns RULES for every token.
+        if _force_inert:
+            proba_floor = 0.0
+            proba_ceiling = 1.0
         return cls(
             model,
             model_hash,
@@ -377,6 +428,11 @@ class EntryMLPolicy:
         )
 
         nz = sum(1 for v in vec if v != 0.0)
+        # Stash for decide_with_confidence so a downstream opt-in
+        # PULSE_ML_DEGENERATE_RULES_FALLBACK gate can refuse degenerate
+        # predictions without rebuilding the feature vector.
+        self._last_nz = nz
+        self._last_vec_len = len(vec)
         if nz < max(5, int(0.4 * len(vec))):
             logger.warning(
                 "predict_proba: only %d/%d features non-zero for %s "
@@ -518,6 +574,23 @@ class EntryMLPolicy:
             wallet_classifications=wallet_classifications,
         )
         s_cal = self._calibrate(s_raw)
+        # Opt-in degenerate-vector fallback. When >60% of the live
+        # feature vector resolves to literal 0.0, the prediction is
+        # outside the training distribution (HELIUS / time-aware groups
+        # often missing live; train rows had real values). Default off
+        # for safe rollback. Flip via PULSE_ML_DEGENERATE_RULES_FALLBACK=1.
+        import os as _os_deg
+
+        if _os_deg.environ.get("PULSE_ML_DEGENERATE_RULES_FALLBACK", "0") == "1":
+            nz = getattr(self, "_last_nz", None)
+            vlen = getattr(self, "_last_vec_len", None)
+            if nz is not None and vlen and nz < int(0.4 * vlen):
+                logger.info(
+                    "ML degenerate-vector fallback → RULES (nz=%d/%d)",
+                    nz,
+                    vlen,
+                )
+                return "RULES", s_raw, s_cal
         if s_raw >= self.proba_ceiling:
             action = "BUY"
         elif s_raw < self.proba_floor:
@@ -530,6 +603,7 @@ class EntryMLPolicy:
             # SKIP override (strict hybrid). Default off for safe
             # rollback; flip on in .env to activate.
             import os as _os_grey
+
             if _os_grey.environ.get("PULSE_ENTRY_GREY_TO_SKIP", "0") == "1":
                 action = "SKIP"
             else:
@@ -799,12 +873,15 @@ def load_entry_t30_policy_if_available(
         logger.info("No entry T30 model at %s — T+30 advisory disabled.", p)
         return None
     try:
-        return EntryT30Policy.from_path(
+        policy = EntryT30Policy.from_path(
             p, buy_ceiling=buy_ceiling, skip_floor=skip_floor
         )
     except Exception as e:
         logger.exception("Failed to load entry T30 model: %s", e)
         return None
+    if not _skill_gate(p, "Entry T30 model"):
+        return None
+    return policy
 
 
 class ExitMLPolicy:
@@ -1028,10 +1105,13 @@ def load_exit_quantile_if_available(
         logger.info("No quantile model at %s — dynamic SL override disabled.", p)
         return None
     try:
-        return ExitQuantilePolicy.from_path(p)
+        policy = ExitQuantilePolicy.from_path(p)
     except Exception as e:
         logger.exception("Failed to load quantile model %s: %s", p, e)
         return None
+    if not _skill_gate(p, "Quantile model"):
+        return None
+    return policy
 
 
 def get_active_policy_name() -> str:

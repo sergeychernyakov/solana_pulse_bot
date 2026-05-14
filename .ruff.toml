@@ -1,5 +1,6 @@
 line-length = 120
-exclude = ["tmp", "media"]
+# yellowstone_proto/ is protoc-generated — never hand-edited, never linted.
+exclude = ["tmp", "media", "pulse_bot/launchpads/yellowstone_proto"]
 
 [lint]
 per-file-ignores = { "tests/**/*" = ["F401", "E402", "F841"] }

@@ -303,6 +303,7 @@ def train_survival_model(
     Returns a metrics dict (rows, positive rate, feature list).
     """
     import shutil
+
     import xgboost as xgb  # lazy: only available in .venv
 
     if "died_in_bucket" not in df.columns:
@@ -334,6 +335,18 @@ def train_survival_model(
     )
     model.fit(x, y)
 
+    # In-sample hazard discrimination — can the model rank death-buckets
+    # above survive-buckets? In-sample (optimistic), but a low value is
+    # damning: a hazard model that cannot separate even its own training
+    # data has no skill. Feeds the universal skill gate (task #96).
+    hazard_auc: float | None = None
+    try:
+        from sklearn.metrics import roc_auc_score
+
+        hazard_auc = float(roc_auc_score(y, model.predict_proba(x)[:, 1]))
+    except Exception as e:  # noqa: BLE001 — metric is best-effort
+        logger.warning("Survival hazard AUC could not be computed: %s", e)
+
     meta_out = model_out.with_suffix(".meta.json")
     # Snapshot existing model to .prev before overwrite — symmetric with
     # _save_with_health_check used by entry training. Lets ops roll back via:
@@ -341,9 +354,7 @@ def train_survival_model(
     #   cp survival_model.meta.json.prev survival_model.meta.json
     if model_out.exists():
         try:
-            shutil.copy2(
-                model_out, model_out.with_suffix(model_out.suffix + ".prev")
-            )
+            shutil.copy2(model_out, model_out.with_suffix(model_out.suffix + ".prev"))
             if meta_out.exists():
                 shutil.copy2(
                     meta_out,
@@ -368,6 +379,7 @@ def train_survival_model(
         "learning_rate": learning_rate,
         "reg_lambda": reg_lambda,
         "reg_alpha": reg_alpha,
+        "hazard_auc": hazard_auc,
     }
 
     # ── Sanity test — predictions must vary across tokens ────────────
@@ -418,6 +430,14 @@ def train_survival_model(
             logger.warning("Survival sanity test crashed: %s", e)
     meta["sanity_status"] = sanity_status
     meta["sanity_distinct_remaining"] = sanity_distinct
+
+    # Universal skill gate (task #96): emit an authoritative model_health
+    # block from the degeneracy sanity test + in-sample hazard AUC.
+    from pulse_bot.ml.model_registry import assess_skill as _assess_skill
+
+    _sk, _st, _rs = _assess_skill(meta)
+    meta["model_health"] = {"status": _st, "skilled": _sk, "reason": _rs}
+    logger.info("survival model_health: %s — %s", _st, _rs)
 
     meta_out.write_text(json.dumps(meta, indent=2))
     logger.info(

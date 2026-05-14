@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -110,6 +111,62 @@ class Pipeline:
             wash_cluster_size_min=_wash_min,
             wash_cluster_size_max=_wash_max,
         )
+        # ── Multi-config A/B framework (2026-05-13) ──────────────────
+        # Load the EntryConfig registry; build one DecisionService per
+        # config. Every scored token is evaluated through ALL configs in
+        # parallel and each config's BUY decisions open paper_trades
+        # tagged with config_id. The "live" config additionally drives
+        # legacy single-config code paths (logging, resume, counters).
+        #
+        # Fails open: if the YAML is missing/broken, fall back to
+        # single-config mode (only the env-driven ``self._decision``).
+        self._config_registry = None
+        self._decisions_by_config: dict[str, DecisionService] = {}
+        try:
+            from pulse_bot.entry_configs import (
+                load_registry_from_yaml,
+                upsert_registry_to_db,
+            )
+
+            self._config_registry = load_registry_from_yaml()
+            upsert_registry_to_db(self._config_registry, db)
+            for _cfg in self._config_registry.configs:
+                self._decisions_by_config[_cfg.config_id] = (
+                    DecisionService.from_entry_config(db, _cfg)
+                )
+            # Re-point the legacy single-config handle at the LIVE config
+            # so existing code keeps making the production decision.
+            self._decision = self._decisions_by_config[
+                self._config_registry.live_config_id
+            ]
+            logger.info(
+                "Multi-config A/B active: %d configs (live=%s)",
+                len(self._config_registry.configs),
+                self._config_registry.live_config_id,
+            )
+        except Exception as _mc_exc:
+            logger.warning(
+                "Multi-config registry load failed (%s) — single-config mode",
+                _mc_exc,
+                exc_info=True,
+            )
+            self._config_registry = None
+            self._decisions_by_config = {}
+        # Real on-chain simulation gate for paper trades. When the
+        # config flag is set, every paper trade entry is preflighted
+        # via simulateTransaction; failed sims (auth/graduation/etc.)
+        # SKIP cleanly instead of contaminating the dataset with
+        # phantom fills. Disabled by default — bootstrap returns a
+        # no-op stub if PULSE_PAPER_USE_REAL_SIM is not "1".
+        from pulse_bot.services.sim_executor import SimExecutor
+
+        self._sim_executor = SimExecutor.bootstrap()
+        if config.paper_use_real_sim and not self._sim_executor.enabled:
+            logger.warning(
+                "paper_use_real_sim=True in config but SimExecutor failed "
+                "to bootstrap (env keys missing?) — falling back to "
+                "math-based paper trades."
+            )
         # Holder-snapshot capture tasks (non-blocking). Bounded via
         # ``_holder_sem`` (50 concurrent fetches max) to prevent
         # unbounded growth when many tokens are awaiting their T+30
@@ -138,10 +195,22 @@ class Pipeline:
         self._shadow_tasks: set[asyncio.Task] = set()
         # Atomic slot reservation: _count_open_trades() reads from DB as the
         # source of truth on startup (_resume_open_trades seeds this), but at
-        # runtime we reserve slots synchronously in _open_slots so concurrent
-        # _handle_token coroutines cannot all pass the cap guard before the
-        # first one persists its INSERT (portfolio_max_positions race).
-        self._open_slots: int = 0
+        # runtime we reserve slots synchronously so concurrent _handle_token
+        # coroutines cannot all pass the cap guard before the first one
+        # persists its INSERT (portfolio_max_positions race).
+        #
+        # 2026-05-13 multi-config: slots are tracked PER config_id so each
+        # parallel paper portfolio gets its own portfolio_max_positions
+        # budget. ``_open_slots`` stays as a property aliasing the LIVE
+        # config's count for legacy callers (resume / dashboards).
+        self._open_slots_by_config: dict[str, int] = {}
+        _cfg_ids = (
+            [c.config_id for c in self._config_registry.configs]
+            if self._config_registry is not None
+            else ["LIVE"]
+        )
+        for _cid in _cfg_ids:
+            self._open_slots_by_config[_cid] = 0
         # ML entry policy: loads entry model once at start, None if the
         # model file is missing (fresh clone before weekly_retrain).
         #
@@ -157,7 +226,8 @@ class Pipeline:
         # Logs full status of every artifact (existence, schema_version,
         # AUC, health) so operators see the model ensemble at startup.
         from pulse_bot.ml.model_registry import ModelRegistry
-        from pulse_bot.observability import metrics as _obs, start_http_server
+        from pulse_bot.observability import metrics as _obs
+        from pulse_bot.observability import start_http_server
 
         self._model_registry = ModelRegistry()
         self._model_registry.log_boot_summary()
@@ -166,15 +236,14 @@ class Pipeline:
         # weeks before the 2026-05-01 cleanup pass found it).
         try:
             from pulse_bot.filter_health import log_filter_health_summary
+
             log_filter_health_summary()
         except Exception as exc:  # nosec B110
             # Reason: best-effort observability; never block startup.
             logger.debug("filter_health summary skipped: %s", exc)
         # Sync model_health gauge so /metrics shows current state.
         for _spec in self._model_registry.list_all():
-            _obs.model_health.set(
-                1 if _spec.healthy else 0, name=_spec.name
-            )
+            _obs.model_health.set(1 if _spec.healthy else 0, name=_spec.name)
         # 2026-04-28 (architecture phase H): expose Prometheus
         # exposition-format /metrics endpoint. Tunable via
         # PULSE_METRICS_PORT (default 9100, set 0 to disable).
@@ -208,17 +277,67 @@ class Pipeline:
         # — current rho ≈ 0.146 is too weak to reject BUYs; informative
         # only. Will become a kill-gate once retrained on better labels.
         self._ml_entry_reg_policy: "EntryMLPolicy | None" = None
+        # 2026-05-13 multi-config: configs may point at different reg
+        # models (e.g. ROLLBACK uses yesterday's .bak). Load EVERY
+        # distinct reg_model_path the registry references, keyed by the
+        # relative path string. ``_ml_entry_reg_policy`` stays as the
+        # default (entry_model_reg.ubj) handle for legacy code.
+        self._reg_policies_by_path: dict[str, "EntryMLPolicy"] = {}
         try:
-            from pulse_bot.ml.policy._main import EntryMLPolicy as _EntryMLPolicy
             from pathlib import Path as _Path
-            _reg_path = _Path("data/ml/entry_model_reg.ubj")
-            if _reg_path.exists() and self._ml_entry_policy is not None:
-                self._ml_entry_reg_policy = _EntryMLPolicy.from_path(_reg_path)
-                logger.info(
-                    "Entry regression head loaded: model_hash=%s "
-                    "(predicted_pnl%% feeds entry_score on ml_override)",
-                    self._ml_entry_reg_policy.model_hash[:16],
-                )
+
+            from pulse_bot.ml.policy._main import EntryMLPolicy as _EntryMLPolicy
+
+            _reg_paths = {"entry_model_reg.ubj"}
+            if self._config_registry is not None:
+                _reg_paths |= self._config_registry.all_reg_model_paths()
+            from pulse_bot.ml.model_registry import assess_skill as _assess_skill
+
+            if self._ml_entry_policy is not None:
+                for _rp in sorted(_reg_paths):
+                    _full = _Path("data/ml") / _rp
+                    if not _full.exists():
+                        logger.warning(
+                            "Entry reg model %s not found — configs using it "
+                            "will fall back to default reg model.",
+                            _rp,
+                        )
+                        continue
+                    # Universal skill gate (2026-05-14): a reg head with
+                    # no demonstrated rank/sign skill must not gate
+                    # trades. Skip loading it — configs pointing at it
+                    # then see reg_pnl_pct=None, so reg-floor/ceiling is
+                    # bypassed and the (skilled) classifier decides alone.
+                    try:
+                        _meta = json.loads(_full.with_suffix(".meta.json").read_text())
+                        _skilled, _status, _reason = _assess_skill(_meta)
+                    except Exception:  # noqa: BLE001 — never block load
+                        _skilled, _status, _reason = (
+                            True,
+                            "unmeasured",
+                            "meta unreadable",
+                        )
+                    if not _skilled:
+                        logger.warning(
+                            "Entry reg model %s DISABLED — insufficient "
+                            "skill (%s). Configs using it fall back to "
+                            "classifier-only entry (no reg-floor/ceiling "
+                            "gate).",
+                            _rp,
+                            _reason,
+                        )
+                        continue
+                    _pol = _EntryMLPolicy.from_path(_full)
+                    self._reg_policies_by_path[_rp] = _pol
+                    logger.info(
+                        "Entry regression head loaded: %s model_hash=%s " "(skill: %s)",
+                        _rp,
+                        _pol.model_hash[:16],
+                        _reason,
+                    )
+            self._ml_entry_reg_policy = self._reg_policies_by_path.get(
+                "entry_model_reg.ubj"
+            )
         except Exception as exc:
             logger.warning(
                 "Entry regression head load failed (%s) — falling back "
@@ -226,6 +345,7 @@ class Pipeline:
                 exc,
             )
             self._ml_entry_reg_policy = None
+            self._reg_policies_by_path = {}
         # Exit ML status log — confirms at boot whether the exit advisor
         # is loaded and whether it can actively escalate rule-based holds.
         from pulse_bot.ml.policy import load_exit_policy_if_available
@@ -381,6 +501,26 @@ class Pipeline:
                     default_path,
                     TIMING_SCHEMA_VERSION,
                 )
+
+    @property
+    def _live_config_id(self) -> str:
+        """The config_id whose decisions drive legacy single-config paths."""
+        if self._config_registry is not None:
+            return self._config_registry.live_config_id
+        return "LIVE"
+
+    @property
+    def _open_slots(self) -> int:
+        """Legacy alias — open-slot count for the LIVE config.
+
+        Resume logic, dashboards and the portfolio-cap guard read this.
+        Multi-config slot accounting lives in ``_open_slots_by_config``.
+        """
+        return self._open_slots_by_config.get(self._live_config_id, 0)
+
+    @_open_slots.setter
+    def _open_slots(self, value: int) -> None:
+        self._open_slots_by_config[self._live_config_id] = int(value)
 
     async def run(self) -> None:
         """Main entry point. Connect to WS and process tokens until interrupted."""
@@ -630,7 +770,7 @@ class Pipeline:
             """SELECT p.id, p.mint, p.symbol, p.entry_price, p.entry_time,
                       p.entry_mcap_sol, p.entry_buyer_number, p.entry_type,
                       p.entry_score, p.buy_amount_sol, p.price_updated_at,
-                      t.creator, t.created_at
+                      p.config_id, t.creator, t.created_at
                FROM paper_trades p
                LEFT JOIN tokens t ON t.mint = p.mint
                WHERE p.status='open'"""
@@ -640,9 +780,14 @@ class Pipeline:
             return
 
         logger.info("Resuming %d open trades from previous run", len(open_trades))
-        # Seed the in-memory slot counter so the cap enforces correctly on
-        # resume. _paper_trade's finally-block will decrement as each closes.
-        self._open_slots += len(open_trades)
+        # Seed per-config slot counters so each config's cap enforces
+        # correctly on resume. _paper_trade's finally-block decrements
+        # the matching config bucket as each position closes.
+        for _t in open_trades:
+            _cid = _t.get("config_id") or "LIVE"
+            self._open_slots_by_config[_cid] = (
+                self._open_slots_by_config.get(_cid, 0) + 1
+            )
 
         for t in open_trades:
             token = Token(
@@ -674,6 +819,7 @@ class Pipeline:
                     resume_entry_ts,
                     resume_trade_id=t["id"],
                     resume_last_event_ts=resume_last_event_ts,
+                    config_id=t.get("config_id") or "LIVE",
                 )
             )
 
@@ -921,7 +1067,8 @@ class Pipeline:
                         wallet_prior_stats=wallet_prior_stats,
                         top3_buyer_wallets=top3_wallets,
                         cutoff_ts=scoring_cutoff_ts,
-                        n_buyers_first_5s=n_snipers_first_5s, wallet_classifications=wallet_cls,
+                        n_buyers_first_5s=n_snipers_first_5s,
+                        wallet_classifications=wallet_cls,
                     )
                     feat_json = self._ml_entry_policy.dump_features_json(
                         result,
@@ -930,7 +1077,8 @@ class Pipeline:
                         wallet_prior_stats=wallet_prior_stats,
                         top3_buyer_wallets=top3_wallets,
                         cutoff_ts=scoring_cutoff_ts,
-                        n_buyers_first_5s=n_snipers_first_5s, wallet_classifications=wallet_cls,
+                        n_buyers_first_5s=n_snipers_first_5s,
+                        wallet_classifications=wallet_cls,
                     )
                     await self._db.save_ml_prediction(
                         mint=token.mint,
@@ -1023,6 +1171,16 @@ class Pipeline:
             # 2026-04-28 (architecture phase B step 1): bot-cluster
             # pre-filter delegated to DecisionService. Same semantics
             # as before but tested in isolation.
+            #
+            # 2026-05-13 multi-config: the creator-blacklist / bot-cluster
+            # / wash-cluster filters are config-PARAMETERISED but all
+            # currently-loaded configs use identical thresholds, AND each
+            # filter is a DB round-trip. So we run them ONCE through the
+            # LIVE config's DecisionService and treat the post-filter
+            # ``_decision`` as the shared base for every config. The ONLY
+            # place configs diverge today is ``apply_ml_override``
+            # (reg_floor + which reg model). If a future config varies a
+            # cluster threshold this must move inside the per-config loop.
             from pulse_bot.decision_service import EntryDecision as _ED
 
             _decision = _ED(
@@ -1040,10 +1198,8 @@ class Pipeline:
             _decision = await self._decision.filter_wash_cluster(
                 token, all_trades, _decision, mint_short
             )
-            should_enter = _decision.should_enter
-            entry_type = _decision.entry_type
-            entry_score = _decision.entry_score
-            entry_buyer_num = _decision.entry_buyer_num
+            # Shared post-filter base — every config branches from here.
+            _decision_base = _decision
 
             # ── ML confidence-gating (hybrid mode) ────────────────
             # In hybrid mode ML has authority over entry when it is
@@ -1056,6 +1212,10 @@ class Pipeline:
             # Every override logs at WARN so regressions stay visible.
             ml_action = "N/A"
             ml_proba = None
+            # reg_pnl_by_model maps reg_model_path → predicted PnL%. We
+            # score every distinct reg model the registry references so
+            # each config's apply_ml_override sees the right number.
+            reg_pnl_by_model: dict[str, float | None] = {}
             if self._policy_mode == "hybrid" and self._ml_entry_policy is not None:
                 try:
                     ml_action, ml_proba, ml_cal = (
@@ -1066,20 +1226,17 @@ class Pipeline:
                             wallet_prior_stats=wallet_prior_stats,
                             top3_buyer_wallets=top3_wallets,
                             cutoff_ts=scoring_cutoff_ts,
-                            n_buyers_first_5s=n_snipers_first_5s, wallet_classifications=wallet_cls,
+                            n_buyers_first_5s=n_snipers_first_5s,
+                            wallet_classifications=wallet_cls,
                         )
                     )
                     # Codex Q4 #1 — regression head ranking (2026-04-28).
-                    # Compute predicted PnL% from the parallel reg model.
-                    # Used by DecisionService.apply_ml_override to set a
-                    # meaningful entry_score (live PnL forecast) instead
-                    # of the binary-proba heuristic. Best-effort: a missing
-                    # or failing reg model leaves reg_pnl=None and we fall
-                    # back to the legacy int(ml_cal*100) score.
-                    reg_pnl: float | None = None
-                    if self._ml_entry_reg_policy is not None:
+                    # 2026-05-13: score EVERY distinct reg model so
+                    # configs pointing at different models (e.g. ROLLBACK
+                    # → yesterday's .bak) get their own forecast.
+                    for _rp, _reg_pol in (self._reg_policies_by_path or {}).items():
                         try:
-                            reg_pnl = self._ml_entry_reg_policy.predict_score(
+                            reg_pnl_by_model[_rp] = _reg_pol.predict_score(
                                 result,
                                 holder_snapshot=holder_snapshot_all or None,
                                 creator_snapshot=creator_snapshot,
@@ -1091,31 +1248,12 @@ class Pipeline:
                             )
                         except Exception as _reg_exc:
                             logger.debug(
-                                "Entry reg predict_score failed for %s: %s",
-                                mint_short, _reg_exc,
+                                "Entry reg predict_score (%s) failed for %s: %s",
+                                _rp,
+                                mint_short,
+                                _reg_exc,
                             )
-                            reg_pnl = None
-                    # 2026-04-28 (architecture phase B step 1): ML override
-                    # delegated to DecisionService. Pure function — easy
-                    # to unit-test without spinning up Pipeline.
-                    _decision = _ED(
-                        should_enter=should_enter,
-                        entry_type=entry_type,
-                        entry_score=entry_score,
-                        entry_buyer_num=entry_buyer_num,
-                    )
-                    _decision = self._decision.apply_ml_override(
-                        _decision, ml_action, ml_proba, ml_cal,
-                        result, mint_short, reg_pnl_pct=reg_pnl,
-                    )
-                    should_enter = _decision.should_enter
-                    entry_type = _decision.entry_type
-                    entry_score = _decision.entry_score
-                    entry_buyer_num = _decision.entry_buyer_num
-                    # Mirror counters into legacy attributes for parity
-                    # with existing /metrics paths.
-                    self._ml_overrides_buy = self._decision.ml_overrides_buy
-                    self._ml_overrides_skip = self._decision.ml_overrides_skip
+                            reg_pnl_by_model[_rp] = None
                 except Exception as e:
                     # A broken ML policy must not silently sink live
                     # trading — loud WARN + fall back to rules.
@@ -1127,87 +1265,201 @@ class Pipeline:
                         e,
                         exc_info=True,
                     )
+                    ml_action = "N/A"
 
-            # 2026-04-28 (architecture phase B step 1): checkpoint
-            # override delegated to DecisionService — same logic but
-            # tested in isolation, no clobbering of metadata.
-            _decision = _ED(
-                should_enter=should_enter,
-                entry_type=entry_type,
-                entry_score=entry_score,
-                entry_buyer_num=entry_buyer_num,
-            )
-            _decision = self._decision.apply_checkpoint_override(
-                _decision,
+            # ── Per-config decision fan-out (2026-05-13) ──────────
+            # For every loaded config, branch from the shared post-filter
+            # base, apply that config's ml_override (its reg_floor + reg
+            # model) then the config-independent checkpoint override.
+            # ``per_config_decision`` is consumed by the slot/spawn loop
+            # below. The LIVE config's result also drives the legacy
+            # scalar variables so existing logging/state stays intact.
+            cp_kwargs = dict(
                 cp_verdict=checkpoint_state.get("verdict"),
                 cp_proba=checkpoint_state.get("proba"),
                 cp_source=checkpoint_state.get("source", "checkpoint"),
                 all_trades=all_trades,
                 mint_short=mint_short,
             )
-            should_enter = _decision.should_enter
-            entry_type = _decision.entry_type
-            entry_score = _decision.entry_score
-            entry_buyer_num = _decision.entry_buyer_num
+            if self._decisions_by_config:
+                _eval_services = self._decisions_by_config
+            else:
+                _eval_services = {self._live_config_id: self._decision}
+            per_config_decision: dict[str, _ED] = {}
+            for _cid, _ds in _eval_services.items():
+                _d = _decision_base
+                if (
+                    self._policy_mode == "hybrid"
+                    and self._ml_entry_policy is not None
+                    and ml_action != "N/A"
+                ):
+                    _cfg = (
+                        self._config_registry.by_id(_cid)
+                        if self._config_registry is not None
+                        else None
+                    )
+                    _model_path = (
+                        _cfg.reg_model_path
+                        if _cfg is not None
+                        else "entry_model_reg.ubj"
+                    )
+                    # Explicit None default (not ``reg_pnl``): a config
+                    # whose reg model was disabled/missing must get
+                    # reg_pnl_pct=None so apply_ml_override bypasses the
+                    # reg-floor/ceiling gate — NOT silently substitute
+                    # the default model's forecast.
+                    _reg_pnl_cfg = reg_pnl_by_model.get(_model_path)
+                    _d = _ds.apply_ml_override(
+                        _d,
+                        ml_action,
+                        ml_proba,
+                        ml_cal,
+                        result,
+                        mint_short,
+                        reg_pnl_pct=_reg_pnl_cfg,
+                    )
+                _d = _ds.apply_checkpoint_override(_d, **cp_kwargs)
+                per_config_decision[_cid] = _d
 
-            # Reserve a portfolio slot atomically before scheduling the paper
-            # trade. asyncio is single-threaded, so the check+increment below
-            # is race-free against other _handle_token coroutines — unlike a
-            # DB-only count that they could all read before any INSERT lands.
-            reserved = False
-            # Collector mode: score every token for diagnostics but never
-            # open paper trades — used to accumulate signal data (48-72h
-            # target) without contaminating paper_trades during config tuning.
+            # LIVE config drives legacy scalars + counters.
+            _live_decision = per_config_decision.get(
+                self._live_config_id,
+                _decision_base,
+            )
+            should_enter = _live_decision.should_enter
+            entry_type = _live_decision.entry_type
+            entry_score = _live_decision.entry_score
+            entry_buyer_num = _live_decision.entry_buyer_num
+            self._ml_overrides_buy = self._decision.ml_overrides_buy
+            self._ml_overrides_skip = self._decision.ml_overrides_skip
+
+            # ── Quality gates (config-independent) ────────────────
+            # collector mode, exit_price<=0, and the real-sim gate
+            # apply uniformly: if any of them trip, NO config enters
+            # this token. Computed once, then the per-config slot loop
+            # below only has to check that config's own slot budget.
+            gate_skip_all = False
+            # Collector mode: score every token for diagnostics but
+            # never open paper trades.
             if self._config.collector_only:
-                should_enter = False
+                gate_skip_all = True
             # 2026-04-28: gate on entry_price > 0. ML override path was
             # entering with result.exit_price=0 (token had no observable
-            # trades during scoring window) — produced ~13 of the first
-            # 22 ml_override entries with pnl=+0.0% phantom positions
-            # that never had a real entry price. Skip cleanly.
-            if should_enter and (result.exit_price or 0.0) <= 0.0:
-                logger.warning(
-                    "ML/rules said BUY but exit_price=%.0f for %s — skipping "
-                    "(no observable price; ML override quality gate).",
-                    result.exit_price or 0.0,
-                    mint_short,
-                )
-                should_enter = False
-            if should_enter and self._open_slots < self._config.portfolio_max_positions:
-                self._open_slots += 1
-                reserved = True
+            # trades during the scoring window) — phantom positions that
+            # never had a real entry price. Skip cleanly.
+            _any_wants_entry = any(d.should_enter for d in per_config_decision.values())
+            if (result.exit_price or 0.0) <= 0.0:
+                if _any_wants_entry:
+                    logger.warning(
+                        "ML/rules said BUY but exit_price=%.0f for %s — skipping "
+                        "(no observable price; ML override quality gate).",
+                        result.exit_price or 0.0,
+                        mint_short,
+                    )
+                gate_skip_all = True
+            # Real on-chain simulation gate. Runs ONCE — the simulation
+            # depends only on the mint + buy size, not on which entry
+            # config chose to enter. Result applies to every config.
+            sim_meta: dict | None = None
+            if (
+                not gate_skip_all
+                and _any_wants_entry
+                and self._config.paper_use_real_sim
+                and self._sim_executor.enabled
+            ):
+                # Match dynamic sizing: sim with the SAME size the
+                # supervisor will use at open (read from realized balance).
+                from pulse_bot.config import compute_buy_amount_sol as _cba
 
-            if reserved:
-                # Entry timestamp lives in the SAME clock as the trade stream
-                # so ExitManager.elapsed = trade.timestamp − entry_ts is not
-                # skewed by provider latency or wall-clock drift. We prefer
-                # the last observed scoring trade; fall back to end-of-window
-                # (replay) or wall-clock (live with zero activity).
-                if all_trades:
-                    entry_ts = all_trades[-1].timestamp
-                elif self._launchpad.name == "replay":
-                    entry_ts = token.created_at + self._config.observe_seconds
-                else:
-                    entry_ts = time.time()
-                # TODO(cross-model entry signal): entry_ml_proba was
-                # threaded into _paper_trade here in exit_v2. Removed
-                # with exit_v3 — restore alongside the feature (see
-                # task #123) using the grey-zone/RULES + |pred|<3% gate.
+                realized_for_sim = self._db.get_realized_balance_sync(
+                    self._config.portfolio_initial_sol,
+                )
+                buy_amount_for_sim = _cba(self._config, realized_for_sim)
+                sol_amount_lamports = int(buy_amount_for_sim * 1e9)
+                sim_res = await self._sim_executor.simulate_entry(
+                    token.mint, sol_amount_lamports
+                )
+                sim_meta = {
+                    "entry": {
+                        "success": sim_res.success,
+                        "expected_tokens_raw": sim_res.expected_tokens_raw,
+                        "sol_in_lamports": sim_res.sol_in_lamports,
+                        "slippage_bps_cap": sim_res.slippage_bps_cap,
+                        "units_consumed": sim_res.units_consumed,
+                        "err": str(sim_res.err) if sim_res.err is not None else None,
+                    }
+                }
+                if not sim_res.success:
+                    if self._config.paper_sim_gate:
+                        logger.info(
+                            "REAL_SIM SKIP entry %s: err=%s",
+                            mint_short,
+                            sim_res.err,
+                        )
+                        gate_skip_all = True
+                    else:
+                        logger.info(
+                            "REAL_SIM SHADOW would-skip %s: err=%s "
+                            "(gate=False, opening paper trade anyway)",
+                            mint_short,
+                            sim_res.err,
+                        )
+
+            # Entry timestamp lives in the SAME clock as the trade stream
+            # so ExitManager.elapsed = trade.timestamp − entry_ts is not
+            # skewed by provider latency or wall-clock drift.
+            if all_trades:
+                entry_ts = all_trades[-1].timestamp
+            elif self._launchpad.name == "replay":
+                entry_ts = token.created_at + self._config.observe_seconds
+            else:
+                entry_ts = time.time()
+
+            # ── Per-config slot reservation + spawn ───────────────
+            # Each config gets its own portfolio_max_positions budget.
+            # asyncio is single-threaded so the per-config check+increment
+            # is race-free against other _handle_token coroutines.
+            # Entry-sim token count — fed to the supervisor's close path
+            # for the bonding-curve sell estimate (sim_metadata.exit).
+            _sim_entry_tokens: int | None = None
+            if sim_meta is not None:
+                _e = sim_meta.get("entry") or {}
+                if _e.get("success"):
+                    _sim_entry_tokens = _e.get("expected_tokens_raw") or None
+            any_reserved = False
+            for _cid, _cdec in per_config_decision.items():
+                if gate_skip_all or not _cdec.should_enter:
+                    continue
+                _cur = self._open_slots_by_config.get(_cid, 0)
+                if _cur >= self._config.portfolio_max_positions:
+                    continue
+                self._open_slots_by_config[_cid] = _cur + 1
+                any_reserved = True
                 asyncio.create_task(
                     self._paper_trade(
                         token,
                         result.exit_price,
                         result.market_cap_sol,
-                        entry_buyer_num,
-                        entry_type,
-                        entry_score,
+                        _cdec.entry_buyer_num,
+                        _cdec.entry_type,
+                        _cdec.entry_score,
                         entry_ts,
+                        config_id=_cid,
+                        sim_entry_tokens_raw=_sim_entry_tokens,
                     )
                 )
+
+            if any_reserved:
+                # Stash real-sim metadata on the freshly-opened LIVE
+                # paper_trade row. The sim is per-mint so attaching it
+                # to one row (LIVE) is enough for dashboards comparing
+                # math vs real fills. Background task — non-blocking.
+                if sim_meta is not None:
+                    asyncio.create_task(self._attach_sim_metadata(token.mint, sim_meta))
             else:
-                # SKIP/RULES path: optionally keep collecting trades post-
-                # scoring so ML label/sweep pipelines see >observe_seconds
-                # of activity. Background task; does not delay decisions.
+                # SKIP/RULES path (no config entered): optionally keep
+                # collecting trades post-scoring so ML label/sweep
+                # pipelines see >observe_seconds of activity.
                 extra = float(self._config.pulse_extended_observe_seconds)
                 if extra > 0 and not is_replay:
                     asyncio.create_task(self._extended_observation(token.mint, extra))
@@ -1292,6 +1544,7 @@ class Pipeline:
             # Then build the decision input by event-time filter, not
             # by arrival time. Tunable via PULSE_CHECKPOINT_LAG_BUFFER.
             import os as _os_lag
+
             LAG_BUFFER_SEC = float(
                 _os_lag.environ.get("PULSE_CHECKPOINT_LAG_BUFFER", "0.5")
             )
@@ -1342,7 +1595,8 @@ class Pipeline:
                     # build_dataset_t30 sees in training (`WHERE timestamp
                     # <= scored_at`).
                     visible_t30 = [
-                        t for t in collected
+                        t
+                        for t in collected
                         if (float(t.timestamp) - float(token.created_at)) <= target_age
                     ]
                     verdict = await self._evaluate_t30_checkpoint(
@@ -1386,6 +1640,7 @@ class Pipeline:
                         # tokens. Test set skip_wr at proba<0.15 = 0.05% so
                         # missed-winner cost is negligible.
                         import os as _os_t30
+
                         t30_skip_tail = float(
                             _os_t30.environ.get("PULSE_T30_SKIP_TAIL", "0.005")
                         )
@@ -1426,7 +1681,8 @@ class Pipeline:
                     # snapshots in build_for_token are built with the
                     # exact same `t.timestamp <= snapshot_t` semantics.
                     visible_timing = [
-                        t for t in collected
+                        t
+                        for t in collected
                         if (float(t.timestamp) - float(token.created_at)) <= target_age
                     ]
                     verdict = self._evaluate_timing_checkpoint(
@@ -1446,8 +1702,11 @@ class Pipeline:
                         # symbol only exists if the t30 block ran above, but
                         # timing can be called without t30 being active.
                         import os as _os_timing
+
                         timing_gate = float(
-                            _os_timing.environ.get("PULSE_TIMING_CONFIDENCE_GATE", "0.85")
+                            _os_timing.environ.get(
+                                "PULSE_TIMING_CONFIDENCE_GATE", "0.85"
+                            )
                         )
                         # Timing is a 3-class softmax — `proba` is the
                         # CONFIDENCE in the chosen class. Same gate for
@@ -1567,7 +1826,8 @@ class Pipeline:
                 hydration = FeatureHydrationService(
                     db=self._db,
                     holder_fetcher=getattr(
-                        self, "_fetch_holder_snapshot_all",
+                        self,
+                        "_fetch_holder_snapshot_all",
                         lambda mint: None,
                     ),
                 )
@@ -1661,37 +1921,79 @@ class Pipeline:
             age = int(r.get("capture_at_age_sec") or 0)
             by_age[age] = r
 
+        # 2026-05-12 train/serve parity (codex review): pre-fix this fn
+        # returned literal 0.0 for every age that wasn't captured. Training
+        # paths (build_dataset.py) leave those columns as NaN — pandas /
+        # XGBoost natively understand missing-value semantics and the
+        # model learned its default-direction routing on the NaN path. By
+        # serving 0.0 we were forcing the model to interpret "captures
+        # missing" as "holder concentration == 0 %", which is nonsense.
+        # Now: emit NaN for every per-age value that the DB lacks. The
+        # T+120 extrapolation still fires when (T+30, T+60) are both
+        # present; otherwise its result is NaN through propagation, which
+        # is the honest answer.
+        import math
+
+        _NAN = float("nan")
         out: dict[str, float] = {}
-        # T+30 + T+60 are real captures (capture rate ~100% by scoring time).
+
+        def _f(row: dict | None, key: str) -> float:
+            if row is None:
+                return _NAN
+            v = row.get(key)
+            if v is None:
+                return _NAN
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return _NAN
+            return f
+
         for age in (30, 60):
             r = by_age.get(age)
-            out[f"top1_{age}"] = float((r or {}).get("top1_pct") or 0.0)
-            out[f"top5_{age}"] = float((r or {}).get("top5_pct") or 0.0)
-            out[f"top10_{age}"] = float((r or {}).get("top10_pct") or 0.0)
-            out[f"hc_{age}"] = float((r or {}).get("holder_count") or 0.0)
+            out[f"top1_{age}"] = _f(r, "top1_pct")
+            out[f"top5_{age}"] = _f(r, "top5_pct")
+            out[f"top10_{age}"] = _f(r, "top10_pct")
+            out[f"hc_{age}"] = _f(r, "holder_count")
 
-        # T+120 — prefer real capture; fall back to linear extrapolation
-        # from (T+30, T+60). Pump.fun bonding-curve concentration tends to
-        # be monotonic over 30-120s windows, so linear extension off the
-        # observed slope is a defensible proxy. ``f(120) ≈ f(60) + (f(60)
-        # - f(30)) * (60/30) = 2*f(60) - f(30)``. Holder count uses the
-        # same formula but is clamped to >= max(hc_60, hc_30) since
-        # holders only ever grow on a freshly launched mint.
         r120 = by_age.get(120)
         if r120 is not None:
-            out["top1_120"] = float(r120.get("top1_pct") or 0.0)
-            out["top5_120"] = float(r120.get("top5_pct") or 0.0)
-            out["top10_120"] = float(r120.get("top10_pct") or 0.0)
-            out["hc_120"] = float(r120.get("holder_count") or 0.0)
+            out["top1_120"] = _f(r120, "top1_pct")
+            out["top5_120"] = _f(r120, "top5_pct")
+            out["top10_120"] = _f(r120, "top10_pct")
+            out["hc_120"] = _f(r120, "holder_count")
         else:
-            out["top1_120"] = max(0.0, min(100.0, 2 * out["top1_60"] - out["top1_30"]))
-            out["top5_120"] = max(0.0, min(100.0, 2 * out["top5_60"] - out["top5_30"]))
-            out["top10_120"] = max(0.0, min(100.0, 2 * out["top10_60"] - out["top10_30"]))
-            out["hc_120"] = max(out["hc_30"], out["hc_60"], 2 * out["hc_60"] - out["hc_30"])
+            # Linear extrapolation from (T+30, T+60). NaN propagates: if
+            # either source is NaN, the result is NaN — exactly mirroring
+            # build_dataset.py:301-319 which only extrapolates when both
+            # sources are non-null.
+            def _extrap(
+                t30: float,
+                t60: float,
+                clamp_lo: float = 0.0,
+                clamp_hi: float | None = 100.0,
+            ) -> float:
+                if math.isnan(t30) or math.isnan(t60):
+                    return _NAN
+                v = 2.0 * t60 - t30
+                if clamp_hi is not None:
+                    v = min(clamp_hi, v)
+                return max(clamp_lo, v)
+
+            def _hc_extrap(hc30: float, hc60: float) -> float:
+                if math.isnan(hc30) or math.isnan(hc60):
+                    return _NAN
+                return max(hc30, hc60, 2.0 * hc60 - hc30)
+
+            out["top1_120"] = _extrap(out["top1_30"], out["top1_60"])
+            out["top5_120"] = _extrap(out["top5_30"], out["top5_60"])
+            out["top10_120"] = _extrap(out["top10_30"], out["top10_60"])
+            out["hc_120"] = _hc_extrap(out["hc_30"], out["hc_60"])
 
         out["top1_delta"] = out["top1_120"] - out["top1_30"]
         out["top5_delta"] = out["top5_120"] - out["top5_30"]
         out["top10_delta"] = out["top10_120"] - out["top10_30"]
+        # hc_velocity propagates NaN naturally — division of NaN is NaN.
         out["hc_velocity"] = (out["hc_120"] - out["hc_30"]) / 90.0
         return out
 
@@ -1917,6 +2219,35 @@ class Pipeline:
                 continue
         return feats
 
+    async def _attach_sim_metadata(
+        self,
+        mint: str,
+        sim_meta: dict,
+        *,
+        max_wait_sec: float = 10.0,
+        poll_interval_sec: float = 0.25,
+    ) -> None:
+        """Find the freshly-opened paper_trade row for ``mint`` and
+        write ``sim_meta`` into ``sim_metadata``. PaperTradeSupervisor
+        creates the row asynchronously; this poller waits up to
+        ``max_wait_sec`` before giving up. Best-effort — failures are
+        logged but don't propagate (the trade itself still records)."""
+        deadline = time.monotonic() + max_wait_sec
+        trade_id: int | None = None
+        while time.monotonic() < deadline:
+            row = self._db.get_paper_trade_for_resume(mint)
+            if row and row.get("id"):
+                trade_id = int(row["id"])
+                break
+            await asyncio.sleep(poll_interval_sec)
+        if trade_id is None:
+            logger.debug("sim_metadata: no paper_trade row found for %s", mint[:14])
+            return
+        try:
+            self._db.set_paper_trade_sim_metadata(trade_id, sim_meta)
+        except Exception as exc:  # nosec B110 — log + continue
+            logger.warning("sim_metadata write failed for trade=%s: %s", trade_id, exc)
+
     async def _extended_observation(self, mint: str, duration_seconds: float) -> None:
         """Continue saving trades for `duration_seconds` after a SKIP decision.
 
@@ -1950,11 +2281,22 @@ class Pipeline:
         entry_ts: float,
         resume_trade_id: int | None = None,
         resume_last_event_ts: float | None = None,
+        config_id: str = "LIVE",
+        sim_entry_tokens_raw: int | None = None,
     ) -> None:
         """Paper-trade lifecycle. Implementation lives in
         pulse_bot/paper_trade_supervisor.py (architecture phase B
         step 2, codex 2026-04-28). This thin wrapper preserves the
-        existing call sites and signature."""
+        existing call sites and signature.
+
+        ``config_id`` (2026-05-13 multi-config A/B): which entry-decision
+        config opened this trade. Threaded through to the supervisor so
+        the paper_trades row is tagged and the per-config slot counter
+        is decremented correctly on close. Defaults to ``"LIVE"``.
+
+        ``sim_entry_tokens_raw`` (2026-05-14 real-sim exit): token count
+        from the entry simulation, used by the supervisor's close path
+        for the bonding-curve sell estimate."""
         from pulse_bot.paper_trade_supervisor import PaperTradeSupervisor
 
         supervisor = PaperTradeSupervisor(self)
@@ -1968,5 +2310,6 @@ class Pipeline:
             entry_ts=entry_ts,
             resume_trade_id=resume_trade_id,
             resume_last_event_ts=resume_last_event_ts,
+            config_id=config_id,
+            sim_entry_tokens_raw=sim_entry_tokens_raw,
         )
-

@@ -69,6 +69,7 @@ class MultiplexerLaunchpad(Launchpad):
         # < 50 trades during their entire life; 200 is a generous
         # safety margin.
         import os as _os_mux
+
         _create_q_cap = int(_os_mux.environ.get("PULSE_MUX_CREATE_QUEUE_MAX", "5000"))
         self._trade_q_cap = int(_os_mux.environ.get("PULSE_MUX_TRADE_QUEUE_MAX", "200"))
         self._create_queue: asyncio.Queue[Token] = asyncio.Queue(maxsize=_create_q_cap)
@@ -184,7 +185,10 @@ class MultiplexerLaunchpad(Launchpad):
             remaining = deadline - time.time()
             if remaining <= 0:
                 break
-            if inactivity_timeout > 0 and time.time() - last_trade_time >= inactivity_timeout:
+            if (
+                inactivity_timeout > 0
+                and time.time() - last_trade_time >= inactivity_timeout
+            ):
                 break
             try:
                 trade = await asyncio.wait_for(queue.get(), timeout=min(remaining, 2.0))

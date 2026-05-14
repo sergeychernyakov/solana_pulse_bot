@@ -82,7 +82,8 @@ class ExitReason(str, Enum):
     that don't appear here (e.g. operator-typed override). Treat as
     documentation + autocomplete, not a hard contract."""
 
-    DEAD_TOKEN = "dead_token"
+    # B105 false positive: this is an exit-reason label, not a secret string.
+    DEAD_TOKEN = "dead_token"  # nosec B105
     HARD_STOP = "hard_stop"
     TAKE_PROFIT = "take_profit"
     TRAILING_STOP = "trailing_stop"

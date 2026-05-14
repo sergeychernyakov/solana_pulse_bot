@@ -30,6 +30,7 @@ Why the slow build:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import struct
@@ -74,16 +75,95 @@ DEFAULT_COMPUTE_UNIT_LIMIT = 200_000
 
 # ── Pump.fun program constants ─────────────────────────────────
 # Source: https://solscan.io/account/6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
-PUMPFUN_PROGRAM_ID = Pubkey.from_string(
-    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+PUMPFUN_PROGRAM_ID = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+# Pump.fun has two fee_recipient pools, picked by coin's mayhem flag:
+#   * normal (Global.fee_recipient + fee_recipients[7]) — for standard coins
+#   * reserved (Global.reserved_fee_recipient + reserved_fee_recipients[7]) — for mayhem coins
+# Picking the wrong pool reverts with 6000 NotAuthorized at fee_recipient.rs:19.
+PUMPFUN_NORMAL_FEE_RECIPIENT = Pubkey.from_string(
+    "62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV"  # Global.fee_recipient (primary)
 )
-PUMPFUN_FEE_RECIPIENT = Pubkey.from_string(
-    "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM"
+PUMPFUN_RESERVED_FEE_RECIPIENT = Pubkey.from_string(
+    "8sNeir4QsLsJdYpc9RZacohhK1Y5FLU3nC5LXgYB4aa6"  # reserved_fee_recipients[3]
 )
+# Backwards-compatible alias — call sites that don't know mayhem yet.
+PUMPFUN_FEE_RECIPIENT = PUMPFUN_NORMAL_FEE_RECIPIENT
+
+
+def pick_fee_recipient(is_mayhem_mode: bool) -> Pubkey:
+    """Return the right fee_recipient for the coin's mayhem mode.
+
+    Pump.fun's `fee_recipient.rs:19` check requires that the recipient
+    we pass is in the pool matching the coin's mayhem flag — wrong
+    pool → on-chain revert with custom error 6000 (NotAuthorized).
+    """
+    if is_mayhem_mode:
+        return PUMPFUN_RESERVED_FEE_RECIPIENT
+    return PUMPFUN_NORMAL_FEE_RECIPIENT
+
+
+# Fee program — pump.fun delegates fee accounting to a separate
+# program (pfeeUx...). Lives in slot [15] of buy / [13] of sell.
+FEE_PROGRAM_ID = Pubkey.from_string("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ")
+# 32-byte constant seed for the fee_config PDA. Hardcoded in the
+# on-chain program; pulled from the IDL. Equivalent to
+# bytes(PUMPFUN_PROGRAM_ID).
+FEE_CONFIG_CONST_SEED = bytes(
+    [
+        1,
+        86,
+        224,
+        246,
+        147,
+        102,
+        90,
+        207,
+        68,
+        219,
+        21,
+        104,
+        191,
+        23,
+        91,
+        170,
+        81,
+        137,
+        203,
+        151,
+        245,
+        210,
+        255,
+        59,
+        101,
+        93,
+        43,
+        182,
+        253,
+        109,
+        24,
+        176,
+    ]
+)
+# Buyback fee recipients — eight of them in pump.fun's Global state.
+# Caller selects one for each buy/sell. Must match a recipient in the
+# `Global.buyback_fee_recipients` array; pump.fun rotates this set, so
+# pull from Global if a recipient becomes invalid.
+PUMPFUN_BUYBACK_FEE_RECIPIENTS = [
+    Pubkey.from_string("5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD"),
+    Pubkey.from_string("9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7"),
+    Pubkey.from_string("GXPFM2caqTtQYC2cJ5yJRi9VDkpsYZXzYdwYpGnLmtDL"),
+    Pubkey.from_string("3BpXnfJaUTiwXnJNe7Ej1rcbzqTTQUvLShZaWazebsVR"),
+    Pubkey.from_string("5cjcW9wExnJJiqgLjq7DEG75Pm6JBgE1hNv4B2vHXUW6"),
+    Pubkey.from_string("EHAAiTxcdDwQ3U4bU6YcMsQGaekdzLS3B5SmYo46kJtL"),
+    Pubkey.from_string("5eHhjP8JaYkz83CWwvGU2uMUXefd3AazWGx4gpcuEEYD"),
+    Pubkey.from_string("A7hAgCzFw14fejgCp387JUJRMNyz4j89JKnhtKU8piqW"),
+]
+# Default pick — index [1] which has been observed in the highest
+# share of recent mainnet buys (rotation should be bot-side; using
+# index 0 in production sweeps would be fine too).
+PUMPFUN_DEFAULT_BUYBACK_FEE_RECIPIENT = PUMPFUN_BUYBACK_FEE_RECIPIENTS[1]
 SYSTEM_PROGRAM_ID = Pubkey.from_string("11111111111111111111111111111111")
-TOKEN_PROGRAM_ID = Pubkey.from_string(
-    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-)
+TOKEN_PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 # Token-2022 program — pump.fun (as of 2026) mints all tokens under
 # Token-2022, NOT the legacy SPL Token program. Verified empirically
 # 2026-05-08: 10/10 sampled mints owned by Token-2022. Using legacy
@@ -93,12 +173,8 @@ TOKEN_PROGRAM_ID = Pubkey.from_string(
 TOKEN_2022_PROGRAM_ID = Pubkey.from_string(
     "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 )
-ATA_PROGRAM_ID = Pubkey.from_string(
-    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
-)
-RENT_SYSVAR_ID = Pubkey.from_string(
-    "SysvarRent111111111111111111111111111111111"
-)
+ATA_PROGRAM_ID = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+RENT_SYSVAR_ID = Pubkey.from_string("SysvarRent111111111111111111111111111111111")
 
 # Anchor instruction discriminators — first 8 bytes of
 # ``sha256("global:buy")`` and ``sha256("global:sell")``. These are
@@ -142,6 +218,61 @@ def derive_event_authority_pda() -> Pubkey:
     return pda
 
 
+def derive_bonding_curve_v2_pda(mint: Pubkey) -> Pubkey:
+    """Derive the bonding-curve-v2 PDA. Per the official pump-rust-client
+    SDK, this is appended as a remaining_account on legacy buy/sell —
+    seed = ['bonding-curve-v2', mint] under the pump.fun program.
+    """
+    pda, _bump = Pubkey.find_program_address(
+        [b"bonding-curve-v2", bytes(mint)],
+        PUMPFUN_PROGRAM_ID,
+    )
+    return pda
+
+
+def derive_creator_vault_pda(creator: Pubkey) -> Pubkey:
+    """Derive the creator-vault PDA. Seed = ['creator-vault', creator].
+
+    The creator is the wallet that originally minted the token. It is
+    stored in the bonding-curve account state — pass
+    ``BondingCurveState.creator`` here, NOT the user wallet.
+    """
+    pda, _bump = Pubkey.find_program_address(
+        [b"creator-vault", bytes(creator)],
+        PUMPFUN_PROGRAM_ID,
+    )
+    return pda
+
+
+def derive_global_volume_accumulator_pda() -> Pubkey:
+    """Derive the program-wide volume accumulator PDA (constant)."""
+    pda, _bump = Pubkey.find_program_address(
+        [b"global_volume_accumulator"],
+        PUMPFUN_PROGRAM_ID,
+    )
+    return pda
+
+
+def derive_user_volume_accumulator_pda(user: Pubkey) -> Pubkey:
+    """Derive the per-user volume accumulator PDA. Created on a
+    wallet's first buy, holds aggregated trade volume for that user."""
+    pda, _bump = Pubkey.find_program_address(
+        [b"user_volume_accumulator", bytes(user)],
+        PUMPFUN_PROGRAM_ID,
+    )
+    return pda
+
+
+def derive_fee_config_pda() -> Pubkey:
+    """Derive the fee-config PDA. Lives under FEE_PROGRAM_ID, NOT
+    the main pump.fun program. Constant per program version."""
+    pda, _bump = Pubkey.find_program_address(
+        [b"fee_config", FEE_CONFIG_CONST_SEED],
+        FEE_PROGRAM_ID,
+    )
+    return pda
+
+
 def derive_associated_token_account(
     owner: Pubkey,
     mint: Pubkey,
@@ -169,13 +300,17 @@ def encode_buy_instruction_data(
 ) -> bytes:
     """Pack the buy-instruction data payload.
 
-    Layout (Anchor convention):
+    Layout (Anchor convention) — **24 bytes**:
         [0..8]   discriminator (8 bytes, fixed)
         [8..16]  amount (u64 LE) — token amount we want, raw integer
         [16..24] max_sol_cost (u64 LE) — slippage cap in lamports
 
-    ``amount`` is the EXACT token output target. The program reverts
-    if the SOL cost exceeds ``max_sol_cost`` (slippage protection).
+    2026-05-14: the previous code appended a 25th ``track_volume`` byte.
+    A decoded reference buy from the *current* on-chain program (slot
+    419594334, sig af4miEhv…) is exactly 24 bytes with no trailing byte
+    — the 25th byte was the "protocol-version mismatch" that got every
+    direct buy rejected. The current program no longer takes the
+    OptionBool arg on the legacy ``buy`` discriminator.
     """
     if token_amount_raw < 0:
         raise ValueError(f"token_amount_raw must be >= 0, got {token_amount_raw}")
@@ -215,45 +350,101 @@ def encode_sell_instruction_data(
 # ── Account-list builders (instruction needs accounts in exact order) ─
 @dataclass
 class PumpFunBuyAccounts:
-    """Account ordering for the buy instruction.
+    """Account ordering for the buy instruction (16 accounts).
 
-    Must match the on-chain program's expected order exactly.
-    Verified against multiple decoded mainnet buy txs.
+    Order matches the canonical on-chain IDL (pulled live from the
+    program's IDL PDA). Slot meanings:
+        [ 0] global                    — PDA(['global'])
+        [ 1] fee_recipient             — input (program maintains a list)
+        [ 2] mint
+        [ 3] bonding_curve             — PDA(['bonding-curve', mint])
+        [ 4] associated_bonding_curve  — ATA(bonding, token_program, mint)
+        [ 5] associated_user           — ATA(user, token_program, mint)
+        [ 6] user                      — signer, mut
+        [ 7] system_program
+        [ 8] token_program             — Token-2022
+        [ 9] creator_vault             — PDA(['creator-vault', creator])
+        [10] event_authority           — PDA(['__event_authority'])
+        [11] program                   — self
+        [12] global_volume_accumulator — PDA(['global_volume_accumulator'])
+        [13] user_volume_accumulator   — PDA(['user_volume_accumulator', user])
+        [14] fee_config                — PDA under FEE_PROGRAM
+        [15] fee_program               — pfeeUx...
     """
 
-    global_pda: Pubkey
-    fee_recipient: Pubkey
-    mint: Pubkey
-    bonding_curve: Pubkey
-    associated_bonding_curve: Pubkey
-    associated_user: Pubkey
-    user: Pubkey
-    system_program: Pubkey
-    token_program: Pubkey
-    rent_sysvar: Pubkey
-    event_authority: Pubkey
-    program: Pubkey
+    global_pda: Pubkey  # [ 0]
+    fee_recipient: Pubkey  # [ 1]
+    mint: Pubkey  # [ 2]
+    bonding_curve: Pubkey  # [ 3]
+    associated_bonding_curve: Pubkey  # [ 4]
+    associated_user: Pubkey  # [ 5]
+    user: Pubkey  # [ 6]
+    system_program: Pubkey  # [ 7]
+    token_program: Pubkey  # [ 8]
+    creator_vault: Pubkey  # [ 9]
+    event_authority: Pubkey  # [10]
+    program: Pubkey  # [11]
+    global_volume_accumulator: Pubkey  # [12]
+    user_volume_accumulator: Pubkey  # [13]
+    fee_config: Pubkey  # [14]
+    fee_program: Pubkey  # [15]
+    bonding_curve_v2: Pubkey  # [16] — IDL-undocumented remaining account
+    buyback_fee_recipient: Pubkey  # [17] — IDL-undocumented remaining account
 
     @classmethod
-    def for_user_and_mint(cls, user: Pubkey, mint: Pubkey) -> "PumpFunBuyAccounts":
-        """Build a complete account list given just the user wallet
-        and the target mint. All PDAs derived; SPL/system/rent
-        constants pulled from module-level. Token program defaults
-        to **Token-2022** because pump.fun mints use it."""
+    def for_user_mint_creator(
+        cls,
+        user: Pubkey,
+        mint: Pubkey,
+        creator: Pubkey,
+        fee_recipient: Pubkey | None = None,
+        buyback_fee_recipient: Pubkey | None = None,
+        token_program: Pubkey = TOKEN_2022_PROGRAM_ID,
+    ) -> "PumpFunBuyAccounts":
+        """Build a complete 18-account list (16 from IDL + 2 remaining
+        accounts not in the public IDL: ``bonding_curve_v2`` and
+        ``buyback_fee_recipient``).
+
+        ``creator`` MUST come from the bonding-curve account state
+        (``BondingCurveState.creator``), not the user wallet —
+        creator-vault PDA is derived from it.
+
+        ``token_program`` controls both the ATA derivation seed and the
+        ``token_program`` account slot. Pass the actual mint owner —
+        Token-2022 for most pump.fun mints, legacy SPL Token for the
+        minority that use it. Wrong choice → ``IncorrectProgramId``.
+
+        ``fee_recipient`` and ``buyback_fee_recipient`` must be in
+        pump.fun's Global state recipient lists (see
+        ``PUMPFUN_BUYBACK_FEE_RECIPIENTS`` for the 8 valid buyback
+        recipients).
+        """
         bonding = derive_bonding_curve_pda(mint)
         return cls(
             global_pda=derive_global_pda(),
-            fee_recipient=PUMPFUN_FEE_RECIPIENT,
+            fee_recipient=fee_recipient or PUMPFUN_FEE_RECIPIENT,
             mint=mint,
             bonding_curve=bonding,
-            associated_bonding_curve=derive_associated_token_account(bonding, mint),
-            associated_user=derive_associated_token_account(user, mint),
+            associated_bonding_curve=derive_associated_token_account(
+                bonding, mint, token_program=token_program
+            ),
+            associated_user=derive_associated_token_account(
+                user, mint, token_program=token_program
+            ),
             user=user,
             system_program=SYSTEM_PROGRAM_ID,
-            token_program=TOKEN_2022_PROGRAM_ID,
-            rent_sysvar=RENT_SYSVAR_ID,
+            token_program=token_program,
+            creator_vault=derive_creator_vault_pda(creator),
             event_authority=derive_event_authority_pda(),
             program=PUMPFUN_PROGRAM_ID,
+            global_volume_accumulator=derive_global_volume_accumulator_pda(),
+            user_volume_accumulator=derive_user_volume_accumulator_pda(user),
+            fee_config=derive_fee_config_pda(),
+            fee_program=FEE_PROGRAM_ID,
+            bonding_curve_v2=derive_bonding_curve_v2_pda(mint),
+            buyback_fee_recipient=(
+                buyback_fee_recipient or PUMPFUN_DEFAULT_BUYBACK_FEE_RECIPIENT
+            ),
         )
 
 
@@ -262,40 +453,57 @@ class PumpFunBuyAccounts:
 class BondingCurveState:
     """On-chain bonding-curve account state.
 
-    Account layout (Anchor):
-        [0..8]   discriminator (8 bytes — fixed for the account type)
-        [8..16]  virtual_token_reserves (u64 LE)
-        [16..24] virtual_sol_reserves (u64 LE) — in lamports
-        [24..32] real_token_reserves (u64 LE)
-        [32..40] real_sol_reserves (u64 LE) — in lamports
-        [40..48] token_total_supply (u64 LE)
-        [48]     complete (bool, 1 byte) — true after graduation
+    Account layout (Anchor) per pump-rust-client IDL:
+        [0..8]    discriminator
+        [8..16]   virtual_token_reserves (u64 LE)
+        [16..24]  virtual_quote_reserves (u64 LE) — formerly virtual_sol_reserves
+        [24..32]  real_token_reserves (u64 LE)
+        [32..40]  real_quote_reserves (u64 LE) — formerly real_sol_reserves
+        [40..48]  token_total_supply (u64 LE)
+        [48]      complete (bool) — true after graduation
+        [49..81]  creator (Pubkey, 32B) — drives creator_vault PDA
+        [81]      is_mayhem_mode (bool) — selects normal vs reserved fee_recipient
+        [82]      is_cashback_coin (bool) — sell appends UVA when true
+        [83..115] quote_mint (Pubkey, 32B) — SOL for legacy coins, USDC for some
     """
 
     virtual_token_reserves: int
-    virtual_sol_reserves: int
+    virtual_sol_reserves: int  # legacy alias for virtual_quote_reserves
     real_token_reserves: int
-    real_sol_reserves: int
+    real_sol_reserves: int  # legacy alias for real_quote_reserves
     token_total_supply: int
     complete: bool
+    creator: Pubkey
+    is_mayhem_mode: bool = False
+    is_cashback_coin: bool = True
+    quote_mint: Pubkey | None = None
 
     @classmethod
     def from_account_data(cls, data: bytes) -> "BondingCurveState":
         """Parse the 8-byte discriminator + Anchor-encoded fields.
 
-        Raises ``ValueError`` on malformed buffers — short accounts
-        usually mean the bonding-curve PDA doesn't exist yet (token
-        was created off pump.fun, or RPC returned stale state).
+        Older bonding-curve accounts (pre-mayhem) only have 81 bytes
+        (no mayhem/cashback/quote_mint fields). Newer ones have 115+.
+        We tolerate the legacy length and default the new flags so
+        the parser keeps working on stale accounts.
         """
-        if len(data) < 49:
+        if len(data) < 81:
             raise ValueError(
-                f"bonding-curve account too short: {len(data)} bytes "
-                f"(need >=49)"
+                f"bonding-curve account too short: {len(data)} bytes (need >=81)"
             )
-        # Skip the 8-byte Anchor discriminator.
         body = data[8:]
         v_tok, v_sol, r_tok, r_sol, supply = struct.unpack_from("<QQQQQ", body, 0)
         complete = bool(body[40])
+        creator = Pubkey(body[41:73])
+        # New fields (post-mayhem rollout). Default safely if account is short.
+        is_mayhem_mode = bool(body[73]) if len(body) >= 74 else False
+        is_cashback_coin = bool(body[74]) if len(body) >= 75 else True
+        quote_mint: Pubkey | None = None
+        if len(body) >= 107:
+            qm_bytes = body[75:107]
+            # All-zero quote_mint means default (= SOL).
+            if qm_bytes != bytes(32):
+                quote_mint = Pubkey(qm_bytes)
         return cls(
             virtual_token_reserves=v_tok,
             virtual_sol_reserves=v_sol,
@@ -303,6 +511,10 @@ class BondingCurveState:
             real_sol_reserves=r_sol,
             token_total_supply=supply,
             complete=complete,
+            creator=creator,
+            is_mayhem_mode=is_mayhem_mode,
+            is_cashback_coin=is_cashback_coin,
+            quote_mint=quote_mint,
         )
 
 
@@ -335,7 +547,9 @@ def estimate_buy_output_tokens(
     if sol_in_post_fee <= 0:
         return 0
     new_v_sol = state.virtual_sol_reserves + sol_in_post_fee
-    new_v_tokens = (state.virtual_sol_reserves * state.virtual_token_reserves) // new_v_sol
+    new_v_tokens = (
+        state.virtual_sol_reserves * state.virtual_token_reserves
+    ) // new_v_sol
     tokens_out = state.virtual_token_reserves - new_v_tokens
     # Cap at real token reserves — can't sell more than the curve actually holds.
     return max(0, min(tokens_out, state.real_token_reserves))
@@ -373,15 +587,14 @@ class HeliusRpc:
 
     def __init__(self, api_key: str, base_url: str | None = None):
         self._api_key = api_key
-        self._base_url = (
-            base_url or "https://mainnet.helius-rpc.com"
-        )
+        self._base_url = base_url or "https://mainnet.helius-rpc.com"
         self._url = f"{self._base_url}/?api-key={self._api_key}"
         self._session: Any = None
 
     async def _ensure_session(self) -> Any:
         if self._session is None:
             import aiohttp  # type: ignore
+
             self._session = aiohttp.ClientSession()
         return self._session
 
@@ -429,9 +642,7 @@ class HeliusRpc:
             logger.warning("getAccountInfo decode failed for %s: %s", pubkey, exc)
             return None
 
-    async def fetch_bonding_curve_state(
-        self, mint: Pubkey
-    ) -> BondingCurveState | None:
+    async def fetch_bonding_curve_state(self, mint: Pubkey) -> BondingCurveState | None:
         """Convenience wrapper: PDA-derive + getAccountInfo + parse."""
         pda = derive_bonding_curve_pda(mint)
         data = await self.get_account_info(pda)
@@ -442,9 +653,55 @@ class HeliusRpc:
         except ValueError as exc:
             logger.warning(
                 "bonding curve %s parse failed (mint=%s): %s",
-                pda, mint, exc,
+                pda,
+                mint,
+                exc,
             )
             return None
+
+    async def fetch_mint_token_program(self, mint: Pubkey) -> Pubkey:
+        """Return the token-program owner of the mint account.
+
+        pump.fun mints are *usually* Token-2022, but a non-trivial
+        minority are legacy SPL Token. Building the buy/sell tx with
+        the wrong program triggers an ``IncorrectProgramId`` revert at
+        ATA-derivation (different seeds: ``[owner, token_program,
+        mint]``).
+
+        Falls back to Token-2022 on RPC failure — that matches the
+        pre-fix behaviour and is correct for the majority of mints.
+        """
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [
+                str(mint),
+                {"encoding": "base64", "commitment": "processed"},
+            ],
+        }
+        try:
+            resp = await self._post(payload)
+        except Exception as exc:
+            logger.warning(
+                "fetch_mint_token_program(%s) failed: %s — defaulting to Token-2022",
+                mint,
+                exc,
+            )
+            return TOKEN_2022_PROGRAM_ID
+        value = resp.get("result", {}).get("value")
+        if not value:
+            return TOKEN_2022_PROGRAM_ID
+        owner_str = value.get("owner")
+        if not owner_str:
+            return TOKEN_2022_PROGRAM_ID
+        try:
+            owner_pk = Pubkey.from_string(owner_str)
+        except Exception:
+            return TOKEN_2022_PROGRAM_ID
+        if owner_pk == TOKEN_PROGRAM_ID:
+            return TOKEN_PROGRAM_ID
+        return TOKEN_2022_PROGRAM_ID
 
     async def get_latest_blockhash(self) -> Hash | None:
         """Fetch the cluster's most recent blockhash for tx signing.
@@ -514,7 +771,11 @@ class HeliusRpc:
         try:
             resp = await self._post(payload, timeout_sec=10.0)
         except Exception as exc:
-            return SimulateResult(success=False, err=str(exc))
+            return SimulateResult(
+                success=False, err=f"rpc_post_failed:{type(exc).__name__}:{exc}"
+            )
+        if resp.get("error"):
+            return SimulateResult(success=False, err=f"rpc_error:{resp['error']}")
         result = resp.get("result", {}).get("value", {})
         err = result.get("err")
         return SimulateResult(
@@ -524,6 +785,78 @@ class HeliusRpc:
             units_consumed=result.get("unitsConsumed"),
             raw_response=resp,
         )
+
+    async def send_transaction(
+        self,
+        signed_tx_base64: str,
+        *,
+        skip_preflight: bool = False,
+        max_retries: int = 0,
+    ) -> str:
+        """Submit a signed transaction. Returns the signature on
+        success; raises on RPC error.
+
+        ``skip_preflight=False`` keeps Helius's simulate-then-submit
+        guard, which catches account-list bugs before broadcasting
+        and saves the priority fee on definite-fail txs.
+        """
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [
+                signed_tx_base64,
+                {
+                    "encoding": "base64",
+                    "skipPreflight": skip_preflight,
+                    "preflightCommitment": "processed",
+                    "maxRetries": max_retries,
+                },
+            ],
+        }
+        resp = await self._post(payload, timeout_sec=15.0)
+        if "error" in resp:
+            raise RuntimeError(f"sendTransaction RPC error: {resp['error']}")
+        sig = resp.get("result")
+        if not sig:
+            raise RuntimeError(f"sendTransaction returned no signature: {resp}")
+        return sig
+
+    async def get_signature_statuses(self, sigs: list[str]) -> list[dict | None]:
+        """Look up confirmation statuses for an array of signatures."""
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignatureStatuses",
+            "params": [sigs, {"searchTransactionHistory": False}],
+        }
+        resp = await self._post(payload, timeout_sec=10.0)
+        return resp.get("result", {}).get("value", [None] * len(sigs))
+
+    async def confirm_signature(
+        self,
+        sig: str,
+        *,
+        timeout_sec: float = 30.0,
+        poll_interval_sec: float = 1.0,
+    ) -> dict:
+        """Poll ``getSignatureStatuses`` until the tx is confirmed
+        (or until timeout). Returns the final status dict; the caller
+        inspects ``confirmationStatus`` and ``err``."""
+        import time
+
+        deadline = time.monotonic() + timeout_sec
+        last: dict | None = None
+        while time.monotonic() < deadline:
+            (last,) = await self.get_signature_statuses([sig])
+            if last is not None:
+                cs = last.get("confirmationStatus")
+                if cs in ("confirmed", "finalized"):
+                    return last
+                if last.get("err"):
+                    return last
+            await asyncio.sleep(poll_interval_sec)
+        return last or {"err": "confirmation_timeout"}
 
 
 # ── Instruction builders ───────────────────────────────────────
@@ -565,66 +898,110 @@ def build_create_ata_idempotent_ix(
     payer: Pubkey,
     owner: Pubkey,
     mint: Pubkey,
+    token_program: Pubkey = TOKEN_2022_PROGRAM_ID,
 ) -> Instruction:
     """Associated Token Account program: create-if-not-exists.
 
-    Delegates to the canonical SPL helper to avoid hand-rolling the
-    instruction layout — earlier hand-rolled version produced a
-    cryptic ``IncorrectProgramId`` error on simulation, presumably
-    from a missing account slot or wrong discriminator. The SPL
-    helper is the source of truth.
+    Delegates to the canonical SPL helper. ``token_program`` defaults
+    to Token-2022 (pump.fun's typical choice) but legacy SPL Token
+    mints exist too — pass the actual mint owner program here.
     """
     from spl.token.instructions import (  # type: ignore
         create_idempotent_associated_token_account,
     )
+
     return create_idempotent_associated_token_account(
         payer=payer,
         owner=owner,
         mint=mint,
-        token_program_id=TOKEN_2022_PROGRAM_ID,
+        token_program_id=token_program,
     )
 
 
 def build_pump_buy_ix(
     user: Pubkey,
     mint: Pubkey,
+    creator: Pubkey,
     token_amount_raw: int,
     max_sol_cost_lamports: int,
+    fee_recipient: Pubkey | None = None,
+    buyback_fee_recipient: Pubkey | None = None,
+    token_program: Pubkey = TOKEN_2022_PROGRAM_ID,
 ) -> Instruction:
-    """Build the pump.fun buy instruction.
+    """Build the pump.fun buy instruction (18 accounts, 24-byte data).
 
-    Account ordering matches the published IDL (verified against
-    decoded mainnet buy transactions). Each account's signer/writable
-    flags are critical — the on-chain program validates them and
-    reverts on mismatch.
+    16 accounts come from the on-chain IDL; pump.fun's program also
+    consumes 2 trailing remaining_accounts that aren't in the IDL:
+    ``bonding_curve_v2`` (readonly) and ``buyback_fee_recipient``
+    (writable). Per the official ``pump-rust-client`` SDK
+    (`buy_instruction` in `pump_legacy.rs`), this is the canonical
+    layout for buys against the legacy bonding-curve discriminator.
+
+    ``creator`` MUST come from the bonding-curve account state
+    (``BondingCurveState.creator``); it drives the creator-vault PDA.
     """
-    accounts_obj = PumpFunBuyAccounts.for_user_and_mint(user, mint)
-    # is_signer / is_writable flags from decoded mainnet txs:
-    #   1. global                 ro, not signer
-    #   2. fee_recipient          rw, not signer
-    #   3. mint                   ro, not signer
-    #   4. bonding_curve          rw, not signer
-    #   5. associated_bonding_curve  rw, not signer
-    #   6. associated_user        rw, not signer
-    #   7. user                   rw, SIGNER
-    #   8. system_program         ro, not signer
-    #   9. token_program          ro, not signer
-    #  10. rent_sysvar            ro, not signer
-    #  11. event_authority        ro, not signer
-    #  12. program                ro, not signer
+    accounts_obj = PumpFunBuyAccounts.for_user_mint_creator(
+        user,
+        mint,
+        creator,
+        fee_recipient=fee_recipient,
+        buyback_fee_recipient=buyback_fee_recipient,
+        token_program=token_program,
+    )
+    # IDL signer/mut flags (slots 0..15): mut at [1,3,4,5,6,9,13],
+    # signer only at [6]. Trailing remaining_accounts: [16] readonly,
+    # [17] writable per pump-rust-client SDK source.
     accounts = [
         AccountMeta(pubkey=accounts_obj.global_pda, is_signer=False, is_writable=False),
-        AccountMeta(pubkey=accounts_obj.fee_recipient, is_signer=False, is_writable=True),
+        AccountMeta(
+            pubkey=accounts_obj.fee_recipient, is_signer=False, is_writable=True
+        ),
         AccountMeta(pubkey=accounts_obj.mint, is_signer=False, is_writable=False),
-        AccountMeta(pubkey=accounts_obj.bonding_curve, is_signer=False, is_writable=True),
-        AccountMeta(pubkey=accounts_obj.associated_bonding_curve, is_signer=False, is_writable=True),
-        AccountMeta(pubkey=accounts_obj.associated_user, is_signer=False, is_writable=True),
+        AccountMeta(
+            pubkey=accounts_obj.bonding_curve, is_signer=False, is_writable=True
+        ),
+        AccountMeta(
+            pubkey=accounts_obj.associated_bonding_curve,
+            is_signer=False,
+            is_writable=True,
+        ),
+        AccountMeta(
+            pubkey=accounts_obj.associated_user, is_signer=False, is_writable=True
+        ),
         AccountMeta(pubkey=accounts_obj.user, is_signer=True, is_writable=True),
-        AccountMeta(pubkey=accounts_obj.system_program, is_signer=False, is_writable=False),
-        AccountMeta(pubkey=accounts_obj.token_program, is_signer=False, is_writable=False),
-        AccountMeta(pubkey=accounts_obj.rent_sysvar, is_signer=False, is_writable=False),
-        AccountMeta(pubkey=accounts_obj.event_authority, is_signer=False, is_writable=False),
+        AccountMeta(
+            pubkey=accounts_obj.system_program, is_signer=False, is_writable=False
+        ),
+        AccountMeta(
+            pubkey=accounts_obj.token_program, is_signer=False, is_writable=False
+        ),
+        AccountMeta(
+            pubkey=accounts_obj.creator_vault, is_signer=False, is_writable=True
+        ),
+        AccountMeta(
+            pubkey=accounts_obj.event_authority, is_signer=False, is_writable=False
+        ),
         AccountMeta(pubkey=accounts_obj.program, is_signer=False, is_writable=False),
+        AccountMeta(
+            pubkey=accounts_obj.global_volume_accumulator,
+            is_signer=False,
+            is_writable=False,
+        ),
+        AccountMeta(
+            pubkey=accounts_obj.user_volume_accumulator,
+            is_signer=False,
+            is_writable=True,
+        ),
+        AccountMeta(pubkey=accounts_obj.fee_config, is_signer=False, is_writable=False),
+        AccountMeta(
+            pubkey=accounts_obj.fee_program, is_signer=False, is_writable=False
+        ),
+        AccountMeta(
+            pubkey=accounts_obj.bonding_curve_v2, is_signer=False, is_writable=False
+        ),
+        AccountMeta(
+            pubkey=accounts_obj.buyback_fee_recipient, is_signer=False, is_writable=True
+        ),
     ]
     data = encode_buy_instruction_data(token_amount_raw, max_sol_cost_lamports)
     return Instruction(
@@ -637,31 +1014,95 @@ def build_pump_buy_ix(
 def build_pump_sell_ix(
     user: Pubkey,
     mint: Pubkey,
+    creator: Pubkey,
     token_amount_raw: int,
     min_sol_output_lamports: int,
+    is_cashback_coin: bool = True,
+    fee_recipient: Pubkey | None = None,
+    buyback_fee_recipient: Pubkey | None = None,
+    token_program: Pubkey = TOKEN_2022_PROGRAM_ID,
 ) -> Instruction:
-    """Build the pump.fun sell instruction.
+    """Build the pump.fun sell instruction (16 or 17 accounts).
 
-    Differs from buy in two account-list slots:
-      * No rent_sysvar (pump.fun doesn't reach for rent on sells)
-      * associated_token_program slot present (used for ATA close
-        on sells of full balance — although we don't close it here)
+    14 IDL accounts + 2-3 trailing remaining_accounts:
+      * if ``is_cashback_coin`` is True: append user_volume_accumulator
+      * always: append ``bonding_curve_v2`` (readonly) and
+        ``buyback_fee_recipient`` (writable)
+
+    Per pump-rust-client SDK source (`pump_legacy.rs::sell_instruction`).
+    Default is cashback=True since pump.fun's Global has
+    ``is_cashback_enabled=1`` (verified 2026-05-08).
+
+    Sell IDL slot ordering DIFFERS from buy:
+      * creator_vault at [8] (buy has it at [9])
+      * token_program at [9] (buy has it at [8])
     """
-    accounts_obj = PumpFunSellAccounts.for_user_and_mint(user, mint)
+    accounts_obj = PumpFunSellAccounts.for_user_mint_creator(
+        user,
+        mint,
+        creator,
+        fee_recipient=fee_recipient,
+        buyback_fee_recipient=buyback_fee_recipient,
+        token_program=token_program,
+    )
+    # IDL signer/mut flags (slots 0..13): mut at [1,3,4,5,6,8],
+    # signer only at [6]. All other IDL slots ro/non-signer.
     accounts = [
         AccountMeta(pubkey=accounts_obj.global_pda, is_signer=False, is_writable=False),
-        AccountMeta(pubkey=accounts_obj.fee_recipient, is_signer=False, is_writable=True),
+        AccountMeta(
+            pubkey=accounts_obj.fee_recipient, is_signer=False, is_writable=True
+        ),
         AccountMeta(pubkey=accounts_obj.mint, is_signer=False, is_writable=False),
-        AccountMeta(pubkey=accounts_obj.bonding_curve, is_signer=False, is_writable=True),
-        AccountMeta(pubkey=accounts_obj.associated_bonding_curve, is_signer=False, is_writable=True),
-        AccountMeta(pubkey=accounts_obj.associated_user, is_signer=False, is_writable=True),
+        AccountMeta(
+            pubkey=accounts_obj.bonding_curve, is_signer=False, is_writable=True
+        ),
+        AccountMeta(
+            pubkey=accounts_obj.associated_bonding_curve,
+            is_signer=False,
+            is_writable=True,
+        ),
+        AccountMeta(
+            pubkey=accounts_obj.associated_user, is_signer=False, is_writable=True
+        ),
         AccountMeta(pubkey=accounts_obj.user, is_signer=True, is_writable=True),
-        AccountMeta(pubkey=accounts_obj.system_program, is_signer=False, is_writable=False),
-        AccountMeta(pubkey=accounts_obj.associated_token_program, is_signer=False, is_writable=False),
-        AccountMeta(pubkey=accounts_obj.token_program, is_signer=False, is_writable=False),
-        AccountMeta(pubkey=accounts_obj.event_authority, is_signer=False, is_writable=False),
+        AccountMeta(
+            pubkey=accounts_obj.system_program, is_signer=False, is_writable=False
+        ),
+        AccountMeta(
+            pubkey=accounts_obj.creator_vault, is_signer=False, is_writable=True
+        ),
+        AccountMeta(
+            pubkey=accounts_obj.token_program, is_signer=False, is_writable=False
+        ),
+        AccountMeta(
+            pubkey=accounts_obj.event_authority, is_signer=False, is_writable=False
+        ),
         AccountMeta(pubkey=accounts_obj.program, is_signer=False, is_writable=False),
+        AccountMeta(pubkey=accounts_obj.fee_config, is_signer=False, is_writable=False),
+        AccountMeta(
+            pubkey=accounts_obj.fee_program, is_signer=False, is_writable=False
+        ),
     ]
+    if is_cashback_coin:
+        accounts.append(
+            AccountMeta(
+                pubkey=accounts_obj.user_volume_accumulator,
+                is_signer=False,
+                is_writable=True,
+            )
+        )
+    accounts.extend(
+        [
+            AccountMeta(
+                pubkey=accounts_obj.bonding_curve_v2, is_signer=False, is_writable=False
+            ),
+            AccountMeta(
+                pubkey=accounts_obj.buyback_fee_recipient,
+                is_signer=False,
+                is_writable=True,
+            ),
+        ]
+    )
     data = encode_sell_instruction_data(token_amount_raw, min_sol_output_lamports)
     return Instruction(
         program_id=PUMPFUN_PROGRAM_ID,
@@ -680,6 +1121,7 @@ def build_buy_transaction(
     slippage_bps: int = 100,
     priority_fee_microlamports_per_cu: int = DEFAULT_PRIORITY_FEE_MICROLAMPORTS_PER_CU,
     compute_unit_limit: int = DEFAULT_COMPUTE_UNIT_LIMIT,
+    token_program: Pubkey = TOKEN_2022_PROGRAM_ID,
 ) -> VersionedTransaction:
     """Build, sign, and return a complete buy transaction.
 
@@ -705,18 +1147,21 @@ def build_buy_transaction(
             "buy would yield zero tokens — bonding curve complete or "
             "sol_amount too small"
         )
-    max_sol_cost = (
-        sol_amount_lamports * (10_000 + slippage_bps)
-    ) // 10_000
+    max_sol_cost = (sol_amount_lamports * (10_000 + slippage_bps)) // 10_000
     instructions = [
         build_set_compute_unit_limit_ix(compute_unit_limit),
         build_set_compute_unit_price_ix(priority_fee_microlamports_per_cu),
-        build_create_ata_idempotent_ix(payer=user, owner=user, mint=mint),
+        build_create_ata_idempotent_ix(
+            payer=user, owner=user, mint=mint, token_program=token_program
+        ),
         build_pump_buy_ix(
             user=user,
             mint=mint,
+            creator=state.creator,
             token_amount_raw=expected_tokens,
             max_sol_cost_lamports=max_sol_cost,
+            fee_recipient=pick_fee_recipient(state.is_mayhem_mode),
+            token_program=token_program,
         ),
     ]
     msg = MessageV0.try_compile(
@@ -737,6 +1182,7 @@ def build_sell_transaction(
     slippage_bps: int = 100,
     priority_fee_microlamports_per_cu: int = DEFAULT_PRIORITY_FEE_MICROLAMPORTS_PER_CU,
     compute_unit_limit: int = DEFAULT_COMPUTE_UNIT_LIMIT,
+    token_program: Pubkey = TOKEN_2022_PROGRAM_ID,
 ) -> VersionedTransaction:
     """Build a sell transaction. Same pattern as buy, no ATA-create
     (we already own the ATA from the prior buy)."""
@@ -744,21 +1190,22 @@ def build_sell_transaction(
     expected_sol = estimate_sell_output_lamports(token_amount_raw, state)
     if expected_sol <= 0:
         raise ValueError(
-            "sell would yield zero SOL — bonding curve complete or "
-            "amount too small"
+            "sell would yield zero SOL — bonding curve complete or " "amount too small"
         )
     # Slippage on sell goes the OTHER direction: minimum we'll accept.
-    min_sol_output = (
-        expected_sol * (10_000 - slippage_bps)
-    ) // 10_000
+    min_sol_output = (expected_sol * (10_000 - slippage_bps)) // 10_000
     instructions = [
         build_set_compute_unit_limit_ix(compute_unit_limit),
         build_set_compute_unit_price_ix(priority_fee_microlamports_per_cu),
         build_pump_sell_ix(
             user=user,
             mint=mint,
+            creator=state.creator,
             token_amount_raw=token_amount_raw,
             min_sol_output_lamports=min_sol_output,
+            is_cashback_coin=state.is_cashback_coin,
+            fee_recipient=pick_fee_recipient(state.is_mayhem_mode),
+            token_program=token_program,
         ),
     ]
     msg = MessageV0.try_compile(
@@ -797,6 +1244,7 @@ class PumpExecuteResult:
     units_consumed: int | None = None
     err: Any | None = None
     logs: list[str] | None = None
+    signature: str | None = None  # populated only on live submit
 
 
 class PumpFunExecution:
@@ -839,6 +1287,7 @@ class PumpFunExecution:
         """
         import json as _json
         import os as _os
+
         from solders.keypair import Keypair  # type: ignore
 
         helius_key = _os.environ.get("HELIUS_API_KEY", "")
@@ -872,6 +1321,7 @@ class PumpFunExecution:
         # 2. File path (Solana CLI convention).
         if value.endswith(".json") or "/" in value or "\\" in value:
             from pathlib import Path
+
             p = Path(value).expanduser()
             if not p.exists():
                 # Resolve relative to the gg/ repo if not absolute.
@@ -1006,7 +1456,9 @@ class PumpFunExecution:
         submit_live: bool,
     ) -> PumpExecuteResult:
         mint_pk = mint if isinstance(mint, Pubkey) else Pubkey.from_string(mint)
-        # 1. Fetch on-chain bonding-curve state.
+        # 1. Fetch on-chain bonding-curve state + detect mint's token
+        #    program (Token-2022 vs legacy SPL). Wrong program at the
+        #    ATA seed → IncorrectProgramId revert.
         state = await self._rpc.fetch_bonding_curve_state(mint_pk)
         if state is None:
             return PumpExecuteResult(
@@ -1028,6 +1480,7 @@ class PumpFunExecution:
                 slippage_bps_cap=slippage_bps,
                 err="curve_complete_post_graduation",
             )
+        token_program = await self._rpc.fetch_mint_token_program(mint_pk)
         # 2. Get recent blockhash.
         blockhash = await self._rpc.get_latest_blockhash()
         if blockhash is None:
@@ -1050,6 +1503,7 @@ class PumpFunExecution:
                 recent_blockhash=blockhash,
                 slippage_bps=slippage_bps,
                 priority_fee_microlamports_per_cu=priority_fee_microlamports_per_cu,
+                token_program=token_program,
             )
         except ValueError as exc:
             return PumpExecuteResult(
@@ -1065,14 +1519,31 @@ class PumpFunExecution:
         b64 = serialize_signed_tx_base64(tx)
         # 4. Simulate (and only submit if explicit live mode).
         if submit_live:
-            # Live submission is wired separately; for now we only
-            # ship the simulate path — the entire Phase 5 backfill
-            # uses simulate. Live submit is added in a later commit
-            # after the simulator validates the pipeline end-to-end
-            # on real on-chain state.
-            raise NotImplementedError(
-                "live submit path not yet implemented — "
-                "simulate path only in this build"
+            try:
+                signature = await self._rpc.send_transaction(b64, skip_preflight=False)
+            except Exception as exc:
+                return PumpExecuteResult(
+                    side="buy",
+                    mint=str(mint_pk),
+                    submitted_live=True,
+                    success=False,
+                    sol_amount_lamports=sol_amount_lamports,
+                    expected_tokens=expected_tokens,
+                    slippage_bps_cap=slippage_bps,
+                    err=f"send_failed:{exc}",
+                )
+            status = await self._rpc.confirm_signature(signature)
+            err = status.get("err")
+            return PumpExecuteResult(
+                side="buy",
+                mint=str(mint_pk),
+                submitted_live=True,
+                success=(err is None),
+                sol_amount_lamports=sol_amount_lamports,
+                expected_tokens=expected_tokens,
+                slippage_bps_cap=slippage_bps,
+                err=err,
+                signature=signature,
             )
         sim = await self._rpc.simulate_transaction(b64)
         return PumpExecuteResult(
@@ -1107,6 +1578,7 @@ class PumpFunExecution:
                 slippage_bps_cap=slippage_bps,
                 err="bonding_curve_account_missing",
             )
+        token_program = await self._rpc.fetch_mint_token_program(mint_pk)
         blockhash = await self._rpc.get_latest_blockhash()
         if blockhash is None:
             return PumpExecuteResult(
@@ -1126,6 +1598,7 @@ class PumpFunExecution:
                 recent_blockhash=blockhash,
                 slippage_bps=slippage_bps,
                 priority_fee_microlamports_per_cu=priority_fee_microlamports_per_cu,
+                token_program=token_program,
             )
         except ValueError as exc:
             return PumpExecuteResult(
@@ -1139,7 +1612,30 @@ class PumpFunExecution:
         expected_sol = estimate_sell_output_lamports(token_amount_raw, state)
         b64 = serialize_signed_tx_base64(tx)
         if submit_live:
-            raise NotImplementedError("live submit path not yet implemented")
+            try:
+                signature = await self._rpc.send_transaction(b64, skip_preflight=False)
+            except Exception as exc:
+                return PumpExecuteResult(
+                    side="sell",
+                    mint=str(mint_pk),
+                    submitted_live=True,
+                    success=False,
+                    expected_sol_out_lamports=expected_sol,
+                    slippage_bps_cap=slippage_bps,
+                    err=f"send_failed:{exc}",
+                )
+            status = await self._rpc.confirm_signature(signature)
+            err = status.get("err")
+            return PumpExecuteResult(
+                side="sell",
+                mint=str(mint_pk),
+                submitted_live=True,
+                success=(err is None),
+                expected_sol_out_lamports=expected_sol,
+                slippage_bps_cap=slippage_bps,
+                err=err,
+                signature=signature,
+            )
         sim = await self._rpc.simulate_transaction(b64)
         return PumpExecuteResult(
             side="sell",
@@ -1161,17 +1657,19 @@ def estimate_sell_output_lamports(
 ) -> int:
     """Inverse of buy: given tokens to sell, how many lamports out.
 
-        new_v_tokens   = v_tokens + tokens_in
-        new_v_sol      = v_sol × v_tokens / new_v_tokens
-        sol_out_pre_fee = v_sol − new_v_sol
-        sol_out         = sol_out_pre_fee × (1 − fee)
+    new_v_tokens   = v_tokens + tokens_in
+    new_v_sol      = v_sol × v_tokens / new_v_tokens
+    sol_out_pre_fee = v_sol − new_v_sol
+    sol_out         = sol_out_pre_fee × (1 − fee)
     """
     if token_amount_raw <= 0:
         return 0
     if state.complete:
         return 0
     new_v_tokens = state.virtual_token_reserves + token_amount_raw
-    new_v_sol = (state.virtual_sol_reserves * state.virtual_token_reserves) // new_v_tokens
+    new_v_sol = (
+        state.virtual_sol_reserves * state.virtual_token_reserves
+    ) // new_v_tokens
     sol_out_pre_fee = state.virtual_sol_reserves - new_v_sol
     fee_factor_num = 10_000 - fee_bps
     sol_out = (sol_out_pre_fee * fee_factor_num) // 10_000
@@ -1181,39 +1679,69 @@ def estimate_sell_output_lamports(
 # ── Account-list builders (instruction needs accounts in exact order) ─
 @dataclass
 class PumpFunSellAccounts:
-    """Account ordering for the sell instruction.
+    """Account ordering for the sell instruction (14 accounts).
 
-    Same as buy, minus the rent sysvar. Verified against decoded
-    sell txs.
+    Order matches the on-chain IDL. Note slot ordering DIFFERS from
+    buy:
+      * creator_vault is at slot [8] (was [9] in buy)
+      * token_program is at slot [9] (was [8] in buy)
+      * No volume_accumulator slots (those are buy-only)
     """
 
-    global_pda: Pubkey
-    fee_recipient: Pubkey
-    mint: Pubkey
-    bonding_curve: Pubkey
-    associated_bonding_curve: Pubkey
-    associated_user: Pubkey
-    user: Pubkey
-    system_program: Pubkey
-    associated_token_program: Pubkey
-    token_program: Pubkey
-    event_authority: Pubkey
-    program: Pubkey
+    global_pda: Pubkey  # [ 0]
+    fee_recipient: Pubkey  # [ 1]
+    mint: Pubkey  # [ 2]
+    bonding_curve: Pubkey  # [ 3]
+    associated_bonding_curve: Pubkey  # [ 4]
+    associated_user: Pubkey  # [ 5]
+    user: Pubkey  # [ 6]
+    system_program: Pubkey  # [ 7]
+    creator_vault: Pubkey  # [ 8]
+    token_program: Pubkey  # [ 9]
+    event_authority: Pubkey  # [10]
+    program: Pubkey  # [11]
+    fee_config: Pubkey  # [12]
+    fee_program: Pubkey  # [13]
+    # Trailing remaining_accounts (not in IDL). For cashback-enabled
+    # coins, ``user_volume_accumulator`` is appended first; then
+    # ``bonding_curve_v2`` and ``buyback_fee_recipient`` always follow.
+    user_volume_accumulator: Pubkey  # [14] when cashback (else skipped)
+    bonding_curve_v2: Pubkey  # [14 or 15]
+    buyback_fee_recipient: Pubkey  # [15 or 16]
 
     @classmethod
-    def for_user_and_mint(cls, user: Pubkey, mint: Pubkey) -> "PumpFunSellAccounts":
+    def for_user_mint_creator(
+        cls,
+        user: Pubkey,
+        mint: Pubkey,
+        creator: Pubkey,
+        fee_recipient: Pubkey | None = None,
+        buyback_fee_recipient: Pubkey | None = None,
+        token_program: Pubkey = TOKEN_2022_PROGRAM_ID,
+    ) -> "PumpFunSellAccounts":
         bonding = derive_bonding_curve_pda(mint)
         return cls(
             global_pda=derive_global_pda(),
-            fee_recipient=PUMPFUN_FEE_RECIPIENT,
+            fee_recipient=fee_recipient or PUMPFUN_FEE_RECIPIENT,
             mint=mint,
             bonding_curve=bonding,
-            associated_bonding_curve=derive_associated_token_account(bonding, mint),
-            associated_user=derive_associated_token_account(user, mint),
+            associated_bonding_curve=derive_associated_token_account(
+                bonding, mint, token_program=token_program
+            ),
+            associated_user=derive_associated_token_account(
+                user, mint, token_program=token_program
+            ),
             user=user,
             system_program=SYSTEM_PROGRAM_ID,
-            associated_token_program=ATA_PROGRAM_ID,
-            token_program=TOKEN_2022_PROGRAM_ID,
+            creator_vault=derive_creator_vault_pda(creator),
+            token_program=token_program,
             event_authority=derive_event_authority_pda(),
             program=PUMPFUN_PROGRAM_ID,
+            fee_config=derive_fee_config_pda(),
+            fee_program=FEE_PROGRAM_ID,
+            user_volume_accumulator=derive_user_volume_accumulator_pda(user),
+            bonding_curve_v2=derive_bonding_curve_v2_pda(mint),
+            buyback_fee_recipient=(
+                buyback_fee_recipient or PUMPFUN_DEFAULT_BUYBACK_FEE_RECIPIENT
+            ),
         )

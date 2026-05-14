@@ -189,9 +189,7 @@ def train_entry(data_path: Path, model_out: Path, split: str = "chrono") -> dict
         if "realized_pnl_pct" in val_df.columns
         else None
     )
-    thresholds = _search_confidence_thresholds(
-        proba_val, y_val.values, pnl=pnl_val
-    )
+    thresholds = _search_confidence_thresholds(proba_val, y_val.values, pnl=pnl_val)
     logger.info(
         "Confidence-gating thresholds (val-tuned, objective=%s): "
         "FLOOR=%.3f CEILING=%.3f",
@@ -448,9 +446,7 @@ def train_entry_t30(data_path: Path, model_out: Path, split: str = "chrono") -> 
         if "realized_pnl_pct" in val_df.columns
         else None
     )
-    thresholds = _search_confidence_thresholds(
-        proba_val, y_val.values, pnl=pnl_val_t30
-    )
+    thresholds = _search_confidence_thresholds(proba_val, y_val.values, pnl=pnl_val_t30)
     calib = _fit_platt(proba_val, y_val.values)
     test_metrics = _evaluate_gated(proba_test, y_test.values, thresholds, calib)
 
@@ -709,34 +705,39 @@ def train_entry_regression(
     config_hash = compute_config_hash(cfg_for_hash)
     config_values = extract_relevant_fields(cfg_for_hash)
     meta_out = model_out.with_suffix(".meta.json")
-    meta_out.write_text(
-        json.dumps(
-            {
-                "objective": "reg:squarederror",
-                "features": feature_cols,
-                "schema_version": FEATURE_SCHEMA_VERSION,
-                "rmse": rmse,
-                "mae": mae,
-                "spearman_rho": spearman_rho,
-                "auc_sign": auc,
-                "precision_top10": precision_top10,
-                "avg_pnl_top10": avg_pnl_top10,
-                "base_rate": float(y_test_binary.mean()),
-                "pnl_clip_lo": PNL_CLIP_LO,
-                "pnl_clip_hi": PNL_CLIP_HI,
-                "train_rows": len(train_df),
-                "val_rows": len(val_df),
-                "test_rows": len(test_df),
-                "confidence_thresholds": thresholds,
-                "test_gated": test_metrics,
-                "config_hash": config_hash,
-                "config_fields_version": 1,
-                "config_field_names": list(TRAIN_RELEVANT_FIELDS),
-                "config_values": config_values,
-            },
-            indent=2,
-        )
-    )
+    _meta = {
+        "objective": "reg:squarederror",
+        "features": feature_cols,
+        "schema_version": FEATURE_SCHEMA_VERSION,
+        "rmse": rmse,
+        "mae": mae,
+        "spearman_rho": spearman_rho,
+        "auc_sign": auc,
+        "precision_top10": precision_top10,
+        "avg_pnl_top10": avg_pnl_top10,
+        "base_rate": float(y_test_binary.mean()),
+        "pnl_clip_lo": PNL_CLIP_LO,
+        "pnl_clip_hi": PNL_CLIP_HI,
+        "train_rows": len(train_df),
+        "val_rows": len(val_df),
+        "test_rows": len(test_df),
+        "confidence_thresholds": thresholds,
+        "test_gated": test_metrics,
+        "config_hash": config_hash,
+        "config_fields_version": 1,
+        "config_field_names": list(TRAIN_RELEVANT_FIELDS),
+        "config_values": config_values,
+    }
+    # Universal skill gate (task #96): emit an authoritative model_health
+    # block so the runtime judge (model_registry.assess_skill) does not
+    # have to re-derive it. The reg head is gated on rank + sign skill —
+    # a head with rho/auc_sign below the bar must not gate live trades.
+    from pulse_bot.ml.model_registry import assess_skill as _assess_skill
+
+    _sk, _st, _rs = _assess_skill(_meta)
+    _meta["model_health"] = {"status": _st, "skilled": _sk, "reason": _rs}
+    logger.info("  model_health:          %s — %s", _st, _rs)
+    meta_out.write_text(json.dumps(_meta, indent=2))
     return {
         "rmse": rmse,
         "mae": mae,
@@ -962,6 +963,7 @@ def _entry_model_health_check(
     if model_out.exists():
         try:
             import shutil
+
             shutil.copy2(model_out, model_out.with_suffix(model_out.suffix + ".prev"))
             if meta_prev.exists():
                 shutil.copy2(
@@ -1040,7 +1042,6 @@ def _search_confidence_thresholds(
     # FLOOR: seek lowest EV (or WR fallback) below threshold.
     best_floor = 0.30
     best_floor_score = float("inf")
-    best_floor_wr = 1.0
     for t in grid:
         mask = proba < t
         if mask.sum() < min_bucket:
@@ -1052,11 +1053,9 @@ def _search_confidence_thresholds(
         if score < best_floor_score:
             best_floor_score = score
             best_floor = float(t)
-            best_floor_wr = float(y[mask].mean())
     # CEILING: seek highest EV (or WR fallback) above threshold.
     best_ceiling = 0.70
     best_ceiling_score = -float("inf")
-    best_ceiling_wr = 0.0
     for t in grid:
         mask = proba >= t
         if mask.sum() < min_bucket:
@@ -1068,7 +1067,6 @@ def _search_confidence_thresholds(
         if score > best_ceiling_score:
             best_ceiling_score = score
             best_ceiling = float(t)
-            best_ceiling_wr = float(y[mask].mean())
     # Codex 2026-04-28: degeneracy guard with percentile fallback.
     # When EV is monotonically flat / negative across all proba slices
     # (typical on memecoin datasets where avg_pnl is heavily skewed),
@@ -1091,12 +1089,8 @@ def _search_confidence_thresholds(
             best_floor, best_ceiling = 0.30, 0.70
         above_mask = proba >= best_ceiling
         below_mask = proba < best_floor
-        above_wr_chk = (
-            float(y[above_mask].mean()) if above_mask.sum() else 0.0
-        )
-        below_wr_chk = (
-            float(y[below_mask].mean()) if below_mask.sum() else 1.0
-        )
+        above_wr_chk = float(y[above_mask].mean()) if above_mask.sum() else 0.0
+        below_wr_chk = float(y[below_mask].mean()) if below_mask.sum() else 1.0
         # Ranking enrichment: top quintile must show ≥1.3× base WR
         # AND bottom quintile must show ≤0.7× base WR. Both directions
         # required so a single-tail model (e.g. only confident-skip) is
@@ -1316,26 +1310,30 @@ def train_exit_quantile(
 
     model.save_model(model_out)
     meta_out = model_out.with_suffix(".meta.json")
-    meta_out.write_text(
-        json.dumps(
-            {
-                "objective": "reg:quantileerror",
-                "quantile": quantile,
-                "features": feature_cols,
-                "coverage": coverage,
-                "spearman_rho": rho,
-                "train_rows": int(len(X_train)),
-                "test_rows": int(len(X_test)),
-                "note": (
-                    "Shadow-only until paired-bootstrap gate passes. Do "
-                    "not wire into live exit decisions via "
-                    "PULSE_EXIT_REGRESSION_ACTIVE=1 without 2-week shadow "
-                    "validation."
-                ),
-            },
-            indent=2,
-        )
-    )
+    _meta = {
+        "objective": "reg:quantileerror",
+        "quantile": quantile,
+        "features": feature_cols,
+        "coverage": coverage,
+        "spearman_rho": rho,
+        "train_rows": int(len(X_train)),
+        "test_rows": int(len(X_test)),
+        "note": (
+            "Shadow-only until paired-bootstrap gate passes. Do "
+            "not wire into live exit decisions via "
+            "PULSE_EXIT_REGRESSION_ACTIVE=1 without 2-week shadow "
+            "validation."
+        ),
+    }
+    # Universal skill gate (task #96): a quantile head that is not
+    # calibrated (achieved coverage far from the target quantile) must
+    # not influence live exit decisions.
+    from pulse_bot.ml.model_registry import assess_skill as _assess_skill
+
+    _sk, _st, _rs = _assess_skill(_meta)
+    _meta["model_health"] = {"status": _st, "skilled": _sk, "reason": _rs}
+    logger.info("  model_health: %s — %s", _st, _rs)
+    meta_out.write_text(json.dumps(_meta, indent=2))
     logger.info("Saved quantile model to %s", model_out)
     return {"quantile": quantile, "coverage": coverage, "spearman_rho": rho}
 
@@ -1395,7 +1393,9 @@ def train_exit_quantile_max_hold(
         )
     df_obs = df[~censored_mask].copy()
 
-    mints_order = df_obs.drop_duplicates("mint").sort_values("entry_ts")["mint"].tolist()
+    mints_order = (
+        df_obs.drop_duplicates("mint").sort_values("entry_ts")["mint"].tolist()
+    )
     if len(mints_order) < 5:
         raise ValueError(
             "exit_quantile_max_hold: too few unique mints with observed "
@@ -1443,16 +1443,16 @@ def train_exit_quantile_max_hold(
     # near-zero. Old artifact had rho=-0.21 (model predicted opposite
     # of reality). New training on non-censored rows must beat that
     # by a wide margin.
-    status = "ok" if rho >= 0.10 else (
-        "anti_correlated" if rho < 0 else "weak_signal"
-    )
+    status = "ok" if rho >= 0.10 else ("anti_correlated" if rho < 0 else "weak_signal")
     logger.info("=" * 60)
     logger.info("EXIT QUANTILE max_hold (q=%.2f) RESULTS", quantile)
     logger.info("  Coverage (target ≈ %.2f): %.3f", quantile, coverage_q)
     logger.info("  Spearman rho: %.4f (status=%s)", rho, status)
     logger.info("  Train rows: %d, Test rows: %d", len(X_train), len(X_test))
-    logger.info("  Observed-peak coverage: %.1f%% (rest right-censored, dropped)",
-                coverage * 100)
+    logger.info(
+        "  Observed-peak coverage: %.1f%% (rest right-censored, dropped)",
+        coverage * 100,
+    )
     logger.info("  Pred range: [%.1f, %.1f]s", pred_test.min(), pred_test.max())
     logger.info("=" * 60)
 

@@ -40,8 +40,9 @@ def _float_env(name: str, default: float) -> float:
     try:
         return float(raw)
     except ValueError:
-        logger.warning("FeatureFlags: %s=%r is not a number; using %s",
-                       name, raw, default)
+        logger.warning(
+            "FeatureFlags: %s=%r is not a number; using %s", name, raw, default
+        )
         return default
 
 
@@ -52,8 +53,9 @@ def _int_env(name: str, default: int) -> int:
     try:
         return int(raw)
     except ValueError:
-        logger.warning("FeatureFlags: %s=%r is not an int; using %s",
-                       name, raw, default)
+        logger.warning(
+            "FeatureFlags: %s=%r is not an int; using %s", name, raw, default
+        )
         return default
 
 
@@ -66,36 +68,65 @@ class FeatureFlags:
     """
 
     # ── Entry decision modes ─────────────────────────────────────
-    entry_grey_to_skip: bool = field(default_factory=lambda: _bool_env("PULSE_ENTRY_GREY_TO_SKIP"))
-    entry_t30_active: bool = field(default_factory=lambda: _bool_env("PULSE_ENTRY_T30_ACTIVE"))
-    entry_t30_skip_only_active: bool = field(default_factory=lambda: _bool_env("PULSE_ENTRY_T30_SKIP_ACTIVE"))
-    survival_active: bool = field(default_factory=lambda: _bool_env("PULSE_SURVIVAL_ACTIVE"))
-    timing_active: bool = field(default_factory=lambda: _bool_env("PULSE_TIMING_ACTIVE"))
-    allow_degenerate_model: bool = field(default_factory=lambda: _bool_env("PULSE_ALLOW_DEGENERATE_MODEL"))
+    entry_grey_to_skip: bool = field(
+        default_factory=lambda: _bool_env("PULSE_ENTRY_GREY_TO_SKIP")
+    )
+    entry_t30_active: bool = field(
+        default_factory=lambda: _bool_env("PULSE_ENTRY_T30_ACTIVE")
+    )
+    entry_t30_skip_only_active: bool = field(
+        default_factory=lambda: _bool_env("PULSE_ENTRY_T30_SKIP_ACTIVE")
+    )
+    survival_active: bool = field(
+        default_factory=lambda: _bool_env("PULSE_SURVIVAL_ACTIVE")
+    )
+    timing_active: bool = field(
+        default_factory=lambda: _bool_env("PULSE_TIMING_ACTIVE")
+    )
+    allow_degenerate_model: bool = field(
+        default_factory=lambda: _bool_env("PULSE_ALLOW_DEGENERATE_MODEL")
+    )
 
     # ── Confidence gates (codex 2026-04-27) ──────────────────────
-    t30_skip_tail: float = field(default_factory=lambda: _float_env("PULSE_T30_SKIP_TAIL", 0.05))
-    t30_buy_tail: float = field(default_factory=lambda: _float_env("PULSE_T30_BUY_TAIL", 0.85))
-    timing_confidence_gate: float = field(default_factory=lambda: _float_env("PULSE_TIMING_CONFIDENCE_GATE", 0.85))
+    t30_skip_tail: float = field(
+        default_factory=lambda: _float_env("PULSE_T30_SKIP_TAIL", 0.05)
+    )
+    t30_buy_tail: float = field(
+        default_factory=lambda: _float_env("PULSE_T30_BUY_TAIL", 0.85)
+    )
+    timing_confidence_gate: float = field(
+        default_factory=lambda: _float_env("PULSE_TIMING_CONFIDENCE_GATE", 0.85)
+    )
 
     # ── Pre-filters ──────────────────────────────────────────────
-    bot_cluster_hard_skip: int = field(default_factory=lambda: _int_env("PULSE_BOT_CLUSTER_HARD_SKIP", 3))
+    bot_cluster_hard_skip: int = field(
+        default_factory=lambda: _int_env("PULSE_BOT_CLUSTER_HARD_SKIP", 3)
+    )
 
     # ── Event-time watermark (codex Issue #1, 2026-04-27) ────────
-    checkpoint_lag_buffer_sec: float = field(default_factory=lambda: _float_env("PULSE_CHECKPOINT_LAG_BUFFER", 0.5))
+    checkpoint_lag_buffer_sec: float = field(
+        default_factory=lambda: _float_env("PULSE_CHECKPOINT_LAG_BUFFER", 0.5)
+    )
 
     # ── Multiplexer queue sizes (codex Phase I, 2026-04-28) ─────
-    mux_create_queue_max: int = field(default_factory=lambda: _int_env("PULSE_MUX_CREATE_QUEUE_MAX", 5000))
-    mux_trade_queue_max: int = field(default_factory=lambda: _int_env("PULSE_MUX_TRADE_QUEUE_MAX", 200))
+    mux_create_queue_max: int = field(
+        default_factory=lambda: _int_env("PULSE_MUX_CREATE_QUEUE_MAX", 5000)
+    )
+    mux_trade_queue_max: int = field(
+        default_factory=lambda: _int_env("PULSE_MUX_TRADE_QUEUE_MAX", 200)
+    )
 
     # ── Observability ────────────────────────────────────────────
-    metrics_port: int = field(default_factory=lambda: _int_env("PULSE_METRICS_PORT", 9100))
+    metrics_port: int = field(
+        default_factory=lambda: _int_env("PULSE_METRICS_PORT", 9100)
+    )
 
     def log_summary(self) -> None:
         """Emit one INFO line per flag at startup so the bot.log
         records exactly what mode the bot booted in. Matches the
         verbosity codex asked for: 'why model was eligible to run'."""
         from dataclasses import fields
+
         logger.info("=" * 78)
         logger.info("FeatureFlags — boot snapshot")
         for f in fields(self):

@@ -12,11 +12,7 @@ from typing import Any, AsyncIterator
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from pulse_bot.config import (
-    PUMPFUN_GRADUATION_SOL,
-    PUMPPORTAL_API_KEY,
-    PulseBotConfig,
-)
+from pulse_bot.config import PUMPFUN_GRADUATION_SOL, PUMPPORTAL_API_KEY, PulseBotConfig
 from pulse_bot.launchpads.base import Launchpad
 from pulse_bot.models import Token, Trade
 
@@ -250,9 +246,7 @@ class PumpFunLaunchpad(Launchpad):
                 "PUMPPORTAL_API_KEY not set — `subscribeTokenTrade` will "
                 "be silently rejected; trade ingestion will not work"
             )
-        self._ws = await websockets.connect(
-            url, ping_interval=30, ping_timeout=60
-        )
+        self._ws = await websockets.connect(url, ping_interval=30, ping_timeout=60)
         await self._ws.send(json.dumps({"method": "subscribeNewToken"}))
         logger.info("Subscribed to new tokens on PumpFun")
 
@@ -361,7 +355,8 @@ class PumpFunLaunchpad(Launchpad):
                     silence,
                 )
                 self._last_msg_ts = 0.0
+                # Best-effort socket close on reconnect — failure is benign.
                 try:
                     await self._ws.close()
-                except Exception:
+                except Exception:  # nosec B110
                     pass

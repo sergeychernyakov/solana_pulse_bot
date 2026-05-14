@@ -211,7 +211,34 @@ class PulseBotConfig:
     # Use to gather signal-quality data without polluting paper_trades table
     # with noisy losing trades while tuning config. Toggle via PULSE_COLLECTOR_ONLY.
     collector_only: bool = False
+    # Real-sim paper trading: when True, the bot routes every paper-
+    # trade entry through `simulateTransaction` against the live
+    # bonding curve and records realistic fill metadata
+    # (expected_tokens, fees, units) on every trade. No SOL is spent.
+    # Wire via env PULSE_PAPER_USE_REAL_SIM.
+    paper_use_real_sim: bool = False
+    # When ``paper_use_real_sim`` is on, this controls whether a
+    # failed sim SKIPs the entry (gate=True, default) or merely
+    # records the failure into ``sim_metadata`` while letting the
+    # paper trade open as before (gate=False = "shadow mode").
+    # Shadow mode is the safe rollout path: it lets us compare
+    # paper-math fills vs realistic fills without altering bot
+    # profitability. Wire via env PULSE_PAPER_SIM_GATE.
+    paper_sim_gate: bool = True
     buy_amount_sol: float = 0.1
+    # ── DYNAMIC POSITION SIZING ────────────────────────────
+    # When ``dynamic_sizing_pct > 0``, each new paper-entry's
+    # buy_amount is computed as
+    #   clamp(realized_balance * dynamic_sizing_pct / 100,
+    #         dynamic_sizing_floor_sol,
+    #         dynamic_sizing_cap_sol)
+    # rather than using the fixed ``buy_amount_sol``. Realized
+    # balance = portfolio_initial_sol + Σ pnl_sol of closed paper
+    # trades. Effect: position grows on profit (compound), shrinks
+    # on drawdown (defensive). At 0 (default) sizing is static.
+    dynamic_sizing_pct: float = 0.0
+    dynamic_sizing_cap_sol: float = 0.5
+    dynamic_sizing_floor_sol: float = 0.05
     execution_base_slippage: float = 0.02
     execution_slippage_per_volume_pct: float = 0.05
     execution_max_slippage: float = 0.25
@@ -362,6 +389,17 @@ def get_config() -> PulseBotConfig:
             "collector_only",
             lambda v: v.lower() in ("1", "true", "yes"),
         ),
+        "PULSE_PAPER_USE_REAL_SIM": (
+            "paper_use_real_sim",
+            lambda v: v.lower() in ("1", "true", "yes"),
+        ),
+        "PULSE_PAPER_SIM_GATE": (
+            "paper_sim_gate",
+            lambda v: v.lower() in ("1", "true", "yes"),
+        ),
+        "PULSE_DYNAMIC_SIZING_PCT": ("dynamic_sizing_pct", float),
+        "PULSE_DYNAMIC_SIZING_CAP_SOL": ("dynamic_sizing_cap_sol", float),
+        "PULSE_DYNAMIC_SIZING_FLOOR_SOL": ("dynamic_sizing_floor_sol", float),
         "PULSE_EXIT_ML_ACTIVE": (
             "exit_ml_active",
             lambda v: v.lower() in ("1", "true", "yes"),
@@ -428,6 +466,26 @@ def get_config() -> PulseBotConfig:
     return cfg
 
 
+def compute_buy_amount_sol(cfg: "PulseBotConfig", realized_balance_sol: float) -> float:
+    """Resolve the position size for the next paper-trade entry.
+
+    When ``cfg.dynamic_sizing_pct > 0`` the size scales with the
+    realized balance — compound on profit, defensive on drawdown.
+    Otherwise returns the fixed ``cfg.buy_amount_sol``. Result is
+    clamped to ``[dynamic_sizing_floor_sol, dynamic_sizing_cap_sol]``
+    and rounded to 3 decimals (so 5% of 2.0 SOL → 0.1 SOL exactly,
+    matching the legacy fixed default at start-of-portfolio).
+    """
+    if cfg.dynamic_sizing_pct <= 0.0:
+        return float(cfg.buy_amount_sol)
+    raw = float(realized_balance_sol) * (cfg.dynamic_sizing_pct / 100.0)
+    lo = float(cfg.dynamic_sizing_floor_sol)
+    hi = float(cfg.dynamic_sizing_cap_sol)
+    if hi < lo:
+        hi = lo
+    return round(max(lo, min(hi, raw)), 3)
+
+
 def _warn_on_dead_exit_combo(cfg: PulseBotConfig) -> None:
     """Emit a startup WARNING when ``(exit_max_hold_seconds,
     exit_take_profit_pct)`` is the long-known dead pair (TP=100% but
@@ -445,13 +503,18 @@ def _warn_on_dead_exit_combo(cfg: PulseBotConfig) -> None:
     _logger = _logging.getLogger("pulse_bot.config")
     tp = float(cfg.exit_take_profit_pct or 0.0)
     mh = float(cfg.exit_max_hold_seconds or 0.0)
-    if tp >= 100.0 and mh <= 120.0:
+    # 2026-05-12 broadened (codex review): empirical p90 of peak_pnl_pct
+    # over the hold window in exit.parquet (N=1997) is +13.8%, p95=+20.7%,
+    # only ~1.85% of holds reach +30%. The legacy (TP=100, max_hold=90)
+    # warning let (TP=30, max_hold=120) slip through — that pair is also
+    # structurally near-dead. Live confirmed 0/159 TP fires in 10.7h.
+    if (tp >= 100.0 and mh <= 120.0) or (tp >= 30.0 and mh <= 180.0):
         _logger.warning(
             "EXIT CONFIG WARNING: take_profit_pct=%.1f%% with "
-            "max_hold_seconds=%.0fs is the documented dead pair "
-            "(TP almost never fires; see "
-            "project_exit_take_profit_broken). Run optimizer sweep "
-            "before activating ML exit gates.",
+            "max_hold_seconds=%.0fs is structurally near-dead "
+            "(empirical p90 peak ≈ +14%%; <2%% of holds reach +30%% "
+            "within 120s; see project_exit_take_profit_broken). "
+            "Run scripts/tp_max_hold_sweep.py before activating.",
             tp,
             mh,
         )

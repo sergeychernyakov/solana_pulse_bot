@@ -42,26 +42,65 @@ def _replay_trades(
     trades: Iterable[Trade],
     entry_ts: float,
     entry_price: float,
+    tick_seconds: float = 5.0,
+    horizon_seconds: float = 0.0,
 ) -> MonitorResult:
-    """Internal core: same loop as ``simulate_exit``; reused by batch path.
+    """Internal core: replay trades + interleaved tick events.
 
-    Kept separate so ``simulate_exit_batch`` can drive many runners without
-    extra function-call overhead and so the public ``simulate_exit``
-    signature stays untouched.
+    Live parity: in production the bot has two concurrent coroutines on
+    each open paper trade — ``_trade_stream_loop`` (processes WS trades)
+    and ``_tick_loop`` (evaluates exit rules every ``tick_seconds``
+    regardless of trade activity). The tick loop is the only thing that
+    closes positions when the WS goes quiet — ``runner.tick()`` checks
+    ``max_hold`` / survival / inactivity via ``elapsed = now - entry_ts``
+    without needing a new trade event.
+
+    Previously this function only replayed trades — for the 76 % of
+    pump.fun positions that go silent after ~5 s, the simulator missed
+    every tick-driven exit live had taken (max_hold, survival, etc.) and
+    instead returned a stale ``timeout_result`` at the last trade. Result
+    on a 2509-position sample: live PnL = +0.49 SOL, sim PnL = −16.76 SOL
+    on identical entries/config — a pure policy-skew artifact.
+
+    We now walk the timeline: drain ticks until the next trade's
+    timestamp, then process the trade, repeat. After trades exhaust we
+    keep ticking until ``max_hold + buffer`` (or ``horizon_seconds`` if
+    larger) so dead-after-5 s positions exit by max_hold like in live.
     """
     runner = PaperTradeRunner(config, entry_price)
-    last_ts = entry_ts
-    inactivity = float(getattr(config, "exit_inactivity_seconds", 0.0) or 0.0)
+    tick_seconds = max(float(tick_seconds or 0.0), 1.0)
+    max_hold = float(getattr(config, "exit_max_hold_seconds", 0.0) or 0.0)
+    deadline_ts = entry_ts + max(max_hold + tick_seconds, float(horizon_seconds or 0.0))
+    next_tick_ts = entry_ts + tick_seconds
+
+    def _drain_ticks_until(target_ts: float) -> MonitorResult | None:
+        nonlocal next_tick_ts
+        while next_tick_ts <= target_ts:
+            res = runner.tick(next_tick_ts, entry_ts)
+            if res is not None:
+                return res
+            next_tick_ts += tick_seconds
+        return None
+
     for trade in trades:
-        if inactivity > 0.0 and (trade.timestamp - last_ts) > inactivity:
-            return runner.timeout_result(
-                hold_seconds=max(last_ts - entry_ts, 0.0)
-            )
+        # Interpolate ticks up to this trade's timestamp first — gives
+        # max_hold / inactivity / survival a chance to fire on quiet
+        # gaps, matching the live tick_loop behaviour.
+        tick_res = _drain_ticks_until(trade.timestamp)
+        if tick_res is not None:
+            return tick_res
         result = runner.process_trade(trade, entry_ts)
         if result is not None:
             return result
-        last_ts = trade.timestamp
-    return runner.timeout_result(hold_seconds=max(last_ts - entry_ts, 0.0))
+
+    # Trades exhausted — continue ticking until deadline. This is what
+    # live does between the last WS trade and the eventual max_hold /
+    # survival exit. Without this, "dead-after-5s" positions wrongly
+    # return timeout_result at last_ts instead of the real exit.
+    tick_res = _drain_ticks_until(deadline_ts)
+    if tick_res is not None:
+        return tick_res
+    return runner.timeout_result(hold_seconds=max(deadline_ts - entry_ts, 0.0))
 
 
 def simulate_exit(
@@ -89,15 +128,17 @@ def simulate_exit(
     Returns:
         ``MonitorResult`` with ``exit_price``, ``exit_reason``,
         ``pnl_pct`` (fee+slippage adjusted, partial-exit-weighted). When
-        ``trades`` is exhausted without a hard exit, returns the
-        ``timeout_result()`` (last observed price, reason="timeout").
+        no hard exit fires before ``max_hold``, the terminal
+        ``timeout_result()`` is returned.
 
-    Inactivity handling: live path uses ``stream_trades(..., inactivity_timeout=X)``
-    which terminates the iterator when no trade arrives for X seconds.
-    We replicate that here by checking ``trade.timestamp - last_ts`` — if
-    a gap exceeds ``config.exit_inactivity_seconds``, we stop iterating
-    and return ``timeout_result``. Zero/negative ``exit_inactivity_seconds``
-    disables the check (matching live semantics).
+    Tick parity: live runs a ``_tick_loop`` alongside the trade stream,
+    so ``max_hold`` / inactivity / survival can close a position even
+    when the WS goes silent. ``_replay_trades`` mirrors that by draining
+    ``runner.tick()`` events (every ``tick_seconds``) between trades and
+    after the trade stream is exhausted — up to ``max_hold + tick``.
+    Without this the ~76 % of pump.fun tokens that die after ~5 s would
+    wrongly carry their last observed price to a stale timeout instead
+    of the real max-hold exit.
     """
     return _replay_trades(config, trades, entry_ts, entry_price)
 

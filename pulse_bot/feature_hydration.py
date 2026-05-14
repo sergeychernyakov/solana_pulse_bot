@@ -53,7 +53,9 @@ class HydratedContext:
     holder_snapshot: dict[str, Any] | None = None
     top_n_wallets: list[str] = field(default_factory=list)
     wallet_prior_stats: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
-    wallet_classifications: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    wallet_classifications: Mapping[str, Mapping[str, Any]] = field(
+        default_factory=dict
+    )
     n_buyers_first_5s: float = float("nan")
     cutoff_ts: float = 0.0
 
@@ -179,9 +181,7 @@ class FeatureHydrationService:
 
         return ctx
 
-    def _fetch_wallet_classifications(
-        self, wallets: list[str]
-    ) -> dict[str, dict]:
+    def _fetch_wallet_classifications(self, wallets: list[str]) -> dict[str, dict]:
         """Single SELECT against wallet_classifications. Returns
         {wallet: {is_sniper, is_smart_money, is_bot, cluster_size}}
         only for wallets that have a row. Empty dict on failure."""
@@ -204,9 +204,7 @@ class FeatureHydrationService:
                 for r in rows
             }
         except Exception as exc:
-            logger.debug(
-                "wallet_classifications lookup failed: %s", exc
-            )
+            logger.debug("wallet_classifications lookup failed: %s", exc)
             return {}
 
     def hydrate_for_t30(

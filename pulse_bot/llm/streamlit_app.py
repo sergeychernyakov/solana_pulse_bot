@@ -1,4 +1,6 @@
 # pulse_bot/llm/streamlit_app.py
+# ruff: noqa: E402 — Streamlit runs this file directly, so the repo-root
+# sys.path injection (below) must happen before any pulse_bot.* import.
 """Interactive Streamlit UI for the LangChain/LangGraph trade-explainer.
 
 Run::
@@ -40,9 +42,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import streamlit as st
-from langchain_core.language_models.fake_chat_models import (
-    FakeListChatModel,
-)
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -53,6 +53,7 @@ from pulse_bot.llm.explainer import (
     TradeExplanation,
     build_trade_explainer_chain,
 )
+
 FIXTURE_PATH = REPO_ROOT / "pulse_bot" / "llm" / "fixtures" / "trades_sample.json"
 
 
@@ -80,9 +81,7 @@ def stub_response_for(trade: Mapping[str, Any]) -> str:
     hold = float(trade.get("hold_seconds") or 0.0)
 
     is_fee_bleed = (
-        exit_reason == "survival_predict"
-        and 90 < hold < 110
-        and -0.008 < pnl < -0.006
+        exit_reason == "survival_predict" and 90 < hold < 110 and -0.008 < pnl < -0.006
     )
 
     if is_fee_bleed:
@@ -153,15 +152,21 @@ def stub_chain_for(trade: Mapping[str, Any]):
 
 def payload_for(trade: Mapping[str, Any]) -> dict[str, Any]:
     keys = (
-        "mint", "symbol", "entry_type", "entry_score",
-        "entry_buyer_number", "entry_mcap_sol", "exit_reason",
-        "exit_mcap_sol", "hold_seconds", "pnl_sol", "pnl_pct",
-        "total_buys", "total_sells",
+        "mint",
+        "symbol",
+        "entry_type",
+        "entry_score",
+        "entry_buyer_number",
+        "entry_mcap_sol",
+        "exit_reason",
+        "exit_mcap_sol",
+        "hold_seconds",
+        "pnl_sol",
+        "pnl_pct",
+        "total_buys",
+        "total_sells",
     )
-    return {
-        k: trade.get(k) if trade.get(k) is not None else ""
-        for k in keys
-    }
+    return {k: trade.get(k) if trade.get(k) is not None else "" for k in keys}
 
 
 def grade_to_color(grade: str) -> tuple[str, str]:
@@ -195,9 +200,7 @@ provider = st.sidebar.radio(
 )
 
 if provider == "Real (Anthropic)" and not os.environ.get("ANTHROPIC_API_KEY"):
-    st.sidebar.warning(
-        "ANTHROPIC_API_KEY not set — falling back to stub mode."
-    )
+    st.sidebar.warning("ANTHROPIC_API_KEY not set — falling back to stub mode.")
     provider = "Stub (no API)"
 
 trade_label = st.sidebar.selectbox(
@@ -232,10 +235,12 @@ st.caption(
 
 # Trade summary card
 emoji, color = grade_to_color(
-    "bad" if (trade.get("exit_reason") == "survival_predict"
-              and -0.008 < float(trade.get("pnl_sol") or 0) < -0.006)
-    else "good" if float(trade.get("pnl_sol") or 0) > 0
-    else "neutral"
+    "bad"
+    if (
+        trade.get("exit_reason") == "survival_predict"
+        and -0.008 < float(trade.get("pnl_sol") or 0) < -0.006
+    )
+    else "good" if float(trade.get("pnl_sol") or 0) > 0 else "neutral"
 )
 
 c1, c2, c3, c4 = st.columns(4)
@@ -363,9 +368,7 @@ with tab_arch:
 
     st.subheader("Layer 2 — LangGraph state machine")
     graph = build_analysis_graph()
-    st.markdown(
-        f"```mermaid\n{graph.get_graph().draw_mermaid()}\n```"
-    )
+    st.markdown(f"```mermaid\n{graph.get_graph().draw_mermaid()}\n```")
     st.caption(
         "Conditional edge after `analyst` routes open trades "
         "directly to `synthesizer`, closed trades through `critic`."
@@ -373,12 +376,12 @@ with tab_arch:
 
     st.subheader("State (LangGraph TypedDict)")
     st.code(
-        '''class AnalysisState(TypedDict, total=False):
+        """class AnalysisState(TypedDict, total=False):
     trade: Mapping[str, Any]
     analyst_view: str
     critic_view: str
     final_verdict: str
-    quality_grade: Literal["good", "neutral", "bad"]''',
+    quality_grade: Literal["good", "neutral", "bad"]""",
         language="python",
     )
 

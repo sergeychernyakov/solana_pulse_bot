@@ -11,10 +11,10 @@ Future split: ``_entry.py`` (EntryMLPolicy, EntryT30Policy),
 a new policy class.
 """
 
-from pulse_bot.ml.policy._main import *  # noqa: F401,F403
 from pulse_bot.ml.policy import _main as _impl  # noqa: F401
 
 # Explicit re-exports for static analysers + IDE autocomplete.
+from pulse_bot.ml.policy._main import *  # noqa: F401,F403
 from pulse_bot.ml.policy._main import (  # noqa: F401
     DEFAULT_ENTRY_MODEL_PATH,
     DEFAULT_ENTRY_REG_MODEL_PATH,
@@ -25,14 +25,14 @@ from pulse_bot.ml.policy._main import (  # noqa: F401
     EntryT30Policy,
     ExitMLPolicy,
     ExitQuantilePolicy,
-    sha256_file,
+    _check_config_drift,
+    _first_mismatch,
+    _resolve_entry_model_path,
+    _safe_get_runtime_config,
     get_active_policy_name,
     load_entry_policy_if_available,
     load_entry_t30_policy_if_available,
     load_exit_policy_if_available,
     load_exit_quantile_if_available,
-    _safe_get_runtime_config,
-    _check_config_drift,
-    _first_mismatch,
-    _resolve_entry_model_path,
+    sha256_file,
 )

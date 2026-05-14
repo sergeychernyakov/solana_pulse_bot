@@ -141,9 +141,7 @@ class FastFilter:
             and creator_self_buy_max_pos > 0
             and creator_self_buy_position <= creator_self_buy_max_pos
         ):
-            return _reject(
-                f"creator_self_buy_pos{creator_self_buy_position}"
-            )
+            return _reject(f"creator_self_buy_pos{creator_self_buy_position}")
 
         # ── Scoring ────────────────────────────────────────
 
@@ -192,9 +190,7 @@ class FastFilter:
         # 7. Creator self-buy soft penalty (when not hard-rejected above).
         # Even if we don't reject outright, flag this as suspicious so
         # the score reflects the rug risk.
-        creator_self_buy_score = getattr(
-            self._cfg, "fast_creator_self_buy_score", 0
-        )
+        creator_self_buy_score = getattr(self._cfg, "fast_creator_self_buy_score", 0)
         if creator_self_buy and creator_self_buy_score:
             total_score += creator_self_buy_score
             reasons.append(

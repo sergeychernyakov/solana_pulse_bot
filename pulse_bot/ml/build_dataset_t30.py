@@ -83,6 +83,7 @@ def build_entry_dataset_t30(
     """
     base: pd.DataFrame | None = None
     import time as _time
+
     if base_parquet_path is not None and base_parquet_path.exists():
         age_sec = _time.time() - base_parquet_path.stat().st_mtime
         if age_sec < 24 * 3600:
@@ -98,13 +99,15 @@ def build_entry_dataset_t30(
             except Exception as exc:
                 logger.warning(
                     "Failed to load %s, falling back to full build: %s",
-                    base_parquet_path, exc,
+                    base_parquet_path,
+                    exc,
                 )
                 base = None
         else:
             logger.info(
                 "%s is %.0f min old (>24h) — forcing full rebuild",
-                base_parquet_path, age_sec / 60,
+                base_parquet_path,
+                age_sec / 60,
             )
     if base is None:
         base = build_entry_dataset(
@@ -211,10 +214,13 @@ def build_entry_dataset_t30(
                             "is_bot": bool(r[3] or 0),
                             "cluster_size": r[4],
                         }
-                except Exception:
-                    pass  # v21 features default to NaN
+                # v21 wallet-prior features default to NaN on lookup failure.
+                except Exception:  # nosec B110
+                    pass
             feats = _extract_wallet_prior_features(
-                stats_map, top3, t30_cutoff,
+                stats_map,
+                top3,
+                t30_cutoff,
                 wallet_classifications=cls_subset,
             )
             # v20 sniper proxy at T+30. Need mint creation time for age.

@@ -251,16 +251,22 @@ class TestSimulateTradeFrom:
         # Boundary is ``last_trade_ts + inactivity`` == 520 + 60 = 580.
         assert result["exit_time"] == pytest.approx(520.0 + 60.0)
 
-    def test_hard_stop_uses_stop_price_not_last_trade_price(self) -> None:
-        """PaperTradeRunner returns a stop_price = entry*(1 − SL/100) for hard_stop.
+    def test_hard_stop_uses_current_price_not_synthetic_stop(self) -> None:
+        """PaperTradeRunner returns the actual trigger trade's price for
+        hard_stop (NOT a synthetic ``entry × (1 − SL/100)``).
 
-        PnL on the hard-stop leg is fee-adjusted via ``calc_pnl_pct`` so live
-        DB persistence and optimizer results match exactly.
+        2026-05-12 semantic change (codex review): ``exit_hard_stop_loss_pct``
+        is a floor on the after-fee leg PnL. The trigger fires on the
+        first trade whose price pushes leg PnL below that floor. Using
+        a synthetic stop_price + re-running ``_weighted_pnl`` over it
+        was double-counting fees and inflating reported losses by ~6-7pp.
+        Honest behaviour: report the price at which the trigger actually
+        fired so ``pnl_pct`` matches the trigger condition exactly.
         """
         from pulse_bot.core import calc_pnl_pct
 
         cfg = _cfg(exit_hard_stop_loss_pct=25.0)
-        trigger = _mk_trade(510.0, 0.0005)  # −50% price move
+        trigger = _mk_trade(510.0, 0.0005)  # −50% price move triggers SL=25%
         cached = CachedToken(
             token=_token(),
             monitor_trades=[trigger],
@@ -276,10 +282,9 @@ class TestSimulateTradeFrom:
             entry_time=500.0,
             cfg=cfg,
         )
-        stop_price = 0.001 * (1 - 0.25)
-        expected_pnl = calc_pnl_pct(0.001, stop_price, cfg.buy_amount_sol)
+        expected_pnl = calc_pnl_pct(0.001, 0.0005, cfg.buy_amount_sol)
         assert result["exit_reason"] == "hard_stop"
-        assert result["exit_price"] == pytest.approx(stop_price)
+        assert result["exit_price"] == pytest.approx(0.0005)
         assert result["pnl_pct"] == pytest.approx(expected_pnl)
 
     def test_stream_ends_without_exit_matches_live_dead_token(self) -> None:

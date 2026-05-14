@@ -195,11 +195,43 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     pnl_sol DOUBLE PRECISION DEFAULT 0.0,
     hold_seconds DOUBLE PRECISION DEFAULT 0.0,
 
-    buy_amount_sol DOUBLE PRECISION DEFAULT 0.03
+    buy_amount_sol DOUBLE PRECISION DEFAULT 0.03,
+
+    -- Real on-chain simulation metadata. Populated when the bot is
+    -- run with PULSE_PAPER_USE_REAL_SIM=1. JSON keys:
+    --   entry: {success, expected_tokens_raw, sol_in_lamports,
+    --           slippage_bps_cap, units_consumed, err}
+    --   exit:  {success, expected_sol_out_lamports, tokens_in_raw,
+    --           slippage_bps_cap, units_consumed, err}
+    -- Lets dashboards compare math-based PnL vs realistic-fill PnL
+    -- side-by-side without altering the legacy entry_price column.
+    sim_metadata JSONB,
+
+    -- Multi-config A/B (2026-05-13): which entry-decision config opened
+    -- this trade. 'LIVE' = production policy. Lets parallel paper
+    -- portfolios share one WS stream while being tagged independently.
+    config_id TEXT
 );
+-- Migration for pre-existing tables (idempotent — safe on bot restart).
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS sim_metadata JSONB;
+ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS config_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_paper_status ON paper_trades(status);
 CREATE INDEX IF NOT EXISTS idx_paper_mint ON paper_trades(mint);
 CREATE INDEX IF NOT EXISTS idx_paper_entry_time ON paper_trades(entry_time);
+CREATE INDEX IF NOT EXISTS idx_paper_trades_config ON paper_trades(config_id);
+
+-- Multi-config A/B registry — source of truth for entry-config history.
+-- Populated at bot startup from config/entry_configs.yaml via
+-- entry_configs.upsert_registry_to_db().
+CREATE TABLE IF NOT EXISTS entry_configs (
+    config_id      TEXT PRIMARY KEY,
+    name           TEXT NOT NULL,
+    description    TEXT,
+    params         JSONB NOT NULL,
+    is_active      SMALLINT NOT NULL DEFAULT 1,
+    created_at     DOUBLE PRECISION NOT NULL,
+    deprecated_at  DOUBLE PRECISION
+);
 
 CREATE TABLE IF NOT EXISTS live_decisions (
     mint TEXT PRIMARY KEY,

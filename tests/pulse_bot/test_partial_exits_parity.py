@@ -242,9 +242,13 @@ class TestHardStopAfterPartialUsesLegPnL:
 
         assert result is not None, "hard_stop must fire on current remnant"
         assert result.exit_reason == "hard_stop"
-        # exit_price is entry*(1 - SL/100), independent of realized gains
-        assert result.exit_price == pytest.approx(0.001 * (1 - 0.25))
-        # But weighted pnl_pct includes the realized partial → overall positive
+        # 2026-05-12 semantic change: exit_price is the trigger trade's
+        # price (where the SL was actually crossed), not a synthetic
+        # entry × (1 - SL/100). The trigger condition is on after-fee leg
+        # PnL of current_price; using current_price as exit_price avoids
+        # double-applying fees in the persisted pnl_pct.
+        assert result.exit_price == pytest.approx(0.0006)
+        # Weighted pnl_pct includes the realized partial → overall positive
         assert (
             result.pnl_pct > 0
         ), "weighted pnl should reflect the realized partial gain + remnant at stop"

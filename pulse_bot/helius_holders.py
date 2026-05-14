@@ -64,7 +64,7 @@ DEFAULT_TIMEOUT_SEC = 1.5
 # 2026-04-27 to enable a two-stage cascade: stage 1 buys/skips at T+90,
 # stage 2 (post-90s data) re-validates survivors. Override via env
 # PULSE_HOLDER_CAPTURE_AGES="30,60,120,180,300,600".
-import os as _os_capture
+import os as _os_capture  # noqa: E402 — co-located with capture-age config below
 
 _default_ages = (30.0, 60.0, 120.0, 180.0, 300.0, 600.0)
 _env_ages = _os_capture.environ.get("PULSE_HOLDER_CAPTURE_AGES", "").strip()

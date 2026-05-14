@@ -218,6 +218,13 @@ class _FakeDB:
         self.opened += 1
         return 42
 
+    def get_realized_balance_sync(
+        self, initial_sol: float, config_id: str | None = None
+    ) -> float:
+        # No closed trades in these timer-tick tests — dynamic sizing
+        # falls back to start-of-portfolio balance.
+        return float(initial_sol)
+
     async def close_paper_trade(
         self,
         trade_id: int,
@@ -264,6 +271,12 @@ def _make_pipeline(cfg: PulseBotConfig, launchpad: _FakeLaunchpad, db: _FakeDB):
     pipe._config = cfg
     pipe._db = db
     pipe._launchpad = launchpad
+    # Multi-config refactor: ``_open_slots`` is now a property aliasing
+    # the LIVE config's entry in ``_open_slots_by_config``. A Pipeline
+    # built via ``__new__`` must seed the backing dict + registry before
+    # the property setter is usable.
+    pipe._config_registry = None  # single-config mode → _live_config_id="LIVE"
+    pipe._open_slots_by_config = {}
     pipe._open_slots = 1  # pretend a slot was reserved at entry
     return pipe
 

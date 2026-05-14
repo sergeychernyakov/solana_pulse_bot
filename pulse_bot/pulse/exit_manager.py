@@ -197,9 +197,7 @@ class ExitManager:
                 self._quantile_sl is not None or self._quantile_tp is not None
             ):
                 try:
-                    shadow_state = self._build_state_for_ml(
-                        pulse, pnl_pct, elapsed_sec
-                    )
+                    shadow_state = self._build_state_for_ml(pulse, pnl_pct, elapsed_sec)
                     q25 = (
                         self._quantile_sl.predict(shadow_state, pulse)
                         if self._quantile_sl is not None
@@ -345,9 +343,11 @@ class ExitManager:
                     # 2026-05-01: log so filter_health observability picks
                     # up firings (was silent dead gate before).
                     import logging as _logging
+
                     _logging.getLogger(__name__).info(
                         "dynamic max_hold predicted=%.1fs cached=%.1fs (mint=%s)",
-                        pred, self._dynamic_max_hold_cached,
+                        pred,
+                        self._dynamic_max_hold_cached,
                         (self._mint or "?")[:12],
                     )
                 except Exception:

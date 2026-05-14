@@ -254,12 +254,14 @@ def start_http_server(port: int) -> None:
             pass
 
     try:
-        srv = http.server.HTTPServer(("0.0.0.0", port), _Handler)
+        # Internal /metrics endpoint — host firewall restricts external access.
+        srv = http.server.HTTPServer(("0.0.0.0", port), _Handler)  # nosec B104
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         logger.info("Observability HTTP server listening on :%d/metrics", port)
     except Exception as exc:
-        logger.warning("Observability HTTP server failed to start on :%d: %s",
-                       port, exc)
+        logger.warning(
+            "Observability HTTP server failed to start on :%d: %s", port, exc
+        )
 
 
 # ───────────────────────── Convenience helpers ─────────────────────────

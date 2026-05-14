@@ -55,6 +55,7 @@ class EntryDecision:
     def with_(self, **kwargs: Any) -> "EntryDecision":
         """Return a copy with selected fields replaced."""
         from dataclasses import replace
+
         return replace(self, **kwargs)
 
 
@@ -75,7 +76,20 @@ class DecisionService:
         wash_cluster_skip_n: int = 0,
         wash_cluster_size_min: int = 5,
         wash_cluster_size_max: int = 50,
+        reg_floor_pct: float | None = None,
+        reg_ceiling_pct: float | None = None,
+        config_id: str | None = None,
+        p_cal_floor: float = 0.0,
     ) -> None:
+        """Construct a DecisionService.
+
+        ``reg_floor_pct`` / ``reg_ceiling_pct`` / ``config_id`` are new
+        (2026-05-13) additions for the multi-config A/B framework. When
+        ``reg_floor_pct`` / ``reg_ceiling_pct`` are ``None``, ``apply_ml_override``
+        falls back to the legacy env-var read so single-config bots keep
+        working unchanged. ``config_id`` (when set) is included in log
+        messages so multi-config logs are disambiguated.
+        """
         self._db = db
         self._hard_skip_n = int(hard_skip_n_env)
         # 2026-05-01 (codex review): wash-cluster hard gate.
@@ -87,6 +101,15 @@ class DecisionService:
         self._wash_skip_n = int(wash_cluster_skip_n)
         self._wash_size_min = int(wash_cluster_size_min)
         self._wash_size_max = int(wash_cluster_size_max)
+        # Multi-config framework: floor/ceiling per-config; env fallback
+        # preserves the pre-2026-05-13 single-config behaviour.
+        self._reg_floor_pct = reg_floor_pct
+        self._reg_ceiling_pct = reg_ceiling_pct
+        self._config_id = config_id
+        # 2026-05-14: per-config floor on the classifier's calibrated
+        # probability. Replaces the reg-floor A/B knob (reg head proven
+        # degenerate). 0.0 = no extra floor.
+        self._p_cal_floor = float(p_cal_floor)
         # Counters kept for /metrics + dashboard parity.
         self.ml_overrides_buy = 0
         self.ml_overrides_skip = 0
@@ -98,9 +121,33 @@ class DecisionService:
         # exposes them without further wiring.
         try:
             from pulse_bot.observability import metrics as _obs
+
             self._obs = _obs
         except Exception:  # observability optional
             self._obs = None
+
+    @classmethod
+    def from_entry_config(cls, db: Any, cfg: Any, obs: Any = None) -> "DecisionService":
+        """Construct a DecisionService bound to an ``EntryConfig``.
+
+        Lets ``Pipeline`` build one DecisionService instance per config
+        without having to pull individual fields out by hand. ``cfg`` is
+        an :class:`pulse_bot.entry_configs.EntryConfig`.
+        """
+        inst = cls(
+            db=db,
+            hard_skip_n_env=cfg.bot_cluster_hard_skip_n,
+            wash_cluster_skip_n=cfg.wash_cluster_skip_n,
+            wash_cluster_size_min=cfg.wash_cluster_size_min,
+            wash_cluster_size_max=cfg.wash_cluster_size_max,
+            reg_floor_pct=cfg.reg_floor_pct,
+            reg_ceiling_pct=cfg.reg_ceiling_pct,
+            config_id=cfg.config_id,
+            p_cal_floor=getattr(cfg, "p_cal_floor", 0.0),
+        )
+        if obs is not None:
+            inst._obs = obs
+        return inst
 
     # ───────────────────────── bot-cluster pre-filter ──────────────
 
@@ -152,16 +199,16 @@ class DecisionService:
                     "BOT-CLUSTER HARD SKIP %s: %d known is_bot wallets in "
                     "first 30s (≥%d threshold) — skipping entry without "
                     "ML override",
-                    mint_short, n_bots, self._hard_skip_n,
+                    mint_short,
+                    n_bots,
+                    self._hard_skip_n,
                 )
                 self.bot_cluster_skips += 1
                 if self._obs is not None:
                     self._obs.paper_trades_closed.inc(reason="bot_cluster_skip")
                 return decision.with_(should_enter=False)
         except Exception as exc:
-            logger.debug(
-                "Bot-cluster check failed for %s: %s", mint_short, exc
-            )
+            logger.debug("Bot-cluster check failed for %s: %s", mint_short, exc)
         return decision
 
     # ───────────────────────── creator blacklist gate ─────────────
@@ -201,7 +248,8 @@ class DecisionService:
                 logger.warning(
                     "CREATOR-BLACKLIST HARD SKIP %s: creator %s flagged "
                     "(Tier-2 scammer definition) — skipping entry",
-                    mint_short, creator[:12],
+                    mint_short,
+                    creator[:12],
                 )
                 if not hasattr(self, "creator_blacklist_skips"):
                     self.creator_blacklist_skips = 0
@@ -210,9 +258,7 @@ class DecisionService:
                     self._obs.paper_trades_closed.inc(reason="creator_blacklist_skip")
                 return decision.with_(should_enter=False)
         except Exception as exc:
-            logger.debug(
-                "Creator blacklist check failed for %s: %s", mint_short, exc
-            )
+            logger.debug("Creator blacklist check failed for %s: %s", mint_short, exc)
         return decision
 
     # ───────────────────────── wash-cluster pre-filter ─────────────
@@ -281,9 +327,7 @@ class DecisionService:
                 f" ORDER BY n_in_mint DESC LIMIT 1"
             )
             params = tuple(early_buyers) + (self._wash_size_min, self._wash_size_max)
-            rows = await asyncio.to_thread(
-                self._db._sync_query, sql, params
-            )
+            rows = await asyncio.to_thread(self._db._sync_query, sql, params)
             if rows:
                 row = rows[0]
                 n_in_mint = int(row["n_in_mint"])
@@ -294,17 +338,18 @@ class DecisionService:
                         "WASH-CLUSTER HARD SKIP %s: %d buyers from cluster "
                         "%s (size=%d) in first 30s (≥%d threshold) — "
                         "skipping entry",
-                        mint_short, n_in_mint, cluster_id,
-                        cluster_size, self._wash_skip_n,
+                        mint_short,
+                        n_in_mint,
+                        cluster_id,
+                        cluster_size,
+                        self._wash_skip_n,
                     )
                     self.wash_cluster_skips += 1
                     if self._obs is not None:
                         self._obs.paper_trades_closed.inc(reason="wash_cluster_skip")
                     return decision.with_(should_enter=False)
         except Exception as exc:
-            logger.debug(
-                "Wash-cluster check failed for %s: %s", mint_short, exc
-            )
+            logger.debug("Wash-cluster check failed for %s: %s", mint_short, exc)
         return decision
 
     # ───────────────────────── ML override ─────────────────────────
@@ -336,6 +381,26 @@ class DecisionService:
         read-time to recover signed PnL %% × 10). Clamped to [1, 999].
         """
         if ml_action == "BUY" and not decision.should_enter:
+            # 2026-05-14 p_cal-floor gate. Per-config minimum on the
+            # entry classifier's calibrated probability — the multi-config
+            # A/B knob that replaced reg_floor (reg head proven
+            # degenerate). The classifier ranks winners at auc_sign≈0.92,
+            # so a higher p_cal floor trades volume for selectivity.
+            # 0.0 = disabled (LIVE/production default).
+            if self._p_cal_floor > 0.0 and float(ml_cal) < self._p_cal_floor:
+                logger.warning(
+                    "ML OVERRIDE %s [%s]: rules=SKIP → ML=BUY BLOCKED by "
+                    "p_cal-floor (p_cal=%.4f < floor=%.4f p_raw=%.3f)",
+                    mint_short,
+                    self._config_id or "LIVE",
+                    float(ml_cal),
+                    self._p_cal_floor,
+                    ml_proba,
+                )
+                self.ml_overrides_skip += 1
+                if self._obs is not None:
+                    self._obs.ml_override.inc(action="p_cal_floor_block")
+                return decision  # unchanged — rules SKIP stays
             # 2026-04-29 reg-floor soft gate. Live audit (48h, n=887)
             # showed bottom-quartile predicted PnL → realized -10.11%
             # vs top-quartile → -4.64%. Differential is small (5pp) but
@@ -344,10 +409,18 @@ class DecisionService:
             # disabled = -100%), refuse the BUY override. Off by default
             # because live ρ ≈ 0.008 — operator opt-in only.
             if reg_pnl_pct is not None:
-                import os as _os_reg
-                reg_floor = float(
-                    _os_reg.environ.get("PULSE_ENTRY_REG_FLOOR_PCT", "-100.0")
-                )
+                # 2026-05-13: prefer per-config thresholds (set by
+                # ``from_entry_config``) and fall back to env for the
+                # legacy single-config path so nothing breaks for bots
+                # that haven't migrated.
+                if self._reg_floor_pct is not None:
+                    reg_floor = float(self._reg_floor_pct)
+                else:
+                    import os as _os_reg
+
+                    reg_floor = float(
+                        _os_reg.environ.get("PULSE_ENTRY_REG_FLOOR_PCT", "-100.0")
+                    )
                 # 2026-05-06 — symmetric sanity ceiling. Live ρ ≈ 0.008
                 # means individual reg predictions are weak signals; an
                 # outlier predicting +50% PnL is far more likely to be
@@ -355,16 +428,24 @@ class DecisionService:
                 # forecasts an unrealistically bullish trade — same
                 # asymmetric-default principle as the survival gate
                 # (low-confidence destructive action → skip).
-                reg_ceiling = float(
-                    _os_reg.environ.get("PULSE_ENTRY_REG_CEILING_PCT", "30.0")
-                )
+                if self._reg_ceiling_pct is not None:
+                    reg_ceiling = float(self._reg_ceiling_pct)
+                else:
+                    import os as _os_reg
+
+                    reg_ceiling = float(
+                        _os_reg.environ.get("PULSE_ENTRY_REG_CEILING_PCT", "30.0")
+                    )
                 if float(reg_pnl_pct) < reg_floor:
                     logger.warning(
                         "ML OVERRIDE %s: rules=SKIP → ML=BUY "
                         "BLOCKED by reg-floor (reg_pnl=%+.2f%% < floor=%+.2f%% "
                         "p_raw=%.3f p_cal=%.3f)",
-                        mint_short, float(reg_pnl_pct), reg_floor,
-                        ml_proba, ml_cal,
+                        mint_short,
+                        float(reg_pnl_pct),
+                        reg_floor,
+                        ml_proba,
+                        ml_cal,
                     )
                     self.ml_overrides_skip += 1
                     if self._obs is not None:
@@ -376,8 +457,11 @@ class DecisionService:
                         "BLOCKED by reg-ceiling (reg_pnl=%+.2f%% > ceiling=%+.2f%% "
                         "— suspect noise/calibration error; "
                         "p_raw=%.3f p_cal=%.3f)",
-                        mint_short, float(reg_pnl_pct), reg_ceiling,
-                        ml_proba, ml_cal,
+                        mint_short,
+                        float(reg_pnl_pct),
+                        reg_ceiling,
+                        ml_proba,
+                        ml_cal,
                     )
                     self.ml_overrides_skip += 1
                     if self._obs is not None:
@@ -386,7 +470,10 @@ class DecisionService:
                 logger.warning(
                     "ML OVERRIDE %s: rules=SKIP → ML=BUY "
                     "(p_raw=%.3f p_cal=%.3f reg_pnl=%+.2f%%)",
-                    mint_short, ml_proba, ml_cal, float(reg_pnl_pct),
+                    mint_short,
+                    ml_proba,
+                    ml_cal,
+                    float(reg_pnl_pct),
                 )
                 # Encode signed PnL %% × 10 with offset 500 so negative
                 # forecasts stay representable in the int entry_score
@@ -396,7 +483,9 @@ class DecisionService:
             else:
                 logger.warning(
                     "ML OVERRIDE %s: rules=SKIP → ML=BUY (p_raw=%.3f p_cal=%.3f)",
-                    mint_short, ml_proba, ml_cal,
+                    mint_short,
+                    ml_proba,
+                    ml_cal,
                 )
                 entry_score_val = max(1, int(round(float(ml_cal) * 100.0)))
             full_buy_count = int(getattr(result, "buy_count", 0) or 0)
@@ -412,7 +501,9 @@ class DecisionService:
         if ml_action == "SKIP" and decision.should_enter:
             logger.warning(
                 "ML OVERRIDE %s: rules=BUY → ML=SKIP (p_raw=%.3f p_cal=%.3f)",
-                mint_short, ml_proba, ml_cal,
+                mint_short,
+                ml_proba,
+                ml_cal,
             )
             self.ml_overrides_skip += 1
             if self._obs is not None:
@@ -443,33 +534,35 @@ class DecisionService:
         if cp_verdict == "BUY_EARLY" and not decision.should_enter:
             logger.warning(
                 "EARLY OVERRIDE %s: rules=SKIP → %s=BUY (proba=%.3f)",
-                mint_short, cp_source,
+                mint_short,
+                cp_source,
                 float(cp_proba) if cp_proba is not None else float("nan"),
             )
-            early_buy_count = sum(
-                1 for t in all_trades if t.tx_type == "buy"
-            )
+            early_buy_count = sum(1 for t in all_trades if t.tx_type == "buy")
             return decision.with_(
                 should_enter=True,
                 entry_type=cp_source,
                 entry_buyer_num=max(1, early_buy_count + 1),
                 entry_score=(
                     max(1, int(round(float(cp_proba) * 100.0)))
-                    if cp_proba is not None else 1
+                    if cp_proba is not None
+                    else 1
                 ),
             )
         if cp_verdict == "BUY_EARLY":
             # rules already said BUY; just record the source.
             logger.info(
                 "EARLY agree %s: %s=BUY confirms rules=BUY (proba=%.3f)",
-                mint_short, cp_source,
+                mint_short,
+                cp_source,
                 float(cp_proba) if cp_proba is not None else float("nan"),
             )
             return decision.with_(entry_type=cp_source)
         if cp_verdict == "SKIP_EARLY" and decision.should_enter:
             logger.warning(
                 "EARLY OVERRIDE %s: rules=BUY → %s=SKIP (proba=%.3f)",
-                mint_short, cp_source,
+                mint_short,
+                cp_source,
                 float(cp_proba) if cp_proba is not None else float("nan"),
             )
             return decision.with_(should_enter=False)

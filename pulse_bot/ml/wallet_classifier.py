@@ -42,7 +42,6 @@ from __future__ import annotations
 import argparse
 import logging
 import time
-from typing import Optional
 
 import psycopg2
 import psycopg2.extras
@@ -179,7 +178,9 @@ def compute_per_wallet_stats(conn: "psycopg2.extensions.connection") -> dict[str
         for row in cur:
             wallet = row[0]
             if wallet in out:
-                out[wallet]["median_hold_sec"] = float(row[1]) if row[1] is not None else None
+                out[wallet]["median_hold_sec"] = (
+                    float(row[1]) if row[1] is not None else None
+                )
                 n_with_hold += 1
     logger.info(
         "Median hold: %d wallets w/ closed positions in %.1fs",
@@ -234,7 +235,9 @@ def compute_smart_money(conn: "psycopg2.extensions.connection") -> dict[str, dic
     return out
 
 
-def compute_clusters(conn: "psycopg2.extensions.connection") -> dict[str, tuple[int, int]]:
+def compute_clusters(
+    conn: "psycopg2.extensions.connection",
+) -> dict[str, tuple[int, int]]:
     """Wash-cluster detector via co-occurrence graph + Union-Find.
 
     Two wallets are linked if they bought the same 3+ mints within 30s
@@ -350,10 +353,17 @@ def classify_and_write(
     for wallet, s in stats.items():
         # Sniper: 2-of-4
         crit = 0
-        if s["fastest_buy_age"] is not None and s["fastest_buy_age"] < SNIPER_FASTEST_BUY_AGE:
+        if (
+            s["fastest_buy_age"] is not None
+            and s["fastest_buy_age"] < SNIPER_FASTEST_BUY_AGE
+        ):
             crit += 1
         cv = s.get("buy_amount_cv")
-        if cv is not None and cv < SNIPER_CV_MAX and s["n_buys_total"] >= SNIPER_CV_MIN_BUYS:
+        if (
+            cv is not None
+            and cv < SNIPER_CV_MAX
+            and s["n_buys_total"] >= SNIPER_CV_MIN_BUYS
+        ):
             crit += 1
         if s["n_buys_30d"] >= SNIPER_N_30D:
             crit += 1
@@ -477,7 +487,9 @@ def main() -> None:
                        FROM wallet_classifications"""
                 )
                 r = cur.fetchone()
-            print(f"total={r[0]} sniper={r[1]} smart={r[2]} bot={r[3]} clustered={r[4]}")
+            print(
+                f"total={r[0]} sniper={r[1]} smart={r[2]} bot={r[3]} clustered={r[4]}"
+            )
         else:
             classify_and_write(conn, do_clusters=not args.no_clusters)
     finally:

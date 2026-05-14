@@ -32,7 +32,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from pulse_bot.models import Token
@@ -72,20 +72,59 @@ class PaperTradeSupervisor:
         entry_ts: float,
         resume_trade_id: int | None = None,
         resume_last_event_ts: float | None = None,
+        config_id: str = "LIVE",
+        sim_entry_tokens_raw: int | None = None,
     ) -> None:
         """Open + monitor + close a paper trade. Same contract as the
-        old ``Pipeline._paper_trade``."""
+        old ``Pipeline._paper_trade``.
+
+        ``config_id`` (2026-05-13 multi-config A/B): tag the paper_trades
+        row with which entry-decision policy opened it. Defaults to
+        ``"LIVE"`` so callers that haven't migrated still work.
+
+        ``sim_entry_tokens_raw`` (2026-05-14 real-sim exit): how many
+        tokens the entry simulation said this size would buy. When set
+        and this is the LIVE config, the close path runs a bonding-curve
+        sell estimate and records it into ``sim_metadata.exit``.
+        """
         ctx = self._ctx
         is_replay = ctx._launchpad.name == "replay"
 
         if resume_trade_id is not None:
             trade_id = resume_trade_id
+            # Pull the existing row's buy_amount_sol so the resumed
+            # runner uses the same size that was recorded at entry.
+            resume_rows = ctx._db._sync_query(
+                "SELECT buy_amount_sol FROM paper_trades WHERE id = ?",
+                (resume_trade_id,),
+                one=True,
+            )
+            buy_amount = float(
+                (resume_rows or {}).get("buy_amount_sol") or ctx._config.buy_amount_sol
+            )
             logger.info(
-                "PAPER RESUME %s: price=%e buyer#%d",
-                token.symbol, entry_price, entry_buyer_num,
+                "PAPER RESUME %s: price=%e buyer#%d size=%.3fSOL",
+                token.symbol,
+                entry_price,
+                entry_buyer_num,
+                buy_amount,
             )
             await ctx._launchpad.subscribe_trades(token.mint)
         else:
+            # Dynamic position sizing: when enabled, compute next buy
+            # from realized balance so wins compound and drawdowns shrink
+            # the position. Falls back to fixed cfg.buy_amount_sol when
+            # PULSE_DYNAMIC_SIZING_PCT=0 (default).
+            from pulse_bot.config import compute_buy_amount_sol
+
+            # Multi-config A/B: scope realized balance to THIS config so
+            # each parallel paper portfolio compounds / draws down on its
+            # own PnL, not a shared pool.
+            realized_balance = ctx._db.get_realized_balance_sync(
+                ctx._config.portfolio_initial_sol,
+                config_id=config_id,
+            )
+            buy_amount = compute_buy_amount_sol(ctx._config, realized_balance)
             trade_id = await ctx._db.open_paper_trade(
                 {
                     "mint": token.mint,
@@ -96,19 +135,32 @@ class PaperTradeSupervisor:
                     "entry_buyer_number": entry_buyer_num,
                     "entry_type": entry_type,
                     "entry_score": entry_score,
-                    "buy_amount_sol": ctx._config.buy_amount_sol,
+                    "buy_amount_sol": buy_amount,
+                    "config_id": config_id,
                 }
             )
             logger.info(
-                "PAPER BUY %s: price=%e buyer#%d mcap=%.1f type=%s score=%d",
-                token.symbol, entry_price, entry_buyer_num,
-                entry_mcap, entry_type, entry_score,
+                "PAPER BUY %s [%s]: price=%e buyer#%d mcap=%.1f type=%s score=%d "
+                "size=%.3fSOL (balance=%.3f)",
+                token.symbol,
+                config_id,
+                entry_price,
+                entry_buyer_num,
+                entry_mcap,
+                entry_type,
+                entry_score,
+                buy_amount,
+                realized_balance,
             )
 
         from pulse_bot.core import PaperTradeRunner
 
         runner = PaperTradeRunner(
-            ctx._config, entry_price, mint=token.mint, scored_at=entry_ts,
+            ctx._config,
+            entry_price,
+            mint=token.mint,
+            scored_at=entry_ts,
+            buy_amount_sol_override=buy_amount,
         )
         last_event_ts = (
             resume_last_event_ts if resume_last_event_ts is not None else entry_ts
@@ -135,13 +187,15 @@ class PaperTradeSupervisor:
                 result.total_buys + result.total_sells,
                 trade_market_cap,
                 entry_price,
-                ctx._config.buy_amount_sol,
+                buy_amount,
                 exit_time=exit_time,
                 pnl_pct=result.pnl_pct,
             )
             logger.info(
                 "PAPER SELL %s: pnl=%+.1f%% reason=%s hold=%.0fs",
-                token.symbol, result.pnl_pct, result.exit_reason,
+                token.symbol,
+                result.pnl_pct,
+                result.exit_reason,
                 max(exit_time - entry_ts, 0.0),
             )
             return True
@@ -168,8 +222,12 @@ class PaperTradeSupervisor:
                         )
 
                 await ctx._db.update_paper_trade(
-                    trade_id, runner.current_price, entry_price,
-                    runner.total_buys, runner.total_sells, trade.market_cap_sol,
+                    trade_id,
+                    runner.current_price,
+                    entry_price,
+                    runner.total_buys,
+                    runner.total_sells,
+                    trade.market_cap_sol,
                 )
                 await ctx._db.update_live_price(
                     token.mint, runner.current_price, entry_price
@@ -197,23 +255,27 @@ class PaperTradeSupervisor:
                     result = runner.tick(now, entry_ts)
                     if result:
                         await _close_via_runner_result(
-                            result, trade_market_cap=0.0, exit_time=now,
+                            result,
+                            trade_market_cap=0.0,
+                            exit_time=now,
                         )
                         return
                     if (
                         getattr(ctx, "_survival_active", False)
                         or shadow.survival_shadow_enabled()
-                    ) and (
-                        now - last_survival_check_ts >= ctx._SURVIVAL_TICK_SECONDS
-                    ):
+                    ) and (now - last_survival_check_ts >= ctx._SURVIVAL_TICK_SECONDS):
                         last_survival_check_ts = now
                         survived = await ctx._maybe_survival_exit(
-                            runner=runner, entry_ts=entry_ts,
-                            now=now, mint=token.mint,
+                            runner=runner,
+                            entry_ts=entry_ts,
+                            now=now,
+                            mint=token.mint,
                         )
                         if survived is not None:
                             await _close_via_runner_result(
-                                survived, trade_market_cap=0.0, exit_time=now,
+                                survived,
+                                trade_market_cap=0.0,
+                                exit_time=now,
                             )
                             return
             except asyncio.CancelledError:
@@ -261,14 +323,21 @@ class PaperTradeSupervisor:
                     return
                 closed = True
             await ctx._db.close_paper_trade(
-                trade_id, timeout.exit_price, reason,
-                timeout.total_buys + timeout.total_sells, 0,
-                entry_price, ctx._config.buy_amount_sol,
-                exit_time=exit_ts, pnl_pct=timeout.pnl_pct,
+                trade_id,
+                timeout.exit_price,
+                reason,
+                timeout.total_buys + timeout.total_sells,
+                0,
+                entry_price,
+                buy_amount,
+                exit_time=exit_ts,
+                pnl_pct=timeout.pnl_pct,
             )
             logger.info(
                 "PAPER %s %s (inactive %.0fs)",
-                reason.upper(), token.symbol, inactive,
+                reason.upper(),
+                token.symbol,
+                inactive,
             )
 
         except Exception:
@@ -277,14 +346,77 @@ class PaperTradeSupervisor:
                 try:
                     timeout = runner.timeout_result()
                     await ctx._db.close_paper_trade(
-                        trade_id, timeout.exit_price, "error",
-                        timeout.total_buys + timeout.total_sells, 0,
-                        entry_price, ctx._config.buy_amount_sol,
-                        exit_time=last_event_ts, pnl_pct=timeout.pnl_pct,
+                        trade_id,
+                        timeout.exit_price,
+                        "error",
+                        timeout.total_buys + timeout.total_sells,
+                        0,
+                        entry_price,
+                        buy_amount,
+                        exit_time=last_event_ts,
+                        pnl_pct=timeout.pnl_pct,
                     )
                 except Exception:
                     logger.debug("Failed to close errored trade %s", token.symbol)
         finally:
-            if ctx._open_slots > 0:
+            # 2026-05-14 real-sim exit: once the trade has closed, record
+            # a bonding-curve sell estimate into sim_metadata.exit. Only
+            # for the LIVE config (the entry sim is attached to that row)
+            # and only when the entry sim gave us a token amount. Pure
+            # curve math against live state — no real position needed,
+            # 0 SOL. Best-effort: never let it break the finally block.
+            sim_exec = getattr(ctx, "_sim_executor", None)
+            if (
+                closed
+                and config_id == ctx._live_config_id
+                and sim_entry_tokens_raw
+                and sim_exec is not None
+                and getattr(sim_exec, "enabled", False)
+            ):
+                try:
+                    exit_res = await sim_exec.estimate_exit_curve_math(
+                        token.mint, int(sim_entry_tokens_raw)
+                    )
+                    ctx._db.set_paper_trade_sim_metadata(
+                        trade_id,
+                        {
+                            "exit": {
+                                "success": exit_res.success,
+                                "expected_sol_out_lamports": exit_res.expected_sol_out_lamports,
+                                "tokens_in_raw": exit_res.tokens_in_raw,
+                                "slippage_bps_cap": exit_res.slippage_bps_cap,
+                                "err": (
+                                    str(exit_res.err)
+                                    if exit_res.err is not None
+                                    else None
+                                ),
+                                "reason": close_outcome.get("reason"),
+                            }
+                        },
+                    )
+                    logger.info(
+                        "REAL_SIM exit %s [%s]: success=%s sol_out=%d err=%s",
+                        token.symbol,
+                        config_id,
+                        exit_res.success,
+                        exit_res.expected_sol_out_lamports,
+                        exit_res.err,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "REAL_SIM exit estimate failed for %s: %s",
+                        token.symbol,
+                        exc,
+                    )
+            # 2026-05-13 multi-config: decrement THIS config's slot
+            # counter, not a global one — each parallel paper portfolio
+            # owns its own portfolio_max_positions budget. Falls back to
+            # the LIVE bucket if the config_id is somehow unknown.
+            slots = getattr(ctx, "_open_slots_by_config", None)
+            if isinstance(slots, dict):
+                key = config_id if config_id in slots else "LIVE"
+                if slots.get(key, 0) > 0:
+                    slots[key] -= 1
+            elif ctx._open_slots > 0:  # legacy single-config fallback
                 ctx._open_slots -= 1
             await ctx._launchpad.unsubscribe_trades(token.mint)

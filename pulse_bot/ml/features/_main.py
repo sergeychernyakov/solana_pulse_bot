@@ -821,16 +821,16 @@ def extract_entry_features(
     # or no history so XGBoost splits on missingness.
     feats.update(
         _extract_wallet_prior_features(
-            wallet_prior_stats, top3_buyer_wallets, cutoff_ts,
+            wallet_prior_stats,
+            top3_buyer_wallets,
+            cutoff_ts,
             wallet_classifications=wallet_classifications,
         )
     )
     # v20 sniper proxy — caller pre-computes from raw trades; NaN when
     # not provided (legacy callers, tests).
     feats["n_buyers_first_5s"] = (
-        float(n_buyers_first_5s)
-        if n_buyers_first_5s is not None
-        else float("nan")
+        float(n_buyers_first_5s) if n_buyers_first_5s is not None else float("nan")
     )
     # Phase 2.5 (2026-04-25) — time-aware snapshots. Raw values come
     # straight off the ScoringResult / token_scores row (computed by
@@ -866,10 +866,12 @@ def extract_entry_features(
 # split on natively via NaN. About 64% of creators in the live stream are
 # solo (per 2026-05-05 audit), so leaving these as 0 silently shifts the
 # distribution at serve time vs the mostly-veteran-creator training data.
-_CREATOR_FEATS_DEGENERATE_FOR_SOLO: frozenset[str] = frozenset({
-    "creator_median_peak_mc_sol",
-    "creator_inter_token_interval_sec",
-})
+_CREATOR_FEATS_DEGENERATE_FOR_SOLO: frozenset[str] = frozenset(
+    {
+        "creator_median_peak_mc_sol",
+        "creator_inter_token_interval_sec",
+    }
+)
 
 
 def _creator_priors_count(snapshot: Any) -> float | None:
@@ -1038,14 +1040,14 @@ def extract_entry_features_t30(
             )
     feats.update(
         _extract_wallet_prior_features(
-            wallet_prior_stats, top3_buyer_wallets, cutoff_ts,
+            wallet_prior_stats,
+            top3_buyer_wallets,
+            cutoff_ts,
             wallet_classifications=wallet_classifications,
         )
     )
     feats["n_buyers_first_5s"] = (
-        float(n_buyers_first_5s)
-        if n_buyers_first_5s is not None
-        else float("nan")
+        float(n_buyers_first_5s) if n_buyers_first_5s is not None else float("nan")
     )
     return feats
 

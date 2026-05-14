@@ -1,0 +1,15 @@
+# scripts/pumpportal-balance-monitor.timer
+# Fires every 10 minutes; the corresponding .service polls the
+# PumpPortal wallet balance and logs any unauthorised outflow.
+[Unit]
+Description=PumpPortal wallet drain monitor — every 10 min
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+RandomizedDelaySec=30
+Persistent=true
+Unit=pumpportal-balance-monitor.service
+
+[Install]
+WantedBy=timers.target

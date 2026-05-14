@@ -296,10 +296,62 @@ class Database:
         with _sync_conn(dsn) as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(sql, tuple(params) if params else None)
+                # Write statements (INSERT/UPDATE/DDL with no RETURNING)
+                # leave ``cur.description`` None — there is no result set
+                # to fetch. Commit so the write persists (``_sync_conn``
+                # does not autocommit) and return an empty result.
+                if cur.description is None:
+                    conn.commit()
+                    return None if one else []
                 if one:
                     row = cur.fetchone()
                     return dict(row) if row else None
                 return [dict(r) for r in cur.fetchall()]
+
+    def get_realized_balance_sync(
+        self, initial_sol: float, config_id: str | None = None
+    ) -> float:
+        """Return ``initial_sol + Σ pnl_sol`` over closed real paper trades.
+
+        Used by dynamic position sizing — the next ``buy_amount_sol`` is
+        computed from this value so wins compound and drawdowns shrink
+        position. Excludes shadow tracking rows (entry_type='' /
+        entry_buyer_number=0) since those are what-if simulations, not
+        bot capital. On query failure returns ``initial_sol`` so sizing
+        falls back to start-of-portfolio (conservative).
+
+        ``config_id`` (2026-05-13 multi-config A/B): when supplied, the
+        realized PnL sum is scoped to that config's paper trades so each
+        parallel portfolio compounds/draws-down independently. When
+        ``None`` (legacy single-config callers) the sum spans all rows.
+        """
+        try:
+            if config_id is not None:
+                row = self._sync_query(
+                    "SELECT COALESCE(SUM(pnl_sol), 0.0) AS realized "
+                    "FROM paper_trades "
+                    "WHERE status = 'closed' AND pnl_sol IS NOT NULL "
+                    "AND entry_buyer_number > 0 "
+                    "AND entry_type IN ('fast','full','ml_override','t30',"
+                    "'t30_skip','timing','BUY_EARLY') "
+                    "AND config_id = ?",
+                    (config_id,),
+                    one=True,
+                )
+            else:
+                row = self._sync_query(
+                    "SELECT COALESCE(SUM(pnl_sol), 0.0) AS realized "
+                    "FROM paper_trades "
+                    "WHERE status = 'closed' AND pnl_sol IS NOT NULL "
+                    "AND entry_buyer_number > 0 "
+                    "AND entry_type IN ('fast','full','ml_override','t30',"
+                    "'t30_skip','timing','BUY_EARLY')",
+                    one=True,
+                )
+            realized = float((row or {}).get("realized") or 0.0)
+            return float(initial_sol) + realized
+        except Exception:
+            return float(initial_sol)
 
     # ── Common dashboard reads ──────────────────────────────────────
     def get_recent_scores(self, limit: int = 200, source: str = "live") -> list[dict]:
@@ -827,6 +879,11 @@ class Database:
 
     # ── Paper trade lifecycle ───────────────────────────────────────
     async def open_paper_trade(self, data: dict) -> int:
+        # 2026-05-13 (multi-config A/B): every paper trade is now tagged
+        # with a ``config_id`` so we can run multiple entry-decision
+        # policies in parallel and compare PnL per-config. Callers that
+        # don't supply ``config_id`` fall through to the live default,
+        # preserving the pre-migration behaviour.
         cols_ordered = [
             "mint",
             "symbol",
@@ -837,8 +894,11 @@ class Database:
             "entry_type",
             "entry_score",
             "buy_amount_sol",
+            "config_id",
         ]
         values = [data.get(c) for c in cols_ordered]
+        if values[-1] is None:
+            values[-1] = "LIVE"
         col_list = ", ".join(cols_ordered)
         placeholders = ", ".join(f"${i+1}" for i in range(len(cols_ordered)))
         pool = await _get_async_pool(self.dsn)
@@ -1164,6 +1224,24 @@ class Database:
             (mint,),
             one=True,
         )
+
+    def set_paper_trade_sim_metadata(self, trade_id: int, sim_meta: dict) -> None:
+        """Merge ``sim_meta`` into the paper_trade row's ``sim_metadata``
+        JSONB column. ``COALESCE(sim_metadata, '{}') || meta`` so calling
+        this twice (once on entry, once on exit) doesn't clobber the
+        first write — Postgres JSONB ``||`` is a recursive merge for
+        top-level keys."""
+        import json as _json
+
+        with _sync_conn(self.dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE paper_trades SET "
+                    "sim_metadata = COALESCE(sim_metadata, '{}'::jsonb) || %s::jsonb "
+                    "WHERE id = %s",
+                    (_json.dumps(sim_meta), trade_id),
+                )
+            conn.commit()
 
     def count_open_paper_trades(self) -> int:
         row = self._sync_query(

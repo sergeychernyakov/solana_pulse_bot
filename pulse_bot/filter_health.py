@@ -29,16 +29,16 @@ logger = logging.getLogger(__name__)
 # Patterns are loose to survive log-format drift.
 _FILTER_SIGNATURES: list[tuple[str, re.Pattern[str]]] = [
     ("creator_blacklist_skip", re.compile(r"CREATOR-BLACKLIST HARD SKIP")),
-    ("bot_cluster_skip",       re.compile(r"BOT-CLUSTER HARD SKIP")),
-    ("wash_cluster_skip",      re.compile(r"WASH-CLUSTER HARD SKIP")),
-    ("survival_predict_exit",  re.compile(r"Survival exit: predicted_remaining")),
+    ("bot_cluster_skip", re.compile(r"BOT-CLUSTER HARD SKIP")),
+    ("wash_cluster_skip", re.compile(r"WASH-CLUSTER HARD SKIP")),
+    ("survival_predict_exit", re.compile(r"Survival exit: predicted_remaining")),
     # SKIP_EARLY override fires through decision_service.py:448:
     #   "EARLY OVERRIDE X: rules=BUY → t30_skip=SKIP (proba=Y)"
     # source ∈ {t30, t30_skip, timing, timing_skip}.
-    ("t30_skip_early",         re.compile(r"EARLY OVERRIDE .* → t30(_skip)?=SKIP")),
-    ("timing_skip_early",      re.compile(r"EARLY OVERRIDE .* → timing(_skip)?=SKIP")),
-    ("ml_sl_tightened",        re.compile(r"ml_sl_tightened")),
-    ("dynamic_max_hold_used",  re.compile(r"dynamic max_hold predicted=")),
+    ("t30_skip_early", re.compile(r"EARLY OVERRIDE .* → t30(_skip)?=SKIP")),
+    ("timing_skip_early", re.compile(r"EARLY OVERRIDE .* → timing(_skip)?=SKIP")),
+    ("ml_sl_tightened", re.compile(r"ml_sl_tightened")),
+    ("dynamic_max_hold_used", re.compile(r"dynamic max_hold predicted=")),
 ]
 
 _TIMESTAMP_RE = re.compile(r"^(\d{2}):(\d{2}):(\d{2})")
@@ -115,7 +115,10 @@ def log_filter_health_summary(
         last = f"last={r.last_seen}" if r.last_seen else "no fires"
         logger.info(
             "  %-26s n=%-6d %-12s %s",
-            r.name, r.n_firings, last, flag,
+            r.name,
+            r.n_firings,
+            last,
+            flag,
         )
     logger.info("=" * 78)
     logger.debug("filter_health scan: %.1f ms", elapsed_ms)

@@ -186,8 +186,19 @@ class PaperTradeRunner:
         *,
         mint: str | None = None,
         scored_at: float | None = None,
+        buy_amount_sol_override: float | None = None,
     ) -> None:
         self._config = config
+        # Dynamic position sizing: when the supervisor computed a per-
+        # entry size (compound on profit / shrink on drawdown), it
+        # passes it in here so leg-PnL fee math uses the actual size,
+        # not the static config default. Falls back to config when
+        # None for legacy callers (optimizer, backtests).
+        self._buy_amount_sol = (
+            float(buy_amount_sol_override)
+            if buy_amount_sol_override is not None
+            else float(config.buy_amount_sol)
+        )
         self._entry_price = entry_price
         self._current_price = entry_price
         self._pulse = PulseMonitor(config)
@@ -284,15 +295,23 @@ class PaperTradeRunner:
         # Hard stop loss — check on EVERY trade, don't wait for snapshot.
         # Stop is evaluated on the CURRENT leg (remaining position at current
         # price) so realized partial profits don't mask a tanking residual.
+        #
+        # 2026-05-12 fix (codex review): semantic of exit_hard_stop_loss_pct
+        # is "after-fee leg PnL ≤ −N%" — that's what `current_leg_pnl`
+        # already measures. Reporting exit_price = synthetic
+        # `entry × (1 - N/100)` then passing it through `_weighted_pnl()`
+        # re-applied all entry/exit/slip/priority fees a SECOND time,
+        # causing reported pnl_pct to be ~6-7 pp deeper than the actual
+        # trigger (e.g. SL=−15 % wrote −21 % into paper_trades). The
+        # trigger condition is correct; the reported pnl_pct was double-
+        # counting friction. Fix: report the current price as exit_price
+        # and use the same fee model exactly once.
         current_leg_pnl = self._calc_leg_pnl(self._current_price)
         if current_leg_pnl < -self._config.exit_hard_stop_loss_pct:
-            stop_price = self._entry_price * (
-                1 - self._config.exit_hard_stop_loss_pct / 100
-            )
             return MonitorResult(
-                exit_price=stop_price,
+                exit_price=self._current_price,
                 exit_reason="hard_stop",
-                pnl_pct=self._weighted_pnl(stop_price),
+                pnl_pct=self._weighted_pnl(self._current_price),
                 total_buys=self._total_buys,
                 total_sells=self._total_sells,
                 hold_seconds=max(trade.timestamp - entry_time, 0.0),
@@ -401,7 +420,7 @@ class PaperTradeRunner:
         eff_entry = self._entry_price * (1 + PUMPFUN_FEE_PCT) * (1 + self._buy_slip)
         eff_exit = price * (1 - PUMPFUN_FEE_PCT) * (1 - self._sell_slip)
         raw_pnl = ((eff_exit - eff_entry) / eff_entry) * 100
-        buy_amount = self._config.buy_amount_sol
+        buy_amount = self._buy_amount_sol
         priority_cost_pct = (
             (2 * PUMPFUN_PRIORITY_FEE / buy_amount) * 100 if buy_amount > 0 else 0.0
         )
@@ -428,7 +447,7 @@ class PaperTradeRunner:
             eff_exit = price * (1 - PUMPFUN_FEE_PCT) * (1 - self._sell_slip)
             leg_pnl = ((eff_exit - eff_entry) / eff_entry) * 100
             total += frac * leg_pnl
-        buy_amount = self._config.buy_amount_sol
+        buy_amount = self._buy_amount_sol
         if buy_amount > 0:
             priority_cost_pct = (
                 (1 + len(legs)) * PUMPFUN_PRIORITY_FEE / buy_amount

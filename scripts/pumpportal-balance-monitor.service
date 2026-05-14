@@ -1,0 +1,16 @@
+# scripts/pumpportal-balance-monitor.service
+# Install:  cp scripts/pumpportal-balance-monitor.{service,timer} ~/.config/systemd/user/
+#           systemctl --user daemon-reload
+#           systemctl --user enable --now pumpportal-balance-monitor.timer
+[Unit]
+Description=PumpPortal wallet drain monitor (every 10 min)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/sergey/www/gg
+EnvironmentFile=/home/sergey/www/gg/.env
+ExecStart=/home/sergey/www/gg/.venv/bin/python /home/sergey/www/gg/scripts/pumpportal_balance_monitor.py --threshold-sol 0.025
+# Exit 2 means "drain detected and logged" — that's the monitor doing its job.
+SuccessExitStatus=0 2
+StandardOutput=journal
+StandardError=journal

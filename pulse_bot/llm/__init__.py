@@ -19,15 +19,15 @@ Two layers:
   the multi-agent orchestration pattern.
 """
 
-from pulse_bot.llm.explainer import (
-    TradeExplanation,
-    build_trade_explainer_chain,
-    explain_trade,
-)
 from pulse_bot.llm.analysis_graph import (
     AnalysisState,
     build_analysis_graph,
     run_analysis,
+)
+from pulse_bot.llm.explainer import (
+    TradeExplanation,
+    build_trade_explainer_chain,
+    explain_trade,
 )
 
 __all__ = [

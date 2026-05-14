@@ -53,7 +53,7 @@ class ObservationContext:
     n_buyers_first_5s: float = float("nan")
 
     # Stage 3 — Checkpoint state (mutated by observation_checkpoint_loop)
-    checkpoint_verdict: str | None = None     # "BUY_EARLY" | "SKIP_EARLY" | None
+    checkpoint_verdict: str | None = None  # "BUY_EARLY" | "SKIP_EARLY" | None
     checkpoint_proba: float | None = None
     checkpoint_source: str = "checkpoint"
 

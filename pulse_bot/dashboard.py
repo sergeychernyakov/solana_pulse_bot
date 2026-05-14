@@ -257,9 +257,15 @@ def render_paper_trades(db: Database) -> None:
         # synthetic seed-data with timestamp 2026-01-01 00:16:40.
         REAL_TRADES_FROM = 1743465600  # 2026-04-01 00:00 UTC
         REAL_ENTRY_TYPES = {
-            "fast", "full", "ml_override", "t30", "t30_skip",
-            "timing", "BUY_EARLY",
+            "fast",
+            "full",
+            "ml_override",
+            "t30",
+            "t30_skip",
+            "timing",
+            "BUY_EARLY",
         }
+
         def _is_real(t: dict) -> bool:
             etype = (t.get("entry_type") or "").lower()
             if etype in REAL_ENTRY_TYPES:
@@ -267,6 +273,7 @@ def render_paper_trades(db: Database) -> None:
             # Legacy fallback for pre-2026-04-28 entries when entry_type
             # wasn't always set: trust entry_buyer_number > 0.
             return (t.get("entry_buyer_number", 0) or 0) > 0
+
         closed_trades = [
             t
             for t in closed_trades_all
@@ -300,6 +307,50 @@ def render_paper_trades(db: Database) -> None:
         </div>""",
         unsafe_allow_html=True,
     )
+
+    # ── Per-config A/B breakdown (2026-05-14 multi-config) ─────────
+    # Each entry config opens its own tagged paper trades from one
+    # shared WS stream. Grouping by config_id reads the A/B at a glance.
+    # Shown only when more than one config has trades — single-config
+    # bots see no extra noise.
+    by_cfg: dict[str, dict] = {}
+    for t in closed_trades:
+        cid = t.get("config_id") or "LIVE"
+        b = by_cfg.setdefault(
+            cid, {"n": 0, "wins": 0, "pnl_sol": 0.0, "pnl_pct_sum": 0.0}
+        )
+        b["n"] += 1
+        if (t.get("pnl_pct", 0) or 0) > 0:
+            b["wins"] += 1
+        b["pnl_sol"] += t.get("pnl_sol", 0) or 0
+        b["pnl_pct_sum"] += t.get("pnl_pct", 0) or 0
+    open_by_cfg: dict[str, int] = {}
+    for t in open_trades:
+        cid = t.get("config_id") or "LIVE"
+        open_by_cfg[cid] = open_by_cfg.get(cid, 0) + 1
+    all_cfg_ids = set(by_cfg) | set(open_by_cfg)
+    if len(all_cfg_ids) > 1:
+        cfg_rows = []
+        for cid in sorted(all_cfg_ids):
+            b = by_cfg.get(cid)
+            n = b["n"] if b else 0
+            cfg_rows.append(
+                {
+                    "Config": cid,
+                    "Closed": n,
+                    "Open": open_by_cfg.get(cid, 0),
+                    "WR %": round(b["wins"] / n * 100, 1) if n else 0.0,
+                    "P&L SOL": round(b["pnl_sol"], 4) if b else 0.0,
+                    "Avg P&L %": round(b["pnl_pct_sum"] / n, 1) if n else 0.0,
+                }
+            )
+        st.caption("Per-config A/B breakdown")
+        st.dataframe(
+            pd.DataFrame(cfg_rows),
+            use_container_width=True,
+            height=38 + 35 * len(cfg_rows),
+            hide_index=True,
+        )
 
     # Load scoring data for all paper trade mints
     all_mints = [t["mint"] for t in open_trades + closed_trades if t.get("mint")]
@@ -401,6 +452,7 @@ def render_paper_trades(db: Database) -> None:
             closed_rows.append(
                 {
                     "Sym": t.get("symbol", "?"),
+                    "Cfg": t.get("config_id") or "LIVE",
                     "Path": _classify_entry_path(t, sc),
                     "Score": t.get("entry_score", 0),
                     "Pred PnL": _decode_reg_pnl(t),
@@ -749,7 +801,7 @@ def _short_reason(reasons_str: str | None, max_chars: int = 30) -> str:
     parts = s.replace(";", ",").split(",")
     first = parts[0].strip()
     if len(first) > max_chars:
-        return first[:max_chars - 1] + "…"
+        return first[: max_chars - 1] + "…"
     return first
 
 

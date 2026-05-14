@@ -136,9 +136,7 @@ class GeyserLaunchpad(Launchpad):
                 if idle >= inactivity_timeout:
                     break
             try:
-                trade = await asyncio.wait_for(
-                    queue.get(), timeout=min(remaining, 2.0)
-                )
+                trade = await asyncio.wait_for(queue.get(), timeout=min(remaining, 2.0))
                 last_trade_time = time.time()
                 yield trade
             except asyncio.TimeoutError:
@@ -341,10 +339,18 @@ def _decode_pumpfun_event(info: Any) -> dict | None:
     token_amount = 0.0
     for idx in set(pre_for_mint) | set(post_for_mint):
         pre_amt = float(
-            (pre_for_mint.get(idx).ui_token_amount.ui_amount if idx in pre_for_mint else 0)
+            (
+                pre_for_mint.get(idx).ui_token_amount.ui_amount
+                if idx in pre_for_mint
+                else 0
+            )
         )
         post_amt = float(
-            (post_for_mint.get(idx).ui_token_amount.ui_amount if idx in post_for_mint else 0)
+            (
+                post_for_mint.get(idx).ui_token_amount.ui_amount
+                if idx in post_for_mint
+                else 0
+            )
         )
         change = abs(post_amt - pre_amt)
         if change > token_amount:

@@ -456,6 +456,7 @@ def train_entry_timing(
     # weighting forces the model to actually distinguish the rare
     # BUY/WAIT classes.
     import numpy as _np
+
     n_total = len(y)
     class_counts_arr = _np.bincount(y, minlength=3).astype(float)
     # Inverse frequency, normalized so total weight = n_total (keeps
@@ -483,7 +484,9 @@ def train_entry_timing(
         train_mask = _np.ones(n_total, dtype=bool)
         test_mask = _np.zeros(n_total, dtype=bool)
 
-    dtrain = xgb.DMatrix(X[train_mask], label=y[train_mask], weight=sample_w[train_mask])
+    dtrain = xgb.DMatrix(
+        X[train_mask], label=y[train_mask], weight=sample_w[train_mask]
+    )
     params = {
         "objective": "multi:softprob",
         "num_class": 3,
@@ -500,10 +503,7 @@ def train_entry_timing(
     per_class: dict[str, dict[str, float]] = {}
     overall_auc: float | None = None
     if int(test_mask.sum()) >= 50:
-        from sklearn.metrics import (
-            precision_recall_fscore_support,
-            roc_auc_score,
-        )
+        from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
 
         X_test = X[test_mask]
         y_test = y[test_mask]
@@ -553,6 +553,14 @@ def train_entry_timing(
             "random_state": random_state,
         },
     }
+    # Universal skill gate (task #96): emit an authoritative model_health
+    # block. A timing model whose one-vs-rest AUC is at chance must not
+    # drive TIMING checkpoint BUY/SKIP decisions.
+    from pulse_bot.ml.model_registry import assess_skill as _assess_skill
+
+    _sk, _st, _rs = _assess_skill(meta)
+    meta["model_health"] = {"status": _st, "skilled": _sk, "reason": _rs}
+    logger.info("entry-timing model_health: %s — %s", _st, _rs)
     meta_out = model_out.with_suffix(".meta.json")
     meta_out.write_text(json.dumps(meta, indent=2, sort_keys=True))
     logger.info("Saved entry-timing model to %s (meta %s)", model_out, meta_out)

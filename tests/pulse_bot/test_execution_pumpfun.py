@@ -44,6 +44,11 @@ SAMPLE_MINT = Pubkey.from_string(
 SAMPLE_USER = Pubkey.from_string(
     "11111111111111111111111111111112"  # 1 byte off zero — valid pubkey
 )
+# Creator field from BondingCurveState — drives the creator-vault PDA.
+# Distinct from user so we can assert PDAs don't collide.
+SAMPLE_CREATOR = Pubkey.from_string(
+    "So11111111111111111111111111111111111111112"
+)
 
 
 # ── Discriminators ────────────────────────────────────────────
@@ -102,14 +107,16 @@ def test_ata_derivation_matches_spl_convention():
 
 # ── Instruction data encoding ──────────────────────────────────
 def test_buy_instruction_data_layout():
-    """[0..8] = discriminator, [8..16] = u64 amount, [16..24] = u64 max_sol."""
+    """[0..8]=disc, [8..16]=amount u64, [16..24]=max_sol u64. Total 24
+    bytes — no trailing track_volume byte (2026-05-14: the current
+    on-chain program rejects the 25-byte form; verified against a
+    decoded reference buy)."""
     data = encode_buy_instruction_data(
         token_amount_raw=1_000_000_000,
         max_sol_cost_lamports=10_000_000,
     )
     assert len(data) == 24
     assert data[:8] == BUY_DISCRIMINATOR
-    # u64 LE on amount
     import struct
     amount, max_sol = struct.unpack("<QQ", data[8:24])
     assert amount == 1_000_000_000
@@ -145,42 +152,72 @@ def test_sell_instruction_rejects_negative_amounts():
 
 # ── Account ordering ──────────────────────────────────────────
 def test_buy_accounts_have_expected_count_and_constants():
-    """The buy instruction expects 12 accounts in fixed order. If the
-    order ever changes, on-chain program will fail with cryptic error
-    (account validation by index)."""
-    acc = PumpFunBuyAccounts.for_user_and_mint(SAMPLE_USER, SAMPLE_MINT)
-    # Constants are pinned to module-level singletons.
+    """The buy instruction expects 18 accounts (16 IDL + 2 remaining)."""
+    from pulse_bot.execution_pumpfun import (
+        FEE_PROGRAM_ID,
+        PUMPFUN_DEFAULT_BUYBACK_FEE_RECIPIENT,
+        derive_bonding_curve_v2_pda,
+        derive_creator_vault_pda,
+        derive_fee_config_pda,
+        derive_global_volume_accumulator_pda,
+        derive_user_volume_accumulator_pda,
+    )
+    acc = PumpFunBuyAccounts.for_user_mint_creator(
+        SAMPLE_USER, SAMPLE_MINT, SAMPLE_CREATOR
+    )
     assert acc.fee_recipient == PUMPFUN_FEE_RECIPIENT
     assert acc.system_program == SYSTEM_PROGRAM_ID
     assert acc.token_program == TOKEN_2022_PROGRAM_ID
     assert acc.program == PUMPFUN_PROGRAM_ID
-    # User and mint pass through.
+    assert acc.fee_program == FEE_PROGRAM_ID
     assert acc.user == SAMPLE_USER
     assert acc.mint == SAMPLE_MINT
-    # Bonding-curve PDA is mint-derived.
     assert acc.bonding_curve == derive_bonding_curve_pda(SAMPLE_MINT)
-    # Associated bonding curve = ATA(bonding_curve, mint).
     assert acc.associated_bonding_curve == derive_associated_token_account(
         acc.bonding_curve, acc.mint
     )
-    # User's pump-fun-token ATA.
     assert acc.associated_user == derive_associated_token_account(
         SAMPLE_USER, SAMPLE_MINT
     )
+    assert acc.creator_vault == derive_creator_vault_pda(SAMPLE_CREATOR)
+    assert acc.global_volume_accumulator == derive_global_volume_accumulator_pda()
+    assert acc.user_volume_accumulator == derive_user_volume_accumulator_pda(
+        SAMPLE_USER
+    )
+    assert acc.fee_config == derive_fee_config_pda()
+    # Remaining accounts (slots [16], [17]):
+    assert acc.bonding_curve_v2 == derive_bonding_curve_v2_pda(SAMPLE_MINT)
+    assert acc.buyback_fee_recipient == PUMPFUN_DEFAULT_BUYBACK_FEE_RECIPIENT
 
 
 def test_sell_accounts_have_expected_count_and_constants():
-    acc = PumpFunSellAccounts.for_user_and_mint(SAMPLE_USER, SAMPLE_MINT)
+    from pulse_bot.execution_pumpfun import (
+        FEE_PROGRAM_ID,
+        PUMPFUN_DEFAULT_BUYBACK_FEE_RECIPIENT,
+        derive_bonding_curve_v2_pda,
+        derive_creator_vault_pda,
+        derive_user_volume_accumulator_pda,
+    )
+    acc = PumpFunSellAccounts.for_user_mint_creator(
+        SAMPLE_USER, SAMPLE_MINT, SAMPLE_CREATOR
+    )
     assert acc.fee_recipient == PUMPFUN_FEE_RECIPIENT
     assert acc.system_program == SYSTEM_PROGRAM_ID
     assert acc.token_program == TOKEN_2022_PROGRAM_ID
     assert acc.program == PUMPFUN_PROGRAM_ID
+    assert acc.fee_program == FEE_PROGRAM_ID
     assert acc.bonding_curve == derive_bonding_curve_pda(SAMPLE_MINT)
+    assert acc.creator_vault == derive_creator_vault_pda(SAMPLE_CREATOR)
+    assert acc.bonding_curve_v2 == derive_bonding_curve_v2_pda(SAMPLE_MINT)
+    assert acc.user_volume_accumulator == derive_user_volume_accumulator_pda(
+        SAMPLE_USER
+    )
+    assert acc.buyback_fee_recipient == PUMPFUN_DEFAULT_BUYBACK_FEE_RECIPIENT
 
 
 # ── Bonding-curve state parsing & math ────────────────────────
 def test_bonding_curve_state_parse_basic():
-    """Synthetic on-chain payload — discriminator + 5×u64 + bool."""
+    """Synthetic on-chain payload — disc + 5×u64 + bool + creator (32B)."""
     import struct
     from pulse_bot.execution_pumpfun import BondingCurveState
     discriminator = bytes(8)
@@ -192,18 +229,23 @@ def test_bonding_curve_state_parse_basic():
         0,                       # real_sol_reserves (fresh mint)
         1_000_000_000_000_000,   # token_total_supply
     )
-    data = discriminator + body + bytes([0])  # complete=False
+    creator_bytes = bytes(SAMPLE_CREATOR)
+    data = discriminator + body + bytes([0]) + creator_bytes  # complete=False
     state = BondingCurveState.from_account_data(data)
     assert state.virtual_token_reserves == 1_073_000_000_000_000
     assert state.virtual_sol_reserves == 30_000_000_000
     assert state.real_sol_reserves == 0
     assert state.complete is False
+    assert state.creator == SAMPLE_CREATOR
 
 
 def test_bonding_curve_state_rejects_short_buffer():
     from pulse_bot.execution_pumpfun import BondingCurveState
     with pytest.raises(ValueError):
         BondingCurveState.from_account_data(b"\x00" * 10)
+    # Pre-creator-field schema (49 bytes) is also rejected now.
+    with pytest.raises(ValueError):
+        BondingCurveState.from_account_data(b"\x00" * 49)
 
 
 def test_estimate_buy_output_constant_product_math():
@@ -221,6 +263,7 @@ def test_estimate_buy_output_constant_product_math():
         real_sol_reserves=0,
         token_total_supply=1_000_000_000_000_000,
         complete=False,
+        creator=SAMPLE_CREATOR,
     )
     one_sol = 1_000_000_000  # lamports
     out = estimate_buy_output_tokens(one_sol, state)
@@ -245,6 +288,7 @@ def test_estimate_buy_zero_when_curve_complete():
         real_sol_reserves=85_000_000_000,
         token_total_supply=1_000_000_000_000_000,
         complete=True,
+        creator=SAMPLE_CREATOR,
     )
     assert estimate_buy_output_tokens(1_000_000_000, state) == 0
 
@@ -265,6 +309,7 @@ def test_estimate_sell_inverts_buy_within_fee():
         real_sol_reserves=10_000_000_000,
         token_total_supply=1_000_000_000_000_000,
         complete=False,
+        creator=SAMPLE_CREATOR,
     )
     sol_in = 100_000_000  # 0.1 SOL
     tokens_out = estimate_buy_output_tokens(sol_in, state)
@@ -287,6 +332,7 @@ def test_estimate_buy_zero_for_zero_input():
         virtual_token_reserves=1, virtual_sol_reserves=1,
         real_token_reserves=1, real_sol_reserves=0,
         token_total_supply=1, complete=False,
+        creator=SAMPLE_CREATOR,
     )
     assert estimate_buy_output_tokens(0, state) == 0
     assert estimate_buy_output_tokens(-100, state) == 0
@@ -482,60 +528,120 @@ def test_create_ata_idempotent_ix_layout():
 
 # ── Pump.fun buy/sell instruction with full account list ─────
 def test_pump_buy_ix_account_count_and_signer_flags():
-    """12 accounts in fixed order; user (idx 6) is the signer/writable.
-    Program: pump.fun mainnet program."""
+    """16 accounts (per IDL); user at idx 6 is signer/writable;
+    mut bits at [1,3,4,5,6,9,13]."""
     from pulse_bot.execution_pumpfun import (
+        FEE_PROGRAM_ID,
         PUMPFUN_PROGRAM_ID,
         build_pump_buy_ix,
+        derive_creator_vault_pda,
     )
     ix = build_pump_buy_ix(
         user=SAMPLE_USER,
         mint=SAMPLE_MINT,
+        creator=SAMPLE_CREATOR,
         token_amount_raw=1_000_000_000,
         max_sol_cost_lamports=10_000_000,
     )
     assert ix.program_id == PUMPFUN_PROGRAM_ID
-    assert len(ix.accounts) == 12
+    # 16 IDL + 2 remaining (bonding_curve_v2, buyback_fee_recipient).
+    assert len(ix.accounts) == 18
 
-    # User at index 6: is_signer=True, is_writable=True.
     user_acct = ix.accounts[6]
     assert user_acct.pubkey == SAMPLE_USER
     assert user_acct.is_signer is True
     assert user_acct.is_writable is True
 
-    # Mint at index 2: readonly.
     assert ix.accounts[2].pubkey == SAMPLE_MINT
-    assert ix.accounts[2].is_signer is False
     assert ix.accounts[2].is_writable is False
 
-    # Bonding curve at index 3: writable.
-    assert ix.accounts[3].is_writable is True
+    # Slot [9] is creator_vault (not rent).
+    assert ix.accounts[9].pubkey == derive_creator_vault_pda(SAMPLE_CREATOR)
+    assert ix.accounts[9].is_writable is True
 
-    # No other signers — only the user signs.
+    # Slot [13] = user_volume_accumulator (writable).
+    assert ix.accounts[13].is_writable is True
+
+    # Slot [15] = fee_program.
+    assert ix.accounts[15].pubkey == FEE_PROGRAM_ID
+
+    # Slot [16] = bonding_curve_v2 — readonly.
+    from pulse_bot.execution_pumpfun import (
+        derive_bonding_curve_v2_pda,
+        PUMPFUN_DEFAULT_BUYBACK_FEE_RECIPIENT,
+    )
+    assert ix.accounts[16].pubkey == derive_bonding_curve_v2_pda(SAMPLE_MINT)
+    assert ix.accounts[16].is_writable is False
+    # Slot [17] = buyback_fee_recipient — writable.
+    assert ix.accounts[17].pubkey == PUMPFUN_DEFAULT_BUYBACK_FEE_RECIPIENT
+    assert ix.accounts[17].is_writable is True
+
+    # mut bits: IDL [1,3,4,5,6,9,13] + remaining [17] = 8 writable slots.
+    writable_slots = [i for i, a in enumerate(ix.accounts) if a.is_writable]
+    assert writable_slots == [1, 3, 4, 5, 6, 9, 13, 17]
+    # Only user signs.
     assert sum(1 for a in ix.accounts if a.is_signer) == 1
+
+    # Data is 24 bytes — no trailing track_volume byte (2026-05-14).
+    assert len(bytes(ix.data)) == 24
 
 
 def test_pump_sell_ix_account_count():
-    """12 accounts; sell instruction has associated_token_program at
-    slot 8 (vs rent at slot 9 for buy)."""
+    """14 accounts (per IDL); creator_vault at slot [8],
+    token_program at slot [9] — different from buy."""
     from pulse_bot.execution_pumpfun import (
-        ATA_PROGRAM_ID,
+        FEE_PROGRAM_ID,
         PUMPFUN_PROGRAM_ID,
+        TOKEN_2022_PROGRAM_ID,
         build_pump_sell_ix,
+        derive_creator_vault_pda,
     )
+    from pulse_bot.execution_pumpfun import (
+        derive_bonding_curve_v2_pda,
+        derive_user_volume_accumulator_pda,
+        PUMPFUN_DEFAULT_BUYBACK_FEE_RECIPIENT,
+    )
+    # Default is_cashback_coin=True → 14 IDL + UVA + bonding_v2 + buyback = 17 accounts.
     ix = build_pump_sell_ix(
         user=SAMPLE_USER,
         mint=SAMPLE_MINT,
+        creator=SAMPLE_CREATOR,
         token_amount_raw=500_000_000,
         min_sol_output_lamports=4_500_000,
     )
     assert ix.program_id == PUMPFUN_PROGRAM_ID
-    assert len(ix.accounts) == 12
-    # User still index 6, signer/writable.
+    assert len(ix.accounts) == 17  # cashback adds UVA
     assert ix.accounts[6].pubkey == SAMPLE_USER
     assert ix.accounts[6].is_signer is True
-    # Slot 8 is ATA program for sell (was rent for buy).
-    assert ix.accounts[8].pubkey == ATA_PROGRAM_ID
+    # Slot [8] = creator_vault (not ATA program).
+    assert ix.accounts[8].pubkey == derive_creator_vault_pda(SAMPLE_CREATOR)
+    assert ix.accounts[8].is_writable is True
+    # Slot [9] = token_program (Token-2022).
+    assert ix.accounts[9].pubkey == TOKEN_2022_PROGRAM_ID
+    # Slot [13] = fee_program.
+    assert ix.accounts[13].pubkey == FEE_PROGRAM_ID
+    # Slot [14] = user_volume_accumulator (cashback only).
+    assert ix.accounts[14].pubkey == derive_user_volume_accumulator_pda(SAMPLE_USER)
+    assert ix.accounts[14].is_writable is True
+    # Slot [15] = bonding_curve_v2 (readonly).
+    assert ix.accounts[15].pubkey == derive_bonding_curve_v2_pda(SAMPLE_MINT)
+    assert ix.accounts[15].is_writable is False
+    # Slot [16] = buyback_fee_recipient (writable).
+    assert ix.accounts[16].pubkey == PUMPFUN_DEFAULT_BUYBACK_FEE_RECIPIENT
+    assert ix.accounts[16].is_writable is True
+    # mut bits: IDL [1,3,4,5,6,8] + UVA [14] + buyback [16].
+    writable_slots = [i for i, a in enumerate(ix.accounts) if a.is_writable]
+    assert writable_slots == [1, 3, 4, 5, 6, 8, 14, 16]
+    # Sell data still 24 bytes (no track_volume).
+    assert len(bytes(ix.data)) == 24
+
+    # Non-cashback variant — 16 accounts.
+    ix_no_cb = build_pump_sell_ix(
+        user=SAMPLE_USER, mint=SAMPLE_MINT, creator=SAMPLE_CREATOR,
+        token_amount_raw=1, min_sol_output_lamports=1,
+        is_cashback_coin=False,
+    )
+    assert len(ix_no_cb.accounts) == 16
 
 
 # ── Full transaction assembly ─────────────────────────────────
@@ -559,6 +665,7 @@ def _make_test_state():
         real_sol_reserves=10_000_000_000,
         token_total_supply=1_000_000_000_000_000,
         complete=False,
+        creator=SAMPLE_CREATOR,
     )
 
 
@@ -627,6 +734,7 @@ def test_build_buy_transaction_rejects_complete_curve():
         virtual_token_reserves=0, virtual_sol_reserves=0,
         real_token_reserves=0, real_sol_reserves=85_000_000_000,
         token_total_supply=1_000_000_000_000_000, complete=True,
+        creator=SAMPLE_CREATOR,
     )
     with pytest.raises(ValueError):
         build_buy_transaction(
@@ -697,6 +805,10 @@ class _FakeRpc:
     async def fetch_bonding_curve_state(self, mint):
         return self._state
 
+    async def fetch_mint_token_program(self, mint):
+        from pulse_bot.execution_pumpfun import TOKEN_2022_PROGRAM_ID
+        return TOKEN_2022_PROGRAM_ID
+
     async def get_latest_blockhash(self):
         return self._blockhash
 
@@ -755,6 +867,7 @@ async def test_pump_execution_simulate_buy_returns_error_when_curve_complete():
         virtual_token_reserves=1, virtual_sol_reserves=1,
         real_token_reserves=0, real_sol_reserves=85_000_000_000,
         token_total_supply=1, complete=True,
+        creator=SAMPLE_CREATOR,
     )
     rpc = _FakeRpc(state=completed)
     ex = PumpFunExecution(rpc=rpc, keypair=_make_test_keypair())
