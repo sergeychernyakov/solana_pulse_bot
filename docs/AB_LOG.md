@@ -46,7 +46,7 @@ AVG((pnl_pct>0)::int) FROM paper_trades WHERE status='closed' GROUP BY config_id
 | TRAILTIGHT | exit        | `exit_trailing_stop_activation_pct = 10.0`, `exit_trailing_stop_distance_pct = 15.0` |
 | SCAMSTRICT | filters     | `bot_cluster_hard_skip_n = 2`, `wash_cluster_skip_n = 1` |
 
-**Запущено:** _<заполнить при рестарте бота>_ UTC, коммит `<hash>`.
+**Запущено:** 2026-05-14 17:07 UTC, коммит `c486acd`.
 
 **Критерий:** через N≥100 закрытых сделок на конфиг — сравнить
 total_pnl_sol и WR против LIVE. Вариант «deploy-worthy», если
