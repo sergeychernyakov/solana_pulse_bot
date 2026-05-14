@@ -14,9 +14,8 @@ import types
 
 import pytest
 
-from pulse_bot.ml.model_registry import ModelRegistry, assess_skill
 from pulse_bot.decision_service import DecisionService, EntryDecision
-
+from pulse_bot.ml.model_registry import ModelRegistry, assess_skill
 
 # ───────────────────────── assess_skill rules ──────────────────────────
 
@@ -55,9 +54,7 @@ def test_regression_head_with_skill_is_enabled():
 
 def test_regression_head_worse_than_coinflip_sign_is_disabled():
     """rho is fine but auc_sign <= 0.50 → still disabled."""
-    skilled, _, _ = assess_skill(
-        {"auc_sign": 0.50, "spearman_rho": 0.30}
-    )
+    skilled, _, _ = assess_skill({"auc_sign": 0.50, "spearman_rho": 0.30})
     assert skilled is False
 
 
@@ -220,8 +217,9 @@ def test_ev_advisory_inert_for_wr_objective_thresholds():
 def test_registry_spec_healthy_uses_assess_skill(tmp_path):
     (tmp_path / "entry_model_reg.ubj").write_bytes(b"stub")
     (tmp_path / "entry_model_reg.meta.json").write_text(
-        json.dumps({"objective": "reg:squarederror",
-                    "spearman_rho": 0.06, "auc_sign": 0.37})
+        json.dumps(
+            {"objective": "reg:squarederror", "spearman_rho": 0.06, "auc_sign": 0.37}
+        )
     )
     reg = ModelRegistry(data_dir=tmp_path)
     spec = reg.get("entry_reg")
@@ -257,8 +255,13 @@ def test_disabled_reg_model_means_no_reg_floor_block():
     override with NO reg-floor evaluation, even if a floor is set."""
     svc = DecisionService(db=None, hard_skip_n_env=0, reg_floor_pct=0.0)
     out = svc.apply_ml_override(
-        _decision_skip(), ml_action="BUY", ml_proba=0.30, ml_cal=0.02,
-        result=_result(), mint_short="MINT", reg_pnl_pct=None,
+        _decision_skip(),
+        ml_action="BUY",
+        ml_proba=0.30,
+        ml_cal=0.02,
+        result=_result(),
+        mint_short="MINT",
+        reg_pnl_pct=None,
     )
     assert out.should_enter is True
     assert out.entry_type == "ml_override"
@@ -271,8 +274,13 @@ def test_enabled_reg_model_still_applies_reg_floor_block():
     block still fires — the gate is bypassed only by None, not weakened."""
     svc = DecisionService(db=None, hard_skip_n_env=0, reg_floor_pct=0.0)
     out = svc.apply_ml_override(
-        _decision_skip(), ml_action="BUY", ml_proba=0.30, ml_cal=0.02,
-        result=_result(), mint_short="MINT", reg_pnl_pct=-1.5,
+        _decision_skip(),
+        ml_action="BUY",
+        ml_proba=0.30,
+        ml_cal=0.02,
+        result=_result(),
+        mint_short="MINT",
+        reg_pnl_pct=-1.5,
     )
     assert out.should_enter is False
     assert svc.ml_overrides_skip == 1
@@ -285,8 +293,13 @@ def test_p_cal_floor_blocks_buy_below_floor():
     """ml_override BUY is blocked when calibrated proba < p_cal_floor."""
     svc = DecisionService(db=None, hard_skip_n_env=0, p_cal_floor=0.02)
     out = svc.apply_ml_override(
-        _decision_skip(), ml_action="BUY", ml_proba=0.20, ml_cal=0.009,
-        result=_result(), mint_short="MINT", reg_pnl_pct=None,
+        _decision_skip(),
+        ml_action="BUY",
+        ml_proba=0.20,
+        ml_cal=0.009,
+        result=_result(),
+        mint_short="MINT",
+        reg_pnl_pct=None,
     )
     assert out.should_enter is False
     assert svc.ml_overrides_skip == 1
@@ -296,8 +309,13 @@ def test_p_cal_floor_blocks_buy_below_floor():
 def test_p_cal_floor_allows_buy_at_or_above_floor():
     svc = DecisionService(db=None, hard_skip_n_env=0, p_cal_floor=0.02)
     out = svc.apply_ml_override(
-        _decision_skip(), ml_action="BUY", ml_proba=0.55, ml_cal=0.05,
-        result=_result(), mint_short="MINT", reg_pnl_pct=None,
+        _decision_skip(),
+        ml_action="BUY",
+        ml_proba=0.55,
+        ml_cal=0.05,
+        result=_result(),
+        mint_short="MINT",
+        reg_pnl_pct=None,
     )
     assert out.should_enter is True
     assert out.entry_type == "ml_override"
@@ -308,11 +326,126 @@ def test_p_cal_floor_zero_is_no_gate():
     """Default p_cal_floor=0.0 (LIVE config) lets any BUY through."""
     svc = DecisionService(db=None, hard_skip_n_env=0)  # p_cal_floor defaults 0.0
     out = svc.apply_ml_override(
-        _decision_skip(), ml_action="BUY", ml_proba=0.16, ml_cal=0.001,
-        result=_result(), mint_short="MINT", reg_pnl_pct=None,
+        _decision_skip(),
+        ml_action="BUY",
+        ml_proba=0.16,
+        ml_cal=0.001,
+        result=_result(),
+        mint_short="MINT",
+        reg_pnl_pct=None,
     )
     assert out.should_enter is True
     assert svc.ml_overrides_buy == 1
+
+
+# ───────────── p_raw floor gate (multi-config A/B knob, v3) ────────────
+
+
+def test_p_raw_floor_blocks_buy_below_floor():
+    """ml_override BUY is blocked when RAW proba < p_raw_floor — the v3
+    A/B knob with real range (calibrated proba is compressed)."""
+    svc = DecisionService(db=None, hard_skip_n_env=0, p_raw_floor=0.30)
+    out = svc.apply_ml_override(
+        _decision_skip(),
+        ml_action="BUY",
+        ml_proba=0.20,
+        ml_cal=0.05,
+        result=_result(),
+        mint_short="MINT",
+        reg_pnl_pct=None,
+    )
+    assert out.should_enter is False
+    assert svc.ml_overrides_skip == 1
+    assert svc.ml_overrides_buy == 0
+
+
+def test_p_raw_floor_allows_buy_at_or_above_floor():
+    svc = DecisionService(db=None, hard_skip_n_env=0, p_raw_floor=0.30)
+    out = svc.apply_ml_override(
+        _decision_skip(),
+        ml_action="BUY",
+        ml_proba=0.35,
+        ml_cal=0.02,
+        result=_result(),
+        mint_short="MINT",
+        reg_pnl_pct=None,
+    )
+    assert out.should_enter is True
+    assert out.entry_type == "ml_override"
+    assert svc.ml_overrides_buy == 1
+
+
+def test_p_raw_floor_zero_is_no_gate():
+    """Default p_raw_floor=0.0 (LIVE config) lets any BUY through."""
+    svc = DecisionService(db=None, hard_skip_n_env=0)  # p_raw_floor defaults 0.0
+    out = svc.apply_ml_override(
+        _decision_skip(),
+        ml_action="BUY",
+        ml_proba=0.16,
+        ml_cal=0.001,
+        result=_result(),
+        mint_short="MINT",
+        reg_pnl_pct=None,
+    )
+    assert out.should_enter is True
+    assert svc.ml_overrides_buy == 1
+
+
+def test_p_raw_floor_from_entry_config_is_wired():
+    """from_entry_config threads EntryConfig.p_raw_floor into the gate."""
+    from pulse_bot.entry_configs import EntryConfig
+
+    cfg = EntryConfig(config_id="PRAW30", name="n", description="d", p_raw_floor=0.30)
+    svc = DecisionService.from_entry_config(db=None, cfg=cfg)
+    assert svc._p_raw_floor == 0.30
+
+
+# ───────────── EntryConfig per-config exit overrides (v3) ──────────────
+
+
+def test_entry_config_exit_overrides_empty_when_unset():
+    """LIVE / entry-only configs set no exit fields → exit_overrides()
+    is empty → the supervisor uses the global exit config unchanged."""
+    from pulse_bot.entry_configs import EntryConfig
+
+    cfg = EntryConfig(config_id="LIVE", name="n", description="d")
+    assert cfg.exit_overrides() == {}
+
+
+def test_entry_config_exit_overrides_collects_only_set_fields():
+    """A config that sets some exit fields → exit_overrides() returns just
+    those, as a dataclasses.replace kwargs dict."""
+    from pulse_bot.entry_configs import EntryConfig
+
+    cfg = EntryConfig(
+        config_id="TP10",
+        name="n",
+        description="d",
+        exit_take_profit_pct=10.0,
+        exit_trailing_stop_distance_pct=15.0,
+    )
+    assert cfg.exit_overrides() == {
+        "exit_take_profit_pct": 10.0,
+        "exit_trailing_stop_distance_pct": 15.0,
+    }
+
+
+def test_entry_config_exit_overrides_apply_via_dataclasses_replace():
+    """exit_overrides() is shaped for dataclasses.replace(global_config,
+    **overrides) — the exact call the paper-trade supervisor makes."""
+    import dataclasses
+
+    from pulse_bot.config import get_config
+    from pulse_bot.entry_configs import EntryConfig
+
+    gc = get_config()
+    cfg = EntryConfig(
+        config_id="TP10", name="n", description="d", exit_take_profit_pct=10.0
+    )
+    effective = dataclasses.replace(gc, **cfg.exit_overrides())
+    assert effective.exit_take_profit_pct == 10.0
+    # untouched fields inherit the global value
+    assert effective.exit_hard_stop_loss_pct == gc.exit_hard_stop_loss_pct
 
 
 if __name__ == "__main__":

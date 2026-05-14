@@ -1,70 +1,95 @@
 # config/entry_configs.yaml
-# Multi-config A/B framework — 2026-05-13, reworked 2026-05-14.
+# Multi-config A/B framework — 2026-05-13, reworked 2026-05-14 (v3).
 #
-# Each `config` defines one entry-decision policy. The bot loads them all
-# at startup and evaluates EACH config in parallel for every scored token.
-# Every paper trade row carries config_id so live PnL is queryable per-config.
+# Each `config` defines one entry-decision + exit policy. The bot loads
+# them all at startup and evaluates EACH config in parallel for every
+# scored token. Every paper_trades row carries config_id, and each config
+# compounds/draws down its own scoped portfolio — so live PnL is a clean
+# per-config A/B.
 #
-# The "live" config is selected by env var PULSE_LIVE_CONFIG_ID (default: LIVE).
-# The live config is the one whose decisions drive any *real* (non-paper)
-# downstream actions. All other configs are paper-only shadow portfolios.
+# The "live" config is selected by env var PULSE_LIVE_CONFIG_ID (default:
+# LIVE). The live config drives any *real* (non-paper) downstream action;
+# all other configs are paper-only shadow portfolios.
 #
 # Adding/removing/changing configs:
-#   * NEVER recycle a config_id. If you want a different param set, add a NEW id.
-#   * Old paper_trades rows always resolve their full param history via the
+#   * NEVER recycle a config_id. Different param set => NEW id.
+#   * Old paper_trades rows resolve their full param history via the
 #     entry_configs DB table (synced from this YAML at bot startup).
 #
-# 2026-05-14: the A/B knob is now `p_cal_floor` — a per-config minimum on
-# the entry classifier's calibrated probability. The previous reg_floor
-# sweep was retired: the regression head's target is degenerate (95%+
-# exactly 0.0 — dead tokens exit at entry price), so no objective passes
-# the universal skill-gate and the reg head is disabled at load. The
-# classifier, by contrast, ranks winners at auc_sign≈0.92 — so p_cal is a
-# real selectivity knob. This sweep answers: does requiring higher
-# calibrated confidence improve WR enough to justify fewer trades?
+# ── v3 rework (2026-05-14) ──────────────────────────────────────────
+# The v2 sweep (PCAL01..08) varied `p_cal_floor` — but the live model's
+# CALIBRATED proba is compressed to ~0.01-0.04, so every PCAL config
+# above LIVE produced zero trades. Retired. v3 tests three directions,
+# one variable per config for clean attribution:
+#   * entry selectivity — `p_raw_floor` (raw proba spreads ~0.2-0.47 and
+#     ranks winners at auc_sign≈0.92, so it has real range): PRAW30/40
+#   * exit policy — TP and trailing (live TP/trailing rarely fire: p90
+#     peak ≈ +14%): TP10, TRAILTIGHT
+#   * scam-filter strictness — bot/wash cluster skip thresholds: SCAMSTRICT
+# Exit-override fields left unset => inherit the global exit config. LIVE
+# sets none — it behaves exactly like the production bot.
+# See docs/AB_LOG.md for the experiment record.
 
 configs:
   - config_id: LIVE
-    name: "Live (production)"
-    description: "Production baseline — no extra p_cal floor (classifier meta ceiling only). Drives real bot decisions."
+    name: "Live (production baseline)"
+    description: "Production baseline — no p_raw/p_cal floor, global exit config, scam filters 3/2. Drives real bot decisions."
+    p_raw_floor: 0.0
     p_cal_floor: 0.0
     bot_cluster_hard_skip_n: 3
     wash_cluster_skip_n: 2
     wash_cluster_size_min: 5
     wash_cluster_size_max: 50
 
-  - config_id: PCAL01
-    name: "p_cal floor 0.01"
-    description: "Same as LIVE but ml_override BUY requires calibrated proba >= 0.01."
-    p_cal_floor: 0.01
+  - config_id: PRAW30
+    name: "p_raw floor 0.30"
+    description: "Entry selectivity: ml_override BUY requires raw proba >= 0.30 (cuts the bottom ~half of the live p_raw range). Everything else = LIVE."
+    p_raw_floor: 0.30
+    p_cal_floor: 0.0
     bot_cluster_hard_skip_n: 3
     wash_cluster_skip_n: 2
     wash_cluster_size_min: 5
     wash_cluster_size_max: 50
 
-  - config_id: PCAL02
-    name: "p_cal floor 0.02"
-    description: "Same as LIVE but ml_override BUY requires calibrated proba >= 0.02."
-    p_cal_floor: 0.02
+  - config_id: PRAW40
+    name: "p_raw floor 0.40"
+    description: "Strict entry selectivity: ml_override BUY requires raw proba >= 0.40 — few trades, should have highest WR if p_raw is informative. Everything else = LIVE."
+    p_raw_floor: 0.40
+    p_cal_floor: 0.0
     bot_cluster_hard_skip_n: 3
     wash_cluster_skip_n: 2
     wash_cluster_size_min: 5
     wash_cluster_size_max: 50
 
-  - config_id: PCAL04
-    name: "p_cal floor 0.04"
-    description: "Same as LIVE but ml_override BUY requires calibrated proba >= 0.04."
-    p_cal_floor: 0.04
+  - config_id: TP10
+    name: "Take-profit 10%"
+    description: "Exit A/B: take-profit at +10% (vs global ~30%). p90 peak is ~+14%, so a low TP actually fires — tests 'lock small wins fast' vs 'hold for the rare moonshot'. Entry = LIVE."
+    p_raw_floor: 0.0
+    p_cal_floor: 0.0
+    exit_take_profit_pct: 10.0
     bot_cluster_hard_skip_n: 3
     wash_cluster_skip_n: 2
     wash_cluster_size_min: 5
     wash_cluster_size_max: 50
 
-  - config_id: PCAL08
-    name: "p_cal floor 0.08"
-    description: "Strictest — ml_override BUY requires calibrated proba >= 0.08. Few trades, should have highest WR if p_cal is informative."
-    p_cal_floor: 0.08
+  - config_id: TRAILTIGHT
+    name: "Tight trailing stop"
+    description: "Exit A/B: trailing stop activates at +10% profit, sells on a 15% drop from peak (vs global 50%/50% which almost never activates). Tests letting winners run with a real lock-in. Entry = LIVE."
+    p_raw_floor: 0.0
+    p_cal_floor: 0.0
+    exit_trailing_stop_activation_pct: 10.0
+    exit_trailing_stop_distance_pct: 15.0
     bot_cluster_hard_skip_n: 3
     wash_cluster_skip_n: 2
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50
+
+  - config_id: SCAMSTRICT
+    name: "Strict scam filters"
+    description: "Filter A/B: stricter bot-cluster (skip at >=2 vs 3) and wash-cluster (skip at >=1 vs 2) thresholds. Tests whether tighter scam filtering improves WR enough to justify fewer trades. Exit = LIVE."
+    p_raw_floor: 0.0
+    p_cal_floor: 0.0
+    bot_cluster_hard_skip_n: 2
+    wash_cluster_skip_n: 1
     wash_cluster_size_min: 5
     wash_cluster_size_max: 50

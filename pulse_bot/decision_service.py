@@ -80,6 +80,7 @@ class DecisionService:
         reg_ceiling_pct: float | None = None,
         config_id: str | None = None,
         p_cal_floor: float = 0.0,
+        p_raw_floor: float = 0.0,
     ) -> None:
         """Construct a DecisionService.
 
@@ -110,6 +111,11 @@ class DecisionService:
         # probability. Replaces the reg-floor A/B knob (reg head proven
         # degenerate). 0.0 = no extra floor.
         self._p_cal_floor = float(p_cal_floor)
+        # 2026-05-14: per-config floor on the classifier's RAW probability.
+        # Calibrated proba is compressed (~0.01-0.04) so p_cal_floor has no
+        # range on the live model; raw proba spreads ~0.2-0.47 and ranks
+        # winners — this is the selectivity knob with real range.
+        self._p_raw_floor = float(p_raw_floor)
         # Counters kept for /metrics + dashboard parity.
         self.ml_overrides_buy = 0
         self.ml_overrides_skip = 0
@@ -144,6 +150,7 @@ class DecisionService:
             reg_ceiling_pct=cfg.reg_ceiling_pct,
             config_id=cfg.config_id,
             p_cal_floor=getattr(cfg, "p_cal_floor", 0.0),
+            p_raw_floor=getattr(cfg, "p_raw_floor", 0.0),
         )
         if obs is not None:
             inst._obs = obs
@@ -381,6 +388,25 @@ class DecisionService:
         read-time to recover signed PnL %% × 10). Clamped to [1, 999].
         """
         if ml_action == "BUY" and not decision.should_enter:
+            # 2026-05-14 p_raw-floor gate. Per-config minimum on the entry
+            # classifier's RAW probability. Calibrated proba is compressed
+            # (~0.01-0.04) so p_cal_floor has no range on the live model;
+            # raw proba spreads ~0.2-0.47 and ranks winners — this is the
+            # A/B selectivity knob with real range. 0.0 = disabled.
+            if self._p_raw_floor > 0.0 and float(ml_proba) < self._p_raw_floor:
+                logger.warning(
+                    "ML OVERRIDE %s [%s]: rules=SKIP → ML=BUY BLOCKED by "
+                    "p_raw-floor (p_raw=%.4f < floor=%.4f p_cal=%.3f)",
+                    mint_short,
+                    self._config_id or "LIVE",
+                    float(ml_proba),
+                    self._p_raw_floor,
+                    ml_cal,
+                )
+                self.ml_overrides_skip += 1
+                if self._obs is not None:
+                    self._obs.ml_override.inc(action="p_raw_floor_block")
+                return decision  # unchanged — rules SKIP stays
             # 2026-05-14 p_cal-floor gate. Per-config minimum on the
             # entry classifier's calibrated probability — the multi-config
             # A/B knob that replaced reg_floor (reg head proven

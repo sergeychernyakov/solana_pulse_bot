@@ -70,11 +70,28 @@ class EntryConfig:
     # p_cal_floor (2026-05-14): per-config minimum on the entry
     # classifier's calibrated probability. An ml_override BUY is blocked
     # when p_cal < p_cal_floor. 0.0 = no extra floor (production default).
-    # Replaces the reg-floor A/B knob — the reg head was proven
-    # degenerate (target 95%+ zeros; no objective passes the skill-gate),
-    # while the classifier ranks winners at auc_sign≈0.92. See CHANGELOG
-    # 2026-05-14.
+    # NOTE (2026-05-14 audit): the live model's calibrated proba is
+    # compressed to ~0.01-0.04, so p_cal_floor barely fires — p_raw_floor
+    # below is the A/B knob that actually has range.
     p_cal_floor: float = 0.0
+    # p_raw_floor (2026-05-14): per-config minimum on the entry
+    # classifier's RAW probability. An ml_override BUY is blocked when
+    # p_raw < p_raw_floor. 0.0 = no extra floor. Unlike p_cal, raw proba
+    # spreads ~0.2-0.47 on the live model and ranks winners
+    # (auc_sign≈0.92), so this is the selectivity knob with real range.
+    p_raw_floor: float = 0.0
+    # Per-config exit overrides (2026-05-14): when set (not None), the
+    # paper-trade supervisor applies them on top of the global
+    # PulseBotConfig for THIS config's portfolio only. None = inherit the
+    # global value — so a config that sets none of these exits exactly
+    # like the live bot. Lets shadow portfolios A/B exit policy (TP /
+    # trailing / max_hold) in parallel without touching the live exit
+    # config. The LIVE config should leave these None.
+    exit_take_profit_pct: float | None = None
+    exit_hard_stop_loss_pct: float | None = None
+    exit_max_hold_seconds: float | None = None
+    exit_trailing_stop_activation_pct: float | None = None
+    exit_trailing_stop_distance_pct: float | None = None
     # reg_* fields kept for back-compat with persisted entry_configs rows;
     # the universal skill-gate disables the reg head at load, so these
     # are inert unless a future skilled reg model is deployed.
@@ -85,6 +102,21 @@ class EntryConfig:
     wash_cluster_size_min: int = 5
     wash_cluster_size_max: int = 50
     reg_model_path: str = "entry_model_reg.ubj"
+
+    def exit_overrides(self) -> dict[str, float]:
+        """Non-None exit-param overrides for this config, as a kwargs dict
+        for ``dataclasses.replace(global_config, **overrides)``. Empty when
+        the config inherits every exit param from the global config."""
+        fields = (
+            "exit_take_profit_pct",
+            "exit_hard_stop_loss_pct",
+            "exit_max_hold_seconds",
+            "exit_trailing_stop_activation_pct",
+            "exit_trailing_stop_distance_pct",
+        )
+        return {
+            f: float(getattr(self, f)) for f in fields if getattr(self, f) is not None
+        }
 
     def params_dict(self) -> dict[str, Any]:
         """JSON-serialisable view for DB storage (entry_configs.params JSONB)."""

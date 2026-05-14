@@ -11,6 +11,27 @@
 ```
 
 ---
+## 2026-05-14 17:07 — Multi-config A/B v3: p_raw_floor + per-config exit + scam-filter варианты
+
+**Что изменилось:**
+- `EntryConfig`: + `p_raw_floor` (порог по сырой вероятности классификатора) + 5 опциональных exit-полей (`exit_take_profit_pct`, `exit_hard_stop_loss_pct`, `exit_max_hold_seconds`, `exit_trailing_stop_activation_pct`, `exit_trailing_stop_distance_pct`). `exit_overrides()` собирает выставленные → kwargs для `dataclasses.replace`. `None` = наследовать глобальный конфиг.
+- `decision_service.apply_ml_override`: + p_raw-floor gate (рядом с p_cal-floor) — блокирует ml_override BUY при `p_raw < p_raw_floor`. Прокинуто через `from_entry_config`.
+- `paper_trade_supervisor.run`: строит `effective_config = dataclasses.replace(ctx._config, **exit_overrides)` для конфига, использует его для `PaperTradeRunner` + `deadline`/`inactivity`. LIVE и entry-only конфиги → `effective_config == ctx._config`, ноль дрейфа на проде.
+- `config/entry_configs.yaml` v3: заменил 5 мёртвых PCAL-конфигов на 6: **LIVE** (baseline) + **PRAW30/PRAW40** (entry-отбор) + **TP10/TRAILTIGHT** (exit-политика) + **SCAMSTRICT** (фильтры). Одна переменная на конфиг для чистой атрибуции.
+- `docs/AB_LOG.md` — новый журнал A/B-экспериментов: гипотеза, конфиги, дата запуска, критерий, результаты (заполняется по мере набора данных).
+
+**Зачем:**
+- v2 PCAL-свип варьировал `p_cal_floor`, но калиброванная proba модели сжата (~0.01-0.04) → 4 из 5 конфигов не сделали ни одной сделки. Сырая proba разбросана 0.2-0.47 и ранжирует (auc_sign≈0.92) — на ней A/B живой.
+- Глобальные TP (~30%) и trailing (активация +50%) почти не срабатывают (p90 пик токенов ≈ +14%). Per-config exit даёт честный live-A/B exit-политики без изменения live exit-конфига.
+
+**Результат:**
+- Boot 17:07:48: `Loaded 6 entry configs (live=LIVE, shadow=[PRAW30,PRAW40,TP10,TRAILTIGHT,SCAMSTRICT])`, `Multi-config A/B active: 6 configs`.
+- Тесты: +8 в `test_model_skill_gate.py` (p_raw_floor gate + exit_overrides), всё зелёное; ruff/black/isort/mypy чисто.
+- Дашборд показывает per-config breakdown автоматически (когда >1 конфиг с сделками).
+
+**Откат:** `ssh rich 'cd ~/www/gg && cp -r .deploy_backups/20260514_multiconfig_v3/pulse_bot/* pulse_bot/ && cp .deploy_backups/20260514_multiconfig_v3/config/entry_configs.yaml config/ && systemctl --user restart pulse-bot.service'`
+
+---
 ## 2026-05-14 14:30 — close-ATA в sell-транзакции: аренда ATA возвращается, формула PnL остаётся честной
 
 **Что изменилось:**

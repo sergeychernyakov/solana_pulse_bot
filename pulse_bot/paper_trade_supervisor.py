@@ -90,6 +90,37 @@ class PaperTradeSupervisor:
         ctx = self._ctx
         is_replay = ctx._launchpad.name == "replay"
 
+        # Per-config exit overrides (2026-05-14 multi-config A/B): a
+        # shadow config may A/B a different exit policy (TP / trailing /
+        # max_hold). Build an exit-overridden copy of the global config
+        # for THIS config's portfolio. Configs that set no exit overrides
+        # (including LIVE) get ctx._config unchanged — zero behaviour
+        # drift on the production portfolio.
+        effective_config = ctx._config
+        _registry = getattr(ctx, "_config_registry", None)
+        if _registry is not None:
+            try:
+                _overrides = _registry.by_id(config_id).exit_overrides()
+                if _overrides:
+                    import dataclasses
+
+                    effective_config = dataclasses.replace(ctx._config, **_overrides)
+                    logger.info(
+                        "PAPER [%s]: per-config exit overrides %s",
+                        config_id,
+                        _overrides,
+                    )
+            except Exception as cfg_exc:  # noqa: BLE001
+                # Never block a paper trade on config resolution — fall
+                # back to the global exit config.
+                logger.warning(
+                    "PAPER [%s]: exit-override resolution failed (%s) — "
+                    "using global exit config",
+                    config_id,
+                    cfg_exc,
+                )
+                effective_config = ctx._config
+
         if resume_trade_id is not None:
             trade_id = resume_trade_id
             # Pull the existing row's buy_amount_sol so the resumed
@@ -156,7 +187,7 @@ class PaperTradeSupervisor:
         from pulse_bot.core import PaperTradeRunner
 
         runner = PaperTradeRunner(
-            ctx._config,
+            effective_config,
             entry_price,
             mint=token.mint,
             scored_at=entry_ts,
@@ -200,8 +231,8 @@ class PaperTradeSupervisor:
             )
             return True
 
-        deadline = ctx._config.exit_max_hold_seconds
-        inactivity = ctx._config.exit_inactivity_seconds
+        deadline = effective_config.exit_max_hold_seconds
+        inactivity = effective_config.exit_inactivity_seconds
 
         async def _trade_stream_loop() -> None:
             nonlocal last_event_ts
