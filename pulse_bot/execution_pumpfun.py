@@ -918,6 +918,35 @@ def build_create_ata_idempotent_ix(
     )
 
 
+def build_close_ata_ix(
+    owner: Pubkey,
+    mint: Pubkey,
+    token_program: Pubkey = TOKEN_2022_PROGRAM_ID,
+) -> Instruction:
+    """SPL Token CloseAccount: close the owner's ATA for ``mint`` and
+    refund its rent-exempt lamports (~0.00204 SOL, ``ATA_RENT_LAMPORTS``)
+    back to ``owner``.
+
+    Only valid when the ATA's token balance is exactly 0 — i.e. append
+    this to the sell transaction that EMPTIES the position, never to a
+    partial sell. The on-chain program reverts on a non-empty account.
+    Reclaiming this rent is what keeps the paper-PnL fee model honest:
+    the formula does not charge ATA rent because, with this close, it is
+    not actually spent.
+    """
+    from spl.token.instructions import CloseAccountParams, close_account  # type: ignore
+
+    ata = derive_associated_token_account(owner, mint, token_program)
+    return close_account(
+        CloseAccountParams(
+            program_id=token_program,
+            account=ata,
+            dest=owner,
+            owner=owner,
+        )
+    )
+
+
 def build_pump_buy_ix(
     user: Pubkey,
     mint: Pubkey,
@@ -1183,9 +1212,17 @@ def build_sell_transaction(
     priority_fee_microlamports_per_cu: int = DEFAULT_PRIORITY_FEE_MICROLAMPORTS_PER_CU,
     compute_unit_limit: int = DEFAULT_COMPUTE_UNIT_LIMIT,
     token_program: Pubkey = TOKEN_2022_PROGRAM_ID,
+    close_ata: bool = False,
 ) -> VersionedTransaction:
     """Build a sell transaction. Same pattern as buy, no ATA-create
-    (we already own the ATA from the prior buy)."""
+    (we already own the ATA from the prior buy).
+
+    ``close_ata``: when True, append an SPL CloseAccount instruction so
+    the ATA's rent-exempt lamports (~0.00204 SOL) are refunded to the
+    wallet. Pass True ONLY on the sell that empties the position — the
+    close instruction reverts on a non-empty account, so every partial
+    sell must leave it False.
+    """
     user = keypair.pubkey()
     expected_sol = estimate_sell_output_lamports(token_amount_raw, state)
     if expected_sol <= 0:
@@ -1208,6 +1245,9 @@ def build_sell_transaction(
             token_program=token_program,
         ),
     ]
+    if close_ata:
+        # Position-emptying sell — reclaim the ATA rent in the same tx.
+        instructions.append(build_close_ata_ix(user, mint, token_program))
     msg = MessageV0.try_compile(
         payer=user,
         instructions=instructions,
@@ -1392,6 +1432,7 @@ class PumpFunExecution:
         *,
         slippage_bps: int = 100,
         priority_fee_microlamports_per_cu: int = DEFAULT_PRIORITY_FEE_MICROLAMPORTS_PER_CU,
+        close_ata: bool = False,
     ) -> PumpExecuteResult:
         return await self._sell_inner(
             mint=mint,
@@ -1399,6 +1440,7 @@ class PumpFunExecution:
             slippage_bps=slippage_bps,
             priority_fee_microlamports_per_cu=priority_fee_microlamports_per_cu,
             submit_live=False,
+            close_ata=close_ata,
         )
 
     async def submit_buy(
@@ -1433,7 +1475,11 @@ class PumpFunExecution:
         *,
         slippage_bps: int = 100,
         priority_fee_microlamports_per_cu: int = DEFAULT_PRIORITY_FEE_MICROLAMPORTS_PER_CU,
+        close_ata: bool = False,
     ) -> PumpExecuteResult:
+        """REAL on-chain sell. ``close_ata=True`` appends a CloseAccount
+        instruction to reclaim the ATA rent — pass it ONLY on the sell
+        that empties the position (a partial sell would revert)."""
         if not self._allow_live:
             raise RuntimeError(
                 "submit_sell refused: allow_live_submit=False at construction"
@@ -1444,6 +1490,7 @@ class PumpFunExecution:
             slippage_bps=slippage_bps,
             priority_fee_microlamports_per_cu=priority_fee_microlamports_per_cu,
             submit_live=True,
+            close_ata=close_ata,
         )
 
     # ── Inner shared paths ─────────────────────────────────────
@@ -1566,6 +1613,7 @@ class PumpFunExecution:
         slippage_bps: int,
         priority_fee_microlamports_per_cu: int,
         submit_live: bool,
+        close_ata: bool = False,
     ) -> PumpExecuteResult:
         mint_pk = mint if isinstance(mint, Pubkey) else Pubkey.from_string(mint)
         state = await self._rpc.fetch_bonding_curve_state(mint_pk)
@@ -1599,6 +1647,7 @@ class PumpFunExecution:
                 slippage_bps=slippage_bps,
                 priority_fee_microlamports_per_cu=priority_fee_microlamports_per_cu,
                 token_program=token_program,
+                close_ata=close_ata,
             )
         except ValueError as exc:
             return PumpExecuteResult(

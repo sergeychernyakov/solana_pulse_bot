@@ -219,6 +219,7 @@ def test_sell_accounts_have_expected_count_and_constants():
 def test_bonding_curve_state_parse_basic():
     """Synthetic on-chain payload — disc + 5×u64 + bool + creator (32B)."""
     import struct
+
     from pulse_bot.execution_pumpfun import BondingCurveState
     discriminator = bytes(8)
     body = struct.pack(
@@ -374,8 +375,9 @@ class _FakeSession:
 
 @pytest.mark.asyncio
 async def test_rpc_get_account_info_decodes_base64():
-    from pulse_bot.execution_pumpfun import HeliusRpc
     import base64
+
+    from pulse_bot.execution_pumpfun import HeliusRpc
     sample_data = b"\x00" * 49
     encoded = base64.b64encode(sample_data).decode()
     fake_resp = {
@@ -526,6 +528,57 @@ def test_create_ata_idempotent_ix_layout():
     assert token.pubkey == TOKEN_2022_PROGRAM_ID
 
 
+def test_close_ata_ix_layout():
+    """SPL CloseAccount: refunds the ATA rent to the wallet. 3 accounts
+    in fixed SPL order — account (the ATA), dest (= owner), owner."""
+    from pulse_bot.execution_pumpfun import (
+        TOKEN_2022_PROGRAM_ID,
+        build_close_ata_ix,
+        derive_associated_token_account,
+    )
+
+    ix = build_close_ata_ix(SAMPLE_USER, SAMPLE_MINT)
+    assert ix.program_id == TOKEN_2022_PROGRAM_ID
+    assert len(ix.accounts) == 3
+    account, dest, owner = ix.accounts
+    assert account.pubkey == derive_associated_token_account(
+        SAMPLE_USER, SAMPLE_MINT
+    )
+    assert account.is_writable is True
+    # Rent refund + close authority both go to the wallet.
+    assert dest.pubkey == SAMPLE_USER
+    assert owner.pubkey == SAMPLE_USER
+    assert owner.is_signer is True
+
+
+def test_sell_transaction_close_ata_appends_one_instruction():
+    """build_sell_transaction(close_ata=True) appends exactly one extra
+    instruction (the CloseAccount) — the position-emptying sell reclaims
+    the ATA rent in the same tx. close_ata=False (default, used for
+    partial sells) leaves the instruction list untouched."""
+    from solders.hash import Hash  # type: ignore
+    from solders.keypair import Keypair  # type: ignore
+
+    from pulse_bot.execution_pumpfun import BondingCurveState, build_sell_transaction
+
+    state = BondingCurveState(
+        virtual_token_reserves=1_000_000_000_000,
+        virtual_sol_reserves=30_000_000_000,
+        real_token_reserves=800_000_000_000,
+        real_sol_reserves=5_000_000_000,
+        token_total_supply=1_000_000_000_000,
+        complete=False,
+        creator=SAMPLE_CREATOR,
+    )
+    kp = Keypair()
+    bh = Hash.default()
+    base = build_sell_transaction(kp, SAMPLE_MINT, 10_000_000_000, state, bh)
+    with_close = build_sell_transaction(
+        kp, SAMPLE_MINT, 10_000_000_000, state, bh, close_ata=True
+    )
+    assert len(with_close.message.instructions) == len(base.message.instructions) + 1
+
+
 # ── Pump.fun buy/sell instruction with full account list ─────
 def test_pump_buy_ix_account_count_and_signer_flags():
     """16 accounts (per IDL); user at idx 6 is signer/writable;
@@ -567,8 +620,8 @@ def test_pump_buy_ix_account_count_and_signer_flags():
 
     # Slot [16] = bonding_curve_v2 — readonly.
     from pulse_bot.execution_pumpfun import (
-        derive_bonding_curve_v2_pda,
         PUMPFUN_DEFAULT_BUYBACK_FEE_RECIPIENT,
+        derive_bonding_curve_v2_pda,
     )
     assert ix.accounts[16].pubkey == derive_bonding_curve_v2_pda(SAMPLE_MINT)
     assert ix.accounts[16].is_writable is False
@@ -591,16 +644,15 @@ def test_pump_sell_ix_account_count():
     token_program at slot [9] — different from buy."""
     from pulse_bot.execution_pumpfun import (
         FEE_PROGRAM_ID,
+        PUMPFUN_DEFAULT_BUYBACK_FEE_RECIPIENT,
         PUMPFUN_PROGRAM_ID,
         TOKEN_2022_PROGRAM_ID,
         build_pump_sell_ix,
-        derive_creator_vault_pda,
-    )
-    from pulse_bot.execution_pumpfun import (
         derive_bonding_curve_v2_pda,
+        derive_creator_vault_pda,
         derive_user_volume_accumulator_pda,
-        PUMPFUN_DEFAULT_BUYBACK_FEE_RECIPIENT,
     )
+
     # Default is_cashback_coin=True → 14 IDL + UVA + bonding_v2 + buyback = 17 accounts.
     ix = build_pump_sell_ix(
         user=SAMPLE_USER,
@@ -647,6 +699,7 @@ def test_pump_sell_ix_account_count():
 # ── Full transaction assembly ─────────────────────────────────
 def _make_test_keypair():
     from solders.keypair import Keypair
+
     # Deterministic for test reproducibility.
     return Keypair.from_seed(bytes(range(32)))
 
@@ -699,10 +752,7 @@ def test_build_buy_transaction_assembles_and_signs():
 
 def test_build_buy_transaction_applies_slippage_to_max_sol_cost():
     """1 % slippage on 0.01 SOL → max_sol_cost = 0.01 × 1.01 = 0.0101 SOL."""
-    from pulse_bot.execution_pumpfun import (
-        BUY_DISCRIMINATOR,
-        build_buy_transaction,
-    )
+    from pulse_bot.execution_pumpfun import BUY_DISCRIMINATOR, build_buy_transaction
     kp = _make_test_keypair()
     sol_in = 10_000_000  # 0.01 SOL
     tx = build_buy_transaction(
@@ -725,10 +775,7 @@ def test_build_buy_transaction_applies_slippage_to_max_sol_cost():
 
 
 def test_build_buy_transaction_rejects_complete_curve():
-    from pulse_bot.execution_pumpfun import (
-        BondingCurveState,
-        build_buy_transaction,
-    )
+    from pulse_bot.execution_pumpfun import BondingCurveState, build_buy_transaction
     kp = _make_test_keypair()
     completed_state = BondingCurveState(
         virtual_token_reserves=0, virtual_sol_reserves=0,
@@ -822,10 +869,7 @@ class _FakeRpc:
 
 @pytest.mark.asyncio
 async def test_pump_execution_simulate_buy_returns_success_when_curve_ok():
-    from pulse_bot.execution_pumpfun import (
-        PumpFunExecution,
-        SimulateResult,
-    )
+    from pulse_bot.execution_pumpfun import PumpFunExecution, SimulateResult
     rpc = _FakeRpc(
         state=_make_test_state(),
         blockhash=_make_zero_blockhash(),
@@ -859,10 +903,7 @@ async def test_pump_execution_simulate_buy_returns_error_when_state_missing():
 
 @pytest.mark.asyncio
 async def test_pump_execution_simulate_buy_returns_error_when_curve_complete():
-    from pulse_bot.execution_pumpfun import (
-        BondingCurveState,
-        PumpFunExecution,
-    )
+    from pulse_bot.execution_pumpfun import BondingCurveState, PumpFunExecution
     completed = BondingCurveState(
         virtual_token_reserves=1, virtual_sol_reserves=1,
         real_token_reserves=0, real_sol_reserves=85_000_000_000,
@@ -880,10 +921,7 @@ async def test_pump_execution_simulate_buy_returns_error_when_curve_complete():
 async def test_pump_execution_simulate_buy_propagates_revert_err():
     """When the on-chain simulator returns err, PumpExecuteResult
     surfaces it as success=False with the same err payload."""
-    from pulse_bot.execution_pumpfun import (
-        PumpFunExecution,
-        SimulateResult,
-    )
+    from pulse_bot.execution_pumpfun import PumpFunExecution, SimulateResult
     rpc = _FakeRpc(
         state=_make_test_state(),
         blockhash=_make_zero_blockhash(),
