@@ -1172,15 +1172,15 @@ class Pipeline:
             # pre-filter delegated to DecisionService. Same semantics
             # as before but tested in isolation.
             #
-            # 2026-05-13 multi-config: the creator-blacklist / bot-cluster
-            # / wash-cluster filters are config-PARAMETERISED but all
-            # currently-loaded configs use identical thresholds, AND each
-            # filter is a DB round-trip. So we run them ONCE through the
-            # LIVE config's DecisionService and treat the post-filter
-            # ``_decision`` as the shared base for every config. The ONLY
-            # place configs diverge today is ``apply_ml_override``
-            # (reg_floor + which reg model). If a future config varies a
-            # cluster threshold this must move inside the per-config loop.
+            # 2026-05-13 multi-config: creator-blacklist is config-
+            # independent (the creators table is global), so we run it
+            # ONCE on the shared base. bot_cluster / wash_cluster /
+            # smart-money / top3-PnL are config-parameterised (SCAMSTRICT,
+            # NOSCAM, SMARTONLY, TOP3PNL all set different thresholds /
+            # toggles) and 2026-05-15 (Round 2) we moved them INSIDE the
+            # per-config loop below so each config actually respects its
+            # own settings. DB load is trivial at the bot's ~3 tokens/h
+            # entry rate even with 20+ configs × 4 queries per token.
             from pulse_bot.decision_service import EntryDecision as _ED
 
             _decision = _ED(
@@ -1192,13 +1192,8 @@ class Pipeline:
             _decision = await self._decision.filter_creator_blacklist(
                 token, _decision, mint_short
             )
-            _decision = await self._decision.filter_bot_cluster(
-                token, all_trades, _decision, mint_short
-            )
-            _decision = await self._decision.filter_wash_cluster(
-                token, all_trades, _decision, mint_short
-            )
-            # Shared post-filter base — every config branches from here.
+            # Shared post-(creator-blacklist) base — every config branches
+            # from here and then runs its OWN config-specific pre-filters.
             _decision_base = _decision
 
             # ── ML confidence-gating (hybrid mode) ────────────────
@@ -1288,6 +1283,17 @@ class Pipeline:
             per_config_decision: dict[str, _ED] = {}
             for _cid, _ds in _eval_services.items():
                 _d = _decision_base
+                # 2026-05-15 Round 2: per-config pre-filters. Each config's
+                # own thresholds (bot/wash) and toggles (smart_money,
+                # top3_pnl) are applied here, BEFORE its apply_ml_override.
+                _d = await _ds.filter_bot_cluster(token, all_trades, _d, mint_short)
+                _d = await _ds.filter_wash_cluster(token, all_trades, _d, mint_short)
+                _d = await _ds.filter_smart_money_required(
+                    token, all_trades, _d, mint_short
+                )
+                _d = await _ds.filter_top3_positive_pnl(
+                    token, all_trades, _d, mint_short
+                )
                 if (
                     self._policy_mode == "hybrid"
                     and self._ml_entry_policy is not None

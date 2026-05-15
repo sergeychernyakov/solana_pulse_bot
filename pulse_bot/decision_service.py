@@ -81,6 +81,10 @@ class DecisionService:
         config_id: str | None = None,
         p_cal_floor: float = 0.0,
         p_raw_floor: float = 0.0,
+        entry_buyer_max_n: int | None = None,
+        disable_ml_override: bool = False,
+        require_smart_money: bool = False,
+        require_top3_positive_pnl: bool = False,
     ) -> None:
         """Construct a DecisionService.
 
@@ -116,6 +120,22 @@ class DecisionService:
         # range on the live model; raw proba spreads ~0.2-0.47 and ranks
         # winners — this is the selectivity knob with real range.
         self._p_raw_floor = float(p_raw_floor)
+        # 2026-05-15 Round-2 A/B: late-entry gate. If set, block the
+        # ml_override BUY when the candidate's buyer-number (= result.buy_count
+        # at score time) exceeds this. Late entries are the most likely
+        # losers; tests whether an "early only" filter lifts WR enough to
+        # justify the loss of volume. ``None`` = disabled (no gate).
+        self._entry_buyer_max_n = (
+            int(entry_buyer_max_n) if entry_buyer_max_n is not None else None
+        )
+        # 2026-05-15 Round-2 A/B: RULESONLY switch. When True, apply_ml_override
+        # is a no-op — neither SKIP→BUY nor BUY→SKIP flips happen. Proves or
+        # disproves that the ml_override path actually adds value vs pure rules.
+        self._disable_ml_override = bool(disable_ml_override)
+        # 2026-05-15 Round-2 A/B: wallet-quality pre-filters. Both block
+        # a rules-BUY when the early-buyer cohort lacks the signal.
+        self._require_smart_money = bool(require_smart_money)
+        self._require_top3_positive_pnl = bool(require_top3_positive_pnl)
         # Counters kept for /metrics + dashboard parity.
         self.ml_overrides_buy = 0
         self.ml_overrides_skip = 0
@@ -151,6 +171,10 @@ class DecisionService:
             config_id=cfg.config_id,
             p_cal_floor=getattr(cfg, "p_cal_floor", 0.0),
             p_raw_floor=getattr(cfg, "p_raw_floor", 0.0),
+            entry_buyer_max_n=getattr(cfg, "entry_buyer_max_n", None),
+            disable_ml_override=getattr(cfg, "disable_ml_override", False),
+            require_smart_money=getattr(cfg, "require_smart_money", False),
+            require_top3_positive_pnl=getattr(cfg, "require_top3_positive_pnl", False),
         )
         if obs is not None:
             inst._obs = obs
@@ -216,6 +240,135 @@ class DecisionService:
                 return decision.with_(should_enter=False)
         except Exception as exc:
             logger.debug("Bot-cluster check failed for %s: %s", mint_short, exc)
+        return decision
+
+    # ───────────────── smart-money / top-3 PnL gates ──────────────
+    # 2026-05-15 Round-2 A/B. Both pre-filter gates mirror filter_bot_cluster
+    # (single async COUNT/AGG query over wallet_classifications, scoped to
+    # early buyers). Off by default; opt-in via EntryConfig.
+
+    async def filter_smart_money_required(
+        self,
+        token: Any,
+        all_trades: list[Any],
+        decision: EntryDecision,
+        mint_short: str,
+    ) -> EntryDecision:
+        """SMARTONLY: require ≥1 ``is_smart_money=1`` wallet in first 30s.
+
+        Conservative pre-filter: refuses to enter tokens whose early buyer
+        cohort has zero known smart-money wallets. The first-30s window
+        mirrors ``filter_bot_cluster`` (smart-money signal is meaningful
+        in the same early-buyer window). 0 known smart-money wallets in
+        early window → block.
+        """
+        if not self._require_smart_money:
+            return decision
+        if not decision.should_enter:
+            return decision
+        if not (token.created_at or 0) > 0:
+            return decision
+
+        early_buyers: set[str] = set()
+        for tr in all_trades:
+            if tr.tx_type != "buy":
+                continue
+            age = float(tr.timestamp) - float(token.created_at)
+            if 0.0 <= age < 30.0:
+                early_buyers.add(tr.wallet)
+        if not early_buyers:
+            # No early buyers observed yet → can't verify, block to be safe.
+            logger.info(
+                "SMARTONLY [%s] %s: 0 early buyers observed → block",
+                self._config_id or "LIVE",
+                mint_short,
+            )
+            return decision.with_(should_enter=False)
+
+        try:
+            placeholders = ",".join("%s" * len(early_buyers))
+            row = await asyncio.to_thread(
+                self._db._sync_query,
+                f"SELECT COUNT(*) AS n FROM wallet_classifications "
+                f"WHERE wallet IN ({placeholders}) AND is_smart_money = 1",
+                tuple(early_buyers),
+            )
+            n_smart = int(row[0]["n"] if row else 0)
+            if n_smart < 1:
+                logger.warning(
+                    "SMARTONLY [%s] %s: 0 smart_money wallets in first 30s "
+                    "(%d early buyers checked) — block",
+                    self._config_id or "LIVE",
+                    mint_short,
+                    len(early_buyers),
+                )
+                if self._obs is not None:
+                    self._obs.paper_trades_closed.inc(reason="smartonly_skip")
+                return decision.with_(should_enter=False)
+        except Exception as exc:
+            logger.debug("Smart-money check failed for %s: %s", mint_short, exc)
+        return decision
+
+    async def filter_top3_positive_pnl(
+        self,
+        token: Any,
+        all_trades: list[Any],
+        decision: EntryDecision,
+        mint_short: str,
+    ) -> EntryDecision:
+        """TOP3PNL: require ≥1 early buyer with ``graduated_winrate > 0.10``.
+
+        Uses ``graduated_winrate`` as the closest available "wallet has prior
+        positive track record" signal in ``wallet_classifications`` (we don't
+        plumb the scorer's ``top3_buyer_prior_total_pnl_sol`` feature into the
+        decision path — that's an unnecessary detour). 0.10 = at least one in
+        ten graduated tokens by this wallet was a winner — a minimal "not a
+        chronic loser" bar.
+        """
+        if not self._require_top3_positive_pnl:
+            return decision
+        if not decision.should_enter:
+            return decision
+        if not (token.created_at or 0) > 0:
+            return decision
+
+        early_buyers: set[str] = set()
+        for tr in all_trades:
+            if tr.tx_type != "buy":
+                continue
+            age = float(tr.timestamp) - float(token.created_at)
+            if 0.0 <= age < 30.0:
+                early_buyers.add(tr.wallet)
+        if not early_buyers:
+            logger.info(
+                "TOP3PNL [%s] %s: 0 early buyers → block",
+                self._config_id or "LIVE",
+                mint_short,
+            )
+            return decision.with_(should_enter=False)
+
+        try:
+            placeholders = ",".join("%s" * len(early_buyers))
+            row = await asyncio.to_thread(
+                self._db._sync_query,
+                f"SELECT COUNT(*) AS n FROM wallet_classifications "
+                f"WHERE wallet IN ({placeholders}) AND graduated_winrate > 0.10",
+                tuple(early_buyers),
+            )
+            n_good = int(row[0]["n"] if row else 0)
+            if n_good < 1:
+                logger.warning(
+                    "TOP3PNL [%s] %s: 0 early buyers with "
+                    "graduated_winrate>0.10 (%d checked) — block",
+                    self._config_id or "LIVE",
+                    mint_short,
+                    len(early_buyers),
+                )
+                if self._obs is not None:
+                    self._obs.paper_trades_closed.inc(reason="top3pnl_skip")
+                return decision.with_(should_enter=False)
+        except Exception as exc:
+            logger.debug("Top3-PnL check failed for %s: %s", mint_short, exc)
         return decision
 
     # ───────────────────────── creator blacklist gate ─────────────
@@ -387,7 +540,30 @@ class DecisionService:
         the column non-negative for legacy DB schemas; subtract 500 at
         read-time to recover signed PnL %% × 10). Clamped to [1, 999].
         """
+        # 2026-05-15 Round-2 A/B: RULESONLY mode — entire ml_override path
+        # becomes a no-op, neither SKIP→BUY nor BUY→SKIP. Proves/disproves
+        # that ml_override adds value over pure rules.
+        if self._disable_ml_override:
+            return decision
         if ml_action == "BUY" and not decision.should_enter:
+            # 2026-05-15 Round-2 A/B: late-entry gate. If the candidate's
+            # buyer-number exceeds the per-config cap, block the BUY.
+            if self._entry_buyer_max_n is not None:
+                buy_count = int(getattr(result, "buy_count", 0) or 0)
+                if buy_count > self._entry_buyer_max_n:
+                    logger.warning(
+                        "ML OVERRIDE %s [%s]: rules=SKIP → ML=BUY BLOCKED by "
+                        "entry_buyer_max_n (buyer#%d > %d, p_raw=%.3f)",
+                        mint_short,
+                        self._config_id or "LIVE",
+                        buy_count,
+                        self._entry_buyer_max_n,
+                        ml_proba,
+                    )
+                    self.ml_overrides_skip += 1
+                    if self._obs is not None:
+                        self._obs.ml_override.inc(action="buyer_max_block")
+                    return decision  # unchanged — rules SKIP stays
             # 2026-05-14 p_raw-floor gate. Per-config minimum on the entry
             # classifier's RAW probability. Calibrated proba is compressed
             # (~0.01-0.04) so p_cal_floor has no range on the live model;

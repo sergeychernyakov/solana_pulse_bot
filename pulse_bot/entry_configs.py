@@ -92,6 +92,37 @@ class EntryConfig:
     exit_max_hold_seconds: float | None = None
     exit_trailing_stop_activation_pct: float | None = None
     exit_trailing_stop_distance_pct: float | None = None
+    # 2026-05-15 Round-2 A/B: per-config inactivity timeout. Most paper
+    # trades exit as ``dead_token`` at the global default (120s); shortening
+    # this returns capital sooner, lengthening gives slow pumps room.
+    exit_inactivity_seconds: float | None = None
+    # 2026-05-15 Round-2 A/B: entry filters that gate ml_override BUY.
+    # ``entry_buyer_max_n`` — if set, block the BUY when the candidate's
+    # ``buy_count`` (current buyer #) exceeds this. Late entries are
+    # the most likely losers; this tests whether "early only" lifts WR.
+    # ``disable_ml_override`` — when True, ``apply_ml_override`` becomes a
+    # no-op (RULESONLY mode); proves or disproves that the ml_override
+    # path actually adds value over a pure-rules entry.
+    entry_buyer_max_n: int | None = None
+    disable_ml_override: bool = False
+    # 2026-05-15 Round-2 A/B: wallet-quality entry filters. Both apply BEFORE
+    # ml_override (pre-filter style like filter_bot_cluster), and only fire
+    # when ``decision.should_enter`` is True (i.e. they CAN'T flip a rules
+    # SKIP to BUY — they only block a rules BUY that lacks the signal).
+    # ``require_smart_money`` — block entry unless ≥1 wallet in the first
+    # 30s of trades is flagged ``is_smart_money=1`` in wallet_classifications.
+    # ``require_top3_positive_pnl`` — block unless ≥1 early buyer has
+    # ``graduated_winrate > 0.10`` (uses graduated_winrate as proxy for
+    # "wallet has positive track record"; top3_buyer_prior_total_pnl_sol
+    # would need scorer plumbing).
+    require_smart_money: bool = False
+    require_top3_positive_pnl: bool = False
+    # 2026-05-15 Round-2 A/B: per-config disable for the survival-model
+    # exit gate (paper_trade_supervisor's tick_loop). When True, the
+    # supervisor skips ``ctx._maybe_survival_exit`` for THIS config — the
+    # trade is left to hit TP / SL / max_hold / dead_token instead.
+    # Tests whether survival exit adds value over a pure pre-set-exits run.
+    disable_survival_exit: bool = False
     # reg_* fields kept for back-compat with persisted entry_configs rows;
     # the universal skill-gate disables the reg head at load, so these
     # are inert unless a future skilled reg model is deployed.
@@ -113,6 +144,7 @@ class EntryConfig:
             "exit_max_hold_seconds",
             "exit_trailing_stop_activation_pct",
             "exit_trailing_stop_distance_pct",
+            "exit_inactivity_seconds",
         )
         return {
             f: float(getattr(self, f)) for f in fields if getattr(self, f) is not None

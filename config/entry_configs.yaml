@@ -1,5 +1,6 @@
 # config/entry_configs.yaml
-# Multi-config A/B framework — 2026-05-13, reworked 2026-05-14 (v3).
+# Multi-config A/B framework — 2026-05-13, reworked 2026-05-14 (v3),
+# expanded 2026-05-15 to 20 configs (Round 2).
 #
 # Each `config` defines one entry-decision + exit policy. The bot loads
 # them all at startup and evaluates EACH config in parallel for every
@@ -16,24 +17,43 @@
 #   * Old paper_trades rows resolve their full param history via the
 #     entry_configs DB table (synced from this YAML at bot startup).
 #
-# ── v3 rework (2026-05-14) ──────────────────────────────────────────
-# The v2 sweep (PCAL01..08) varied `p_cal_floor` — but the live model's
-# CALIBRATED proba is compressed to ~0.01-0.04, so every PCAL config
-# above LIVE produced zero trades. Retired. v3 tests three directions,
-# one variable per config for clean attribution:
-#   * entry selectivity — `p_raw_floor` (raw proba spreads ~0.2-0.47 and
-#     ranks winners at auc_sign≈0.92, so it has real range): PRAW30/40
-#   * exit policy — TP and trailing (live TP/trailing rarely fire: p90
-#     peak ≈ +14%): TP10, TRAILTIGHT
-#   * scam-filter strictness — bot/wash cluster skip thresholds: SCAMSTRICT
-# Exit-override fields left unset => inherit the global exit config. LIVE
-# sets none — it behaves exactly like the production bot.
+# ── Round 2 (2026-05-15) — 20 configs total ─────────────────────────
+# Round-1 productive 5h showed 100% exits = `dead_token`, so max_hold /
+# inactivity dominate PnL more than TP/SL. Round-2 adds 14 variants:
+#
+# Exit-policy sweeps (yaml-only, inherit-from-global pattern):
+#   * exit_max_hold:    HOLD60, HOLD180
+#   * exit_inactivity:  INACT60, INACT180
+#   * exit_hard_stop:   SL08
+#   * exit_take_profit: TP20 (alongside Round-1 TP10)
+#   * trailing variant: TRAIL_LOOSE (alongside Round-1 TRAILTIGHT)
+#
+# Filter sanity check:
+#   * NOSCAM — bot/wash filters effectively disabled. Compare to LIVE;
+#     if NOSCAM ≥ LIVE then scam filters are net-negative.
+#
+# Entry-side filters (new EntryConfig fields + gates in decision_service):
+#   * REGFLOOR5  — block ml_override BUY when reg-model predicts <+5%
+#   * BUYERMAX10 — block ml_override BUY when result.buy_count > 10
+#   * SMARTONLY  — require ≥1 is_smart_money wallet in first 30s
+#   * TOP3PNL    — require ≥1 early buyer with graduated_winrate > 0.10
+#
+# Strategy switches:
+#   * RULESONLY    — disable apply_ml_override entirely (pure rules)
+#   * NO_SURVIVAL  — disable survival-model exit (use only TP/SL/max_hold/dead_token)
+#
+# IMPORTANT: per-config pre-filters (bot_cluster, wash_cluster,
+# smart_money, top3_pnl) are evaluated INSIDE the per-config loop in
+# pipeline.py (2026-05-15 refactor), so SCAMSTRICT/NOSCAM actually
+# respect their own thresholds now (in Round 1 they were silently
+# inheriting LIVE's filter pass — the lockstep counts were a hint).
 # See docs/AB_LOG.md for the experiment record.
 
 configs:
+  # ── Baseline ────────────────────────────────────────────────────
   - config_id: LIVE
     name: "Live (production baseline)"
-    description: "Production baseline — no p_raw/p_cal floor, global exit config, scam filters 3/2. Drives real bot decisions."
+    description: "Production baseline — no floors, global exit config, scam filters 3/2. Drives real bot decisions."
     p_raw_floor: 0.0
     p_cal_floor: 0.0
     bot_cluster_hard_skip_n: 3
@@ -41,11 +61,11 @@ configs:
     wash_cluster_size_min: 5
     wash_cluster_size_max: 50
 
+  # ── Round 1: entry selectivity (p_raw) ─────────────────────────
   - config_id: PRAW30
     name: "p_raw floor 0.30"
-    description: "Entry selectivity: ml_override BUY requires raw proba >= 0.30 (cuts the bottom ~half of the live p_raw range). Everything else = LIVE."
+    description: "Entry selectivity: ml_override BUY requires raw proba >= 0.30. Cuts ~half of LIVE's entries."
     p_raw_floor: 0.30
-    p_cal_floor: 0.0
     bot_cluster_hard_skip_n: 3
     wash_cluster_skip_n: 2
     wash_cluster_size_min: 5
@@ -53,19 +73,17 @@ configs:
 
   - config_id: PRAW40
     name: "p_raw floor 0.40"
-    description: "Strict entry selectivity: ml_override BUY requires raw proba >= 0.40 — few trades, should have highest WR if p_raw is informative. Everything else = LIVE."
+    description: "Strict entry selectivity: raw proba >= 0.40. Round-1 observed ~0.2 trades/h — likely too strict for current flow."
     p_raw_floor: 0.40
-    p_cal_floor: 0.0
     bot_cluster_hard_skip_n: 3
     wash_cluster_skip_n: 2
     wash_cluster_size_min: 5
     wash_cluster_size_max: 50
 
+  # ── Round 1: exit-policy (TP / trailing) ────────────────────────
   - config_id: TP10
     name: "Take-profit 10%"
-    description: "Exit A/B: take-profit at +10% (vs global ~30%). p90 peak is ~+14%, so a low TP actually fires — tests 'lock small wins fast' vs 'hold for the rare moonshot'. Entry = LIVE."
-    p_raw_floor: 0.0
-    p_cal_floor: 0.0
+    description: "Exit A/B: TP at +10%. p90 token peak ~+14% — low TP should actually fire."
     exit_take_profit_pct: 10.0
     bot_cluster_hard_skip_n: 3
     wash_cluster_skip_n: 2
@@ -74,9 +92,7 @@ configs:
 
   - config_id: TRAILTIGHT
     name: "Tight trailing stop"
-    description: "Exit A/B: trailing stop activates at +10% profit, sells on a 15% drop from peak (vs global 50%/50% which almost never activates). Tests letting winners run with a real lock-in. Entry = LIVE."
-    p_raw_floor: 0.0
-    p_cal_floor: 0.0
+    description: "Exit A/B: trailing activates at +10%, sells on 15% drop from peak. Aggressive lock-in for runners."
     exit_trailing_stop_activation_pct: 10.0
     exit_trailing_stop_distance_pct: 15.0
     bot_cluster_hard_skip_n: 3
@@ -84,12 +100,145 @@ configs:
     wash_cluster_size_min: 5
     wash_cluster_size_max: 50
 
+  # ── Round 1: scam-filter strictness ─────────────────────────────
   - config_id: SCAMSTRICT
     name: "Strict scam filters"
-    description: "Filter A/B: stricter bot-cluster (skip at >=2 vs 3) and wash-cluster (skip at >=1 vs 2) thresholds. Tests whether tighter scam filtering improves WR enough to justify fewer trades. Exit = LIVE."
-    p_raw_floor: 0.0
-    p_cal_floor: 0.0
+    description: "Filter A/B: stricter bot-cluster (>=2) and wash-cluster (>=1) thresholds. Round-2 refactor made per-config filters actually respect their own thresholds (Round-1 silently inherited LIVE)."
     bot_cluster_hard_skip_n: 2
     wash_cluster_skip_n: 1
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50
+
+  # ── Round 2: exit_max_hold sweep ────────────────────────────────
+  - config_id: HOLD60
+    name: "Max-hold 60s"
+    description: "Exit A/B: bail at 60s vs global 90s. If pump.fun tokens mostly die <60s, holding longer wastes capital."
+    exit_max_hold_seconds: 60.0
+    bot_cluster_hard_skip_n: 3
+    wash_cluster_skip_n: 2
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50
+
+  - config_id: HOLD180
+    name: "Max-hold 180s"
+    description: "Exit A/B: 3-minute hold. Tests if global 90s cap clips slow-pump winners."
+    exit_max_hold_seconds: 180.0
+    bot_cluster_hard_skip_n: 3
+    wash_cluster_skip_n: 2
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50
+
+  # ── Round 2: exit_inactivity sweep ──────────────────────────────
+  - config_id: INACT60
+    name: "Inactivity 60s"
+    description: "Exit A/B: dead-token bail at 60s of silence vs global 120s. Round-1 showed ALL exits = dead_token; freeing capital faster could lift turnover dramatically."
+    exit_inactivity_seconds: 60.0
+    bot_cluster_hard_skip_n: 3
+    wash_cluster_skip_n: 2
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50
+
+  - config_id: INACT180
+    name: "Inactivity 180s"
+    description: "Exit A/B: give silent tokens 3 minutes before bailing — tests whether some 'dead' tokens recover."
+    exit_inactivity_seconds: 180.0
+    bot_cluster_hard_skip_n: 3
+    wash_cluster_skip_n: 2
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50
+
+  # ── Round 2: exit_hard_stop ─────────────────────────────────────
+  - config_id: SL08
+    name: "Stop-loss 8%"
+    description: "Exit A/B: tight stop at -8% vs global -15%. Task #69 noted SL=8% gave -9% avg loser in offline replay — live test."
+    exit_hard_stop_loss_pct: 8.0
+    bot_cluster_hard_skip_n: 3
+    wash_cluster_skip_n: 2
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50
+
+  # ── Round 2: exit_take_profit (extends TP10) ────────────────────
+  - config_id: TP20
+    name: "Take-profit 20%"
+    description: "Exit A/B: TP at +20%, near observed p90 peak. Middle ground between TP10 and global 100%."
+    exit_take_profit_pct: 20.0
+    bot_cluster_hard_skip_n: 3
+    wash_cluster_skip_n: 2
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50
+
+  # ── Round 2: trailing variant (extends TRAILTIGHT) ──────────────
+  - config_id: TRAIL_LOOSE
+    name: "Loose trailing stop"
+    description: "Exit A/B: trailing activates at +20%, sells on 30% drop from peak. Less aggressive than TRAILTIGHT — gives pumps breathing room."
+    exit_trailing_stop_activation_pct: 20.0
+    exit_trailing_stop_distance_pct: 30.0
+    bot_cluster_hard_skip_n: 3
+    wash_cluster_skip_n: 2
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50
+
+  # ── Round 2: scam-filter sanity (opposite of SCAMSTRICT) ────────
+  - config_id: NOSCAM
+    name: "No scam filters"
+    description: "Sanity check: bot_cluster/wash_cluster filters effectively disabled. If NOSCAM >= LIVE, the scam filters are net-negative — they cost more good trades than they save."
+    bot_cluster_hard_skip_n: 999
+    wash_cluster_skip_n: 999
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50
+
+  # ── Round 2: entry-side filters ─────────────────────────────────
+  - config_id: REGFLOOR5
+    name: "Reg-model floor +5%"
+    description: "Entry A/B: block ml_override BUY when reg-model predicts pnl_pct < +5%. Tests whether reg-model adds selection signal."
+    reg_floor_pct: 5.0
+    bot_cluster_hard_skip_n: 3
+    wash_cluster_skip_n: 2
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50
+
+  - config_id: BUYERMAX10
+    name: "Buyer-# max 10"
+    description: "Entry A/B: block ml_override BUY when result.buy_count > 10. Late entries (buyer#15-30) are likely losers — tests if 'early only' lifts WR."
+    entry_buyer_max_n: 10
+    bot_cluster_hard_skip_n: 3
+    wash_cluster_skip_n: 2
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50
+
+  - config_id: SMARTONLY
+    name: "Smart-money required"
+    description: "Entry A/B: require >=1 wallet flagged is_smart_money=1 in the first 30s of trades. Tests whether wallet_classifications signal materially picks winners."
+    require_smart_money: true
+    bot_cluster_hard_skip_n: 3
+    wash_cluster_skip_n: 2
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50
+
+  - config_id: TOP3PNL
+    name: "Top-3 prior winrate >10%"
+    description: "Entry A/B: require >=1 early-30s buyer with wallet_classifications.graduated_winrate > 0.10 (proxy for 'wallet has track record')."
+    require_top3_positive_pnl: true
+    bot_cluster_hard_skip_n: 3
+    wash_cluster_skip_n: 2
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50
+
+  # ── Round 2: strategy switches ──────────────────────────────────
+  - config_id: RULESONLY
+    name: "Rules-only (no ml_override)"
+    description: "Critical sanity: apply_ml_override becomes a no-op. Compares pure rules-decision PnL vs ml_override hybrid. If LIVE > RULESONLY → ml_override earns its keep; if RULESONLY >= LIVE → rollback PULSE_POLICY to rules."
+    disable_ml_override: true
+    bot_cluster_hard_skip_n: 3
+    wash_cluster_skip_n: 2
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50
+
+  - config_id: NO_SURVIVAL
+    name: "Survival exit disabled"
+    description: "Exit A/B: bypass survival-model exit (paper_trade_supervisor tick-loop). Tests whether the survival head adds value over just TP/SL/max_hold/dead_token."
+    disable_survival_exit: true
+    bot_cluster_hard_skip_n: 3
+    wash_cluster_skip_n: 2
     wash_cluster_size_min: 5
     wash_cluster_size_max: 50

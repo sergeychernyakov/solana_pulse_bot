@@ -97,10 +97,14 @@ class PaperTradeSupervisor:
         # (including LIVE) get ctx._config unchanged — zero behaviour
         # drift on the production portfolio.
         effective_config = ctx._config
+        # 2026-05-15 Round-2 A/B: per-config disable for survival-model
+        # exit (NO_SURVIVAL). Default False = unchanged behaviour.
+        disable_survival_for_this_config = False
         _registry = getattr(ctx, "_config_registry", None)
         if _registry is not None:
             try:
-                _overrides = _registry.by_id(config_id).exit_overrides()
+                _cfg = _registry.by_id(config_id)
+                _overrides = _cfg.exit_overrides()
                 if _overrides:
                     import dataclasses
 
@@ -110,6 +114,9 @@ class PaperTradeSupervisor:
                         config_id,
                         _overrides,
                     )
+                disable_survival_for_this_config = bool(
+                    getattr(_cfg, "disable_survival_exit", False)
+                )
             except Exception as cfg_exc:  # noqa: BLE001
                 # Never block a paper trade on config resolution — fall
                 # back to the global exit config.
@@ -292,9 +299,13 @@ class PaperTradeSupervisor:
                         )
                         return
                     if (
-                        getattr(ctx, "_survival_active", False)
-                        or shadow.survival_shadow_enabled()
-                    ) and (now - last_survival_check_ts >= ctx._SURVIVAL_TICK_SECONDS):
+                        not disable_survival_for_this_config
+                        and (
+                            getattr(ctx, "_survival_active", False)
+                            or shadow.survival_shadow_enabled()
+                        )
+                        and (now - last_survival_check_ts >= ctx._SURVIVAL_TICK_SECONDS)
+                    ):
                         last_survival_check_ts = now
                         survived = await ctx._maybe_survival_exit(
                             runner=runner,

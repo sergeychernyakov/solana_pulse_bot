@@ -67,3 +67,59 @@ total_pnl_sol > LIVE и WR ≥ LIVE − 1pp. Иначе — оставить LIV
 - Реальной торговли нет — всё бумажное.
 
 **Результат:** _<заполнить после набора N≥100 на конфиг>_
+
+---
+
+## 2026-05-15 — Раунд 2: добор до 20 конфигов (×exit-policy, scam-sanity, entry-фильтры, RULESONLY/NO_SURVIVAL)
+
+**Гипотеза:** Раунд-1 продуктивные ~5 часов показали 100% выходов = `dead_token`,
+все exit-параметры (`max_hold`, `inactivity`, `SL`, `TP`, `trailing`) определяют
+PnL гораздо сильнее редко-срабатывающего TP/trailing. Раунд-2 расширяет до 20
+конфигов: плотная сетка по exit-политике + entry-фильтры + sanity-чеки.
+
+**Конфиги (14 новых):**
+
+| config_id | направление | переменная (остальное = LIVE) |
+|---|---|---|
+| HOLD60 | exit | `exit_max_hold_seconds = 60` |
+| HOLD180 | exit | `exit_max_hold_seconds = 180` |
+| INACT60 | exit | `exit_inactivity_seconds = 60` |
+| INACT180 | exit | `exit_inactivity_seconds = 180` |
+| SL08 | exit | `exit_hard_stop_loss_pct = 8.0` |
+| TP20 | exit | `exit_take_profit_pct = 20.0` |
+| TRAIL_LOOSE | exit | trailing активация=20%, дистанция=30% |
+| NOSCAM | sanity | `bot_cluster_hard_skip_n=999, wash_cluster_skip_n=999` (фильтры выключены) |
+| REGFLOOR5 | entry | `reg_floor_pct = 5.0` (reg-модель advisory) |
+| BUYERMAX10 | entry | `entry_buyer_max_n = 10` (только ранние входы) |
+| SMARTONLY | entry | `require_smart_money = True` (нужен ≥1 `is_smart_money` в первых 30с) |
+| TOP3PNL | entry | `require_top3_positive_pnl = True` (нужен ≥1 ранний buyer c `graduated_winrate>0.10`) |
+| RULESONLY | strategy | `disable_ml_override = True` (полный bypass override-пути) |
+| NO_SURVIVAL | strategy | `disable_survival_exit = True` (отключить survival-модель на выходе) |
+
+**Запущено:** 2026-05-15 08:50:52 UTC. Коммит `<hash>`. md5 сверены по всем
+файлам деплоя. `Loaded 20 entry configs ... Multi-config A/B active: 20 configs`.
+
+**Важная архитектурная правка (одновременно с Round-2):** pre-filters
+(`filter_bot_cluster`, `filter_wash_cluster`, `filter_smart_money_required`,
+`filter_top3_positive_pnl`) теперь запускаются **внутри per-config лупа** в
+`pipeline.py`. До этого они шарились через LIVE-DecisionService — и
+SCAMSTRICT/NOSCAM по факту НЕ уважали свои пороги (это объясняло
+lockstep counts SCAMSTRICT=13, TP10=13 в Round-1). Раунд-1 цифры по
+SCAMSTRICT/wash в этом смысле невалидны; настоящий A/B по фильтрам
+начинается с этого момента.
+
+**Критерий:** через N≥100 закрытых сделок на конфиг — `total_pnl_sol > LIVE`
+И `WR ≥ LIVE − 1pp`. При 20 конфигах multiple-comparison: Bonferroni
+`p<0.05/20 = 0.0025`. Без коррекции FP-rate ≈ 64% — на цифры одного
+«победителя» сразу не вестись.
+
+**Заметки:**
+- Темп сбора с Round-1 (5.17h): LIVE-семейство ~2.5 трейда/h. До N=100 на конфиг
+  без entry-фильтра — ~1.7 дня. Entry-фильтры (PRAW30/BUYERMAX10/SMARTONLY/TOP3PNL)
+  идут медленнее, тут до N=100 — несколько дней.
+- PRAW40 пока живёт (Round-1 показал ~0.2 трейда/h). Если за следующие сутки
+  не пополнится — выкинуть.
+- Кошелёк PumpPortal: 0.0204 SOL — на пороге; PumpPortal Lightning подгрызает.
+  Следить, своевременно сообщать.
+
+**Результат:** _<заполнить после набора N≥100 на конфиг>_

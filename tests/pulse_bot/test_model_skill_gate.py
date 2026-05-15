@@ -448,5 +448,137 @@ def test_entry_config_exit_overrides_apply_via_dataclasses_replace():
     assert effective.exit_hard_stop_loss_pct == gc.exit_hard_stop_loss_pct
 
 
+# ───────────── Round-2 gates: RULESONLY / BUYERMAX / smart-money ──────
+
+
+def test_rulesonly_disables_ml_override_buy_flip():
+    """RULESONLY: apply_ml_override must not flip rules-SKIP to BUY when
+    ``disable_ml_override=True`` even if ml_action='BUY' would normally
+    override. The whole point of the variant is to compare pure-rules
+    PnL against the ml_override hybrid."""
+    svc = DecisionService(db=None, hard_skip_n_env=0, disable_ml_override=True)
+    out = svc.apply_ml_override(
+        _decision_skip(),
+        ml_action="BUY",
+        ml_proba=0.99,  # strong ML signal — would normally fire
+        ml_cal=0.30,
+        result=_result(),
+        mint_short="MINT",
+        reg_pnl_pct=None,
+    )
+    assert out.should_enter is False
+    assert svc.ml_overrides_buy == 0
+
+
+def test_rulesonly_also_blocks_skip_flip():
+    """RULESONLY symmetry: a rules-BUY must not be flipped to SKIP either —
+    the ENTIRE override path is suppressed, not just the BUY-side flip."""
+    rules_buy = EntryDecision(
+        should_enter=True, entry_type="rules", entry_score=50, entry_buyer_num=3
+    )
+    svc = DecisionService(db=None, hard_skip_n_env=0, disable_ml_override=True)
+    out = svc.apply_ml_override(
+        rules_buy,
+        ml_action="SKIP",
+        ml_proba=0.01,
+        ml_cal=0.005,
+        result=_result(),
+        mint_short="MINT",
+        reg_pnl_pct=None,
+    )
+    assert out.should_enter is True
+    assert out is rules_buy  # unchanged passthrough
+
+
+def test_buyer_max_n_blocks_late_entry():
+    """BUYERMAX10: BUY override blocked when result.buy_count > the cap."""
+    svc = DecisionService(db=None, hard_skip_n_env=0, entry_buyer_max_n=10)
+    out = svc.apply_ml_override(
+        _decision_skip(),
+        ml_action="BUY",
+        ml_proba=0.30,
+        ml_cal=0.02,
+        result=_result(buy_count=15),  # too late
+        mint_short="MINT",
+        reg_pnl_pct=None,
+    )
+    assert out.should_enter is False
+    assert svc.ml_overrides_skip == 1
+
+
+def test_buyer_max_n_allows_early_entry():
+    """BUYERMAX10 inverse: BUY fires when buyer# is within the cap."""
+    svc = DecisionService(db=None, hard_skip_n_env=0, entry_buyer_max_n=10)
+    out = svc.apply_ml_override(
+        _decision_skip(),
+        ml_action="BUY",
+        ml_proba=0.30,
+        ml_cal=0.02,
+        result=_result(buy_count=5),  # early enough
+        mint_short="MINT",
+        reg_pnl_pct=None,
+    )
+    assert out.should_enter is True
+    assert svc.ml_overrides_buy == 1
+
+
+def test_buyer_max_n_none_is_no_gate():
+    """Default ``entry_buyer_max_n=None`` keeps legacy behaviour (no gate)."""
+    svc = DecisionService(db=None, hard_skip_n_env=0)
+    out = svc.apply_ml_override(
+        _decision_skip(),
+        ml_action="BUY",
+        ml_proba=0.30,
+        ml_cal=0.02,
+        result=_result(buy_count=999),  # absurdly late, but no cap
+        mint_short="MINT",
+        reg_pnl_pct=None,
+    )
+    assert out.should_enter is True
+
+
+def test_entry_config_inactivity_override_round_trips():
+    """``exit_inactivity_seconds`` is in exit_overrides() — supervisor's
+    dataclasses.replace path must pick it up so INACT60/INACT180 fire."""
+    from dataclasses import dataclass
+
+    from pulse_bot.entry_configs import EntryConfig
+
+    cfg = EntryConfig(
+        config_id="INACT60",
+        name="x",
+        description="x",
+        exit_inactivity_seconds=60.0,
+    )
+    overrides = cfg.exit_overrides()
+    assert overrides == {"exit_inactivity_seconds": 60.0}
+
+    @dataclass
+    class _GlobalCfg:
+        exit_inactivity_seconds: float = 120.0
+        exit_hard_stop_loss_pct: float = 15.0
+
+    import dataclasses as _dc
+
+    gc = _GlobalCfg()
+    effective = _dc.replace(gc, **overrides)
+    assert effective.exit_inactivity_seconds == 60.0
+    assert effective.exit_hard_stop_loss_pct == 15.0  # untouched
+
+
+def test_entry_config_new_round2_fields_have_safe_defaults():
+    """New Round-2 fields must default to disabled/None so existing configs
+    that don't set them retain Round-1 behaviour."""
+    from pulse_bot.entry_configs import EntryConfig
+
+    cfg = EntryConfig(config_id="x", name="x", description="x")
+    assert cfg.exit_inactivity_seconds is None
+    assert cfg.entry_buyer_max_n is None
+    assert cfg.disable_ml_override is False
+    assert cfg.require_smart_money is False
+    assert cfg.require_top3_positive_pnl is False
+    assert cfg.disable_survival_exit is False
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

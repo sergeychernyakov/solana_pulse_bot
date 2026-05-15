@@ -11,6 +11,33 @@
 ```
 
 ---
+## 2026-05-15 08:50 — Multi-config A/B Round 2: добор до 20 конфигов + per-config pre-filters
+
+**Что изменилось:**
+- `entry_configs.py::EntryConfig`: новые поля — `exit_inactivity_seconds`, `entry_buyer_max_n`, `disable_ml_override`, `require_smart_money`, `require_top3_positive_pnl`, `disable_survival_exit`. `exit_inactivity_seconds` добавлен в `exit_overrides()`.
+- `decision_service.py::DecisionService`: новые параметры в `__init__` + `from_entry_config` для всех 4 новых ml_override-gate'ов. Новые async-pre-filters `filter_smart_money_required` и `filter_top3_positive_pnl` (зеркало `filter_bot_cluster`, query по `wallet_classifications.is_smart_money` / `graduated_winrate`). `apply_ml_override`: RULESONLY no-op + BUYERMAX10 gate перед существующими p_raw/p_cal/reg.
+- `pipeline.py`: pre-filters (`filter_bot_cluster`, `filter_wash_cluster`, `filter_smart_money_required`, `filter_top3_positive_pnl`) **перенесены внутрь per-config лупа**. До этого они шарились через LIVE-DecisionService — SCAMSTRICT/NOSCAM по факту не уважали свои пороги. `filter_creator_blacklist` остался shared (creators table глобальная).
+- `paper_trade_supervisor.py`: гейт `disable_survival_exit` в tick_loop — NO_SURVIVAL bypass'ит survival-модель на выходе.
+- `config/entry_configs.yaml`: добор до 20 конфигов — 6 из Round-1 + 14 новых (HOLD60, HOLD180, INACT60, INACT180, SL08, TP20, TRAIL_LOOSE, NOSCAM, REGFLOOR5, BUYERMAX10, SMARTONLY, TOP3PNL, RULESONLY, NO_SURVIVAL).
+- `tests/pulse_bot/test_model_skill_gate.py`: +7 тестов (RULESONLY оба направления, BUYERMAX10 границы, `exit_inactivity_seconds` round-trip, дефолты новых полей).
+- `docs/AB_LOG.md`: запись Раунда 2.
+
+**Зачем:**
+- Round-1 показал что 100% выходов = `dead_token` → exit-сетка (max_hold/inactivity/SL) доминирует. TP/trailing почти не срабатывают на текущем потоке. Round-2 плотно покрывает exit-параметры.
+- Раунд-1 lockstep counts (LIVE=SCAMSTRICT=TP10=TRAILTIGHT=13) был не магия — pre-filters шарились, SCAMSTRICT тихо унаследовал LIVE-пороги. Перенос внутрь per-config лупа делает фильтры реально per-config.
+- Sanity-чек NOSCAM (фильтры отключены) — должен был быть в Round-0; если NOSCAM ≥ LIVE то scam-фильтры net-negative.
+- RULESONLY — доказательство/опровержение того что `ml_override` вообще добавляет ценность над rules-only. Самая важная контрольная переменная.
+
+**Результат:**
+- Бот перезапущен 08:50:52 UTC. `Loaded 20 entry configs ... Multi-config A/B active: 20 configs (live=LIVE)`. md5 сверены по 5 задеплоенным файлам.
+- Тесты: 38/38 в `test_model_skill_gate.py` зелёные локально (0.14s).
+- Линт чисто (black/ruff/isort).
+- Темп набора: ~2.5 трейда/h на LIVE-семейство → ~1.7 дня до N=100 на каждый exit-вариант. Entry-фильтры медленнее (несколько дней).
+
+**Откат:**
+- `git revert <hash>` — отменит yaml + код. Бот перезапустится с 20-конфиговой версией пока не откатишь, потом `systemctl --user restart pulse-bot.service` после возврата файлов.
+
+---
 ## 2026-05-15 07:23 — Fix deadlock: `_sync_conn` rollback on pool return
 
 **Что изменилось:**
