@@ -11,6 +11,26 @@
 ```
 
 ---
+## 2026-05-15 07:23 — Fix deadlock: `_sync_conn` rollback on pool return
+
+**Что изменилось:**
+- `pulse_bot/db.py::_sync_conn`: в `finally` теперь вызывается `conn.rollback()` перед возвратом коннекта в psycopg2-пул. Ошибки rollback'а проглатываются (best-effort cleanup).
+- Новый тест `tests/pulse_bot/test_sync_conn_no_idle_txn.py` (3 случая): happy path, исключение в теле, rollback сам бросает — во всех коннект должен вернуться в пул чистым.
+
+**Зачем:**
+- psycopg2 по умолчанию НЕ autocommit, а `_sync_query` коммитил только write-statements (`if cur.description is None`). SELECT'ы (например, `get_realized_balance_sync` на каждом входе в paper trade) неявно открывали транзакцию и возвращали коннект в пул в состоянии `idle in transaction` с непогашенным `AccessShareLock` на `paper_trades`.
+- За пару часов все 10 psycopg2-коннектов накапливали такие висящие транзакции. Любая попытка DDL (например, перезапуск стороннего сервиса, который прогоняет `db_schema_pg.sql`) встаёт за `AccessExclusiveLock`, и тогда все новые INSERT в `paper_trades` встают за DDL → полный дедлок.
+- Наблюдалось 2026-05-15: бот завис в 01:32 UTC на 5ч 44м, 21 paper-trade INSERT/SELECT держали локи в `pg_stat_activity`, ни один не двигался.
+
+**Результат:**
+- Бот перезапущен 07:23:45 UTC с фиксом (md5 deployed == local). Прежний deadlock-сценарий теперь невозможен по построению: каждый `_sync_conn` гарантированно возвращает коннект без открытой транзакции.
+- 3 unit-теста зелёные локально (pytest, 0.20s, чистый mock — без живой БД).
+- Дальнейший мониторинг: если бот опять зависнет с тем же паттерном (несколько 5ч+ висящих запросов с `granted=t` в `pg_stat_activity`) — значит есть второй источник, рыть глубже.
+
+**Откат:**
+- `git revert <hash>` или вручную: убрать try/finally rollback в `_sync_conn`, оставить только `pool.putconn(conn)`. Перезапустить бот.
+
+---
 ## 2026-05-14 17:07 — Multi-config A/B v3: p_raw_floor + per-config exit + scam-filter варианты
 
 **Что изменилось:**

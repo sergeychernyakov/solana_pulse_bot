@@ -109,12 +109,29 @@ def _get_sync_pool(dsn: str) -> psycopg2.pool.ThreadedConnectionPool:
 
 @contextlib.contextmanager
 def _sync_conn(dsn: str):
-    """Borrow a psycopg2 connection from the pool, return on exit."""
+    """Borrow a psycopg2 connection from the pool, return on exit.
+
+    Always rollback the connection before returning it to the pool. Without
+    this, a SELECT inside ``_sync_query`` leaves the connection ``idle in
+    transaction`` (psycopg2 is not autocommit by default, and ``_sync_query``
+    only commits write statements). Such connections accumulate in the pool
+    holding stale ``AccessShareLock``s on ``paper_trades``; any DDL that wants
+    ``AccessExclusiveLock`` then queues behind them, and subsequent INSERTs
+    queue behind the DDL — total deadlock. Observed 2026-05-15: bot froze
+    for 5h44m and 21 paper-trade writes piled up waiting on PG locks.
+
+    ``rollback()`` on a connection whose transaction was already committed by
+    the caller is a no-op, so this is safe for the write path as well.
+    """
     pool = _get_sync_pool(dsn)
     conn = pool.getconn()
     try:
         yield conn
     finally:
+        try:
+            conn.rollback()
+        except Exception:  # nosec B110 - best-effort cleanup before pool return
+            pass
         pool.putconn(conn)
 
 
