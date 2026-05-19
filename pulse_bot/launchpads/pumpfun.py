@@ -44,6 +44,33 @@ class PumpFunLaunchpad(Launchpad):
         self._graduation_sol = PUMPFUN_GRADUATION_SOL
         self._token_creators: dict[str, str] = {}
         self._last_msg_ts = 0.0
+        # 2026-05-18 — PumpPortal feed-funded gate. When the WS responds
+        # with the "API key funded with at least 0.02 SOL" message,
+        # subscribeTokenTrade is SILENTLY rejected — no trade events ever
+        # arrive. Pre-fix the bot kept entering tokens it could never
+        # observe; entries closed as dead_token after 60s with -7%
+        # (fees-only PnL, no price movement). Now we record the rejection
+        # timestamp and gate new entries via ``is_feed_funded``.
+        self._last_unfunded_warning_ts: float = 0.0
+
+    # ── Health gates (2026-05-18) ──────────────────────────────
+
+    # Window after the last "0.02 SOL" warning during which we consider
+    # the feed dead. PumpPortal sends the rejection on every subscribe
+    # attempt; absence for this long = wallet topped up and feed back.
+    _UNFUNDED_GRACE_SECONDS = 60.0
+
+    @property
+    def is_feed_funded(self) -> bool:
+        """Return False if PumpPortal recently rejected subscribeTokenTrade
+        for under-funding. Pipeline checks this before opening new paper
+        trades — entering tokens whose WS feed is denied wastes a slot
+        for 60s of dead_token timeout and produces fees-only losses."""
+        if self._last_unfunded_warning_ts == 0.0:
+            return True
+        return (
+            time.time() - self._last_unfunded_warning_ts
+        ) > self._UNFUNDED_GRACE_SECONDS
 
     # ── Lifecycle ──────────────────────────────────────────────
 
@@ -329,6 +356,36 @@ class PumpFunLaunchpad(Launchpad):
             else:
                 if "errors" in data or "error" in data or "message" in data:
                     logger.warning("PumpPortal WS response: %s", data)
+                    # 2026-05-18 — wallet-funded HARD STOP. PumpPortal
+                    # silently rejects subscribeTokenTrade when the API
+                    # key wallet holds <0.02 SOL; without trade events the
+                    # bot enters tokens it can't observe and accrues
+                    # fees-only losses (4 days of -23 SOL on May 14→18 was
+                    # exactly this). Hard rule: if WS denies a subscribe,
+                    # the bot CANNOT do its job. Crash → systemd marks the
+                    # service failed → operator sees red status.
+                    msg_text = str(data.get("message") or data.get("error") or "")
+                    if "0.02 SOL" in msg_text or "funded with at least" in msg_text:
+                        logger.critical(
+                            "PUMPPORTAL WALLET UNFUNDED — wallet below "
+                            "0.02 SOL; PumpPortal is rejecting "
+                            "subscribeTokenTrade. The bot cannot operate "
+                            "without trade events. EXITING (1) so systemd "
+                            "marks the service FAILED. Top up wallet "
+                            "(GHf7v3Kx9r9VA58UE47k8FouHzyrsCtWH3gx8VWTdK2v) "
+                            "and run: systemctl --user reset-failed "
+                            "pulse-bot.service && systemctl --user start "
+                            "pulse-bot.service. (raw msg: %s)",
+                            msg_text,
+                        )
+                        # os._exit(1) bypasses asyncio cleanup/atexit so
+                        # the process dies immediately even if a hung
+                        # task holds the loop. Standard sys.exit would
+                        # raise SystemExit which the WS reader's broad
+                        # except could swallow.
+                        import os as _os
+
+                        _os._exit(1)
 
     async def _watchdog_loop(self) -> None:
         """Force reconnect if WS goes silent for too long.

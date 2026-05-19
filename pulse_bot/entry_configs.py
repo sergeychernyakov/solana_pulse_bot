@@ -126,7 +126,13 @@ class EntryConfig:
     # reg_* fields kept for back-compat with persisted entry_configs rows;
     # the universal skill-gate disables the reg head at load, so these
     # are inert unless a future skilled reg model is deployed.
-    reg_floor_pct: float = 0.0
+    # 2026-05-18 — default flipped 0.0 → -100.0 to match the stated
+    # design intent in decision_service.apply_ml_override ("off by
+    # default because live ρ ≈ 0.008 — operator opt-in only"). Configs
+    # that want the reg-floor gate active must set this explicitly in
+    # YAML (REGFLOOR0/5/10/MINUS5/MINUS10). LIVE and all exit-side
+    # variants now run without reg-filter on the entry side.
+    reg_floor_pct: float = -100.0
     reg_ceiling_pct: float = 30.0
     bot_cluster_hard_skip_n: int = 3
     wash_cluster_skip_n: int = 2

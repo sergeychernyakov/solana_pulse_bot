@@ -82,9 +82,17 @@ def main() -> None:
     # ── Stats as compact HTML bar ──────────────────────────
     render_stats_bar(stats)
 
-    # ── P&L summary for BUY tokens ────────────────────────
+    # ── Bonding-curve growth on BUY tokens (NOT bot P&L) ──
     if rows:
-        st.subheader("P&L Summary")
+        st.subheader("Curve growth @ buyer# — BUY tokens (not bot P&L)")
+        st.caption(
+            "Price change from the average price of the first N buyers to "
+            "the last observed buy inside the FAST scoring window (~T+30–60s). "
+            "Bonding-curve climbs with every buy, so this is almost always "
+            "positive for tokens that earned a BUY decision — it measures "
+            "intra-window momentum, NOT what the bot actually earned. "
+            "For real trade outcomes see **Paper Trading** below."
+        )
         render_pnl_summary(rows)
 
     # ── Charts ─────────────────────────────────────────────
@@ -329,6 +337,16 @@ def render_paper_trades(db: Database) -> None:
         cid = t.get("config_id") or "LIVE"
         open_by_cfg[cid] = open_by_cfg.get(cid, 0) + 1
     all_cfg_ids = set(by_cfg) | set(open_by_cfg)
+    # Also surface configs currently loaded in YAML even when they have
+    # 0 trades — strict reg-floor / buyer-max filters can keep N=0 for
+    # long stretches but the operator still wants to see them in the A/B.
+    try:
+        from pulse_bot.entry_configs import load_registry_from_yaml
+
+        yaml_reg = load_registry_from_yaml()
+        all_cfg_ids |= {c.config_id for c in yaml_reg.configs}
+    except Exception:  # pragma: no cover — never break the dashboard
+        pass
     if len(all_cfg_ids) > 1:
         cfg_rows = []
         for cid in sorted(all_cfg_ids):

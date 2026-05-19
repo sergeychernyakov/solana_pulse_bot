@@ -178,3 +178,8 @@ pulse_bot.db-wal
 data/
 artifacts/
 .claude/scheduled_tasks.lock
+
+# Local agent / human instructions — not part of the public repo
+AGENTS.md
+CLAUDE.md
+PYTHON_STYLE_GUIDE.md

@@ -1,19 +1,19 @@
-# Solana Pulse Bot v3 — Техническая спецификация
+# Solana Pulse Bot v3 — Technical Specification
 
-## Концепция
+## Concept
 
-Бот-наблюдатель для мемкоин-лончпадов на Solana. Не снайпер — не гонится за первым блоком. Наблюдает 30-90 секунд за новым токеном, оценивает органичность интереса, входит 3м-5м покупателем. Выходит не по фиксированному TP/SL, а по пульсу активности — когда покупатели иссякают.
+An observer bot for memecoin launchpads on Solana. Not a sniper — does not race for the first block. Observes a new token for 30-90 seconds, evaluates the organicity of interest, enters as the 3rd-5th buyer. Exits not on a fixed TP/SL, but on activity pulse — when buyers dry up.
 
-Ассиметричная ставка: теряешь мало (bonding curve почти не сдвинулась), выигрываешь кратно (если токен полетел).
+Asymmetric bet: lose little (bonding curve has barely moved), win multiples (if the token takes off).
 
-Один код — два режима: бэктест на исторических данных и боевая торговля.
+One codebase — two modes: backtest on historical data and live trading.
 
 
 ---
 
-## Архитектура
+## Architecture
 
-Event-driven архитектура: все модули общаются через типизированные события. Commands (намерения) отделены от Events (факты). Время абстрагировано через Clock — бэктест и live используют один и тот же код. Состояние персистентно — бот восстанавливается после падения.
+Event-driven architecture: all modules communicate through typed events. Commands (intentions) are separated from Events (facts). Time is abstracted through Clock — backtest and live use the same code. State is persistent — the bot recovers after a crash.
 
 ```
                     ┌───────────┐
@@ -23,11 +23,11 @@ Event-driven архитектура: все модули общаются чер
                           │ TokenEvent
                     ┌─────▼──────────┐
                     │ PRECHECK       │ Authority, Creator, Blacklist
-                    │ FILTERS        │ hard_reject (без наблюдения)
+                    │ FILTERS        │ hard_reject (no observation)
                     └─────┬──────────┘
                           │ (passed)
                     ┌─────▼──────────┐
-                    │ OBSERVATION    │ 30-90 сек сбор метрик
+                    │ OBSERVATION    │ 30-90 sec metric collection
                     │ FILTERS        │ buyers, volume, diversity, bundled
                     └─────┬──────────┘
                           │ SignalEvent (score > threshold)
@@ -37,7 +37,7 @@ Event-driven архитектура: все модули общаются чер
                           │ PlaceBuyCommand
                     ┌─────▼──────────┐
                     │ EXECUTION      │ SimulatedExecution | LiveExecution
-                    │ WORKER         │ (отдельная task, bounded concurrency)
+                    │ WORKER         │ (separate task, bounded concurrency)
                     └─────┬──────────┘
                           │ FillEvent
                     ┌─────▼──────────┐
@@ -47,7 +47,7 @@ Event-driven архитектура: все модули общаются чер
                           │
                     ┌─────▼──────────┐
                     │ PULSE MONITOR  │ stream-based (no polling)
-                    │ per-mint task  │ тренд пульса, частичные выходы
+                    │ per-mint task  │ pulse trend, partial exits
                     └─────┬──────────┘
                           │ PlaceSellCommand
                           │ → Execution Worker → FillEvent → Portfolio
@@ -56,8 +56,8 @@ Event-driven архитектура: все модули общаются чер
               │  EVENT BUS            │
               │  asyncio.Queue        │
               │  + Clock (Real|Sim)   │
-              │  Все события логируются│
-              │  с event_id +         │
+              │  All events logged    │
+              │  with event_id +      │
               │  correlation_id       │
               └───────────────────────┘
 ```
@@ -65,67 +65,67 @@ Event-driven архитектура: все модули общаются чер
 
 ---
 
-## Файловая структура
+## File structure
 
 ```
 pulse_bot/
 ├── __init__.py
-├── models.py              # Все dataclass: Token, Trade, Position, PulseSnapshot, TradeResult
+├── models.py              # All dataclasses: Token, Trade, Position, PulseSnapshot, TradeResult
 ├── events.py              # Event ABC + TokenEvent, SignalEvent, FillEvent, PulseEvent
-├── commands.py            # Command ABC + PlaceBuyCommand, PlaceSellCommand (намерения)
+├── commands.py            # Command ABC + PlaceBuyCommand, PlaceSellCommand (intentions)
 ├── clock.py               # Clock ABC + RealClock + SimulatedClock
-├── config.py              # Config dataclass + LaunchpadConfig + пресеты
-├── db.py                  # SQLite: схема, CRUD, event_log, state persistence
-├── portfolio.py           # Portfolio: баланс, позиции, reserve/commit/release
+├── config.py              # Config dataclass + LaunchpadConfig + presets
+├── db.py                  # SQLite: schema, CRUD, event_log, state persistence
+├── portfolio.py           # Portfolio: balance, positions, reserve/commit/release
 ├── execution.py           # ExecutionHandler ABC + SimulatedExecution + LiveExecution
-├── engine.py              # PulseBot: главный event loop + event bus
-├── collector.py           # Bitquery → SQLite (сбор данных для бэктеста)
-├── report.py              # P&L отчёт, метрики, топы/лузеры
+├── engine.py              # PulseBot: main event loop + event bus
+├── collector.py           # Bitquery → SQLite (data collection for backtest)
+├── report.py              # P&L report, metrics, winners/losers
 ├── main.py                # CLI: collect / backtest / paper / live
 ├── requirements.txt
 ├── README.md
 │
-├── sources/               # Источники данных
+├── sources/               # Data sources
 │   ├── __init__.py
 │   ├── base.py            # DataSource ABC
 │   ├── backtest.py        # BacktestSource(DataSource) — SQLite + SimulatedClock
 │   └── live.py            # LiveSource(DataSource) — WebSocket + RPC + RealClock
 │
-├── launchpads/            # Адаптеры лончпадов
+├── launchpads/            # Launchpad adapters
 │   ├── __init__.py
 │   ├── base.py            # Launchpad ABC (ws, parse, build_tx, curve, graduation)
 │   └── pumpfun.py         # PumpFun(Launchpad) — bonding curve, tx, ws
-│                          # Потом: letsbonk.py, believe.py, launchlab.py
-│                          # Каждый адаптер может быть "толстым" — свои эвристики
+│                          # Later: letsbonk.py, believe.py, launchlab.py
+│                          # Each adapter can be "thick" — its own heuristics
 │
-├── filters/               # Фильтры (разделены на фазы)
+├── filters/               # Filters (split into phases)
 │   ├── __init__.py
 │   ├── base.py            # Filter ABC + FilterResult
 │   ├── authority.py       # AuthorityFilter — mint/freeze, Token-2022 [precheck]
-│   ├── creator.py         # CreatorFilter — история, возраст, блеклист [precheck]
-│   ├── bundled_buy.py     # BundledBuyFilter — общий источник SOL [observation]
+│   ├── creator.py         # CreatorFilter — history, age, blacklist [precheck]
+│   ├── bundled_buy.py     # BundledBuyFilter — common SOL source [observation]
 │   ├── observation.py     # ObservationFilter — buyers, volume SOL, diversity [observation]
-│   └── scorer.py          # Scorer — двухфазный: precheck_filters + observation_filters
+│   └── scorer.py          # Scorer — two-phase: precheck_filters + observation_filters
 │
-└── pulse/                 # Пульсовый мониторинг
+└── pulse/                 # Pulse monitoring
     ├── __init__.py
-    ├── monitor.py         # PulseMonitor — stream-based, last_seen_tx курсор
-    └── exit_manager.py    # ExitManager — частичные выходы, moonbag, стопы
+    ├── monitor.py         # PulseMonitor — stream-based, last_seen_tx cursor
+    └── exit_manager.py    # ExitManager — partial exits, moonbag, stops
 ```
 
-30 файлов, 4 пакета. Каждый пакет — отдельная зона ответственности. Новый лончпад = новый файл в `launchpads/`, но файл может быть толстым — свои формулы кривой, graduation logic, анти-скам эвристики.
+30 files, 4 packages. Each package is a separate area of responsibility. A new launchpad = new file in `launchpads/`, but the file can be thick — its own curve formulas, graduation logic, anti-scam heuristics.
 
 
 ---
 
-## Модуль 1: EVENTS + COMMANDS — Типизированные сообщения
+## Module 1: EVENTS + COMMANDS — Typed messages
 
-Сердце системы. **Events** — факты (что произошло). **Commands** — намерения (что нужно сделать). Разделение важно: Command может быть отклонён, Event — уже случился.
+The heart of the system. **Events** are facts (what happened). **Commands** are intentions (what needs to be done). The separation is important: a Command can be rejected, an Event has already occurred.
 
-Каждое сообщение имеет `event_id` (уникальный) и `correlation_id` (связь с исходным TokenEvent для всей цепочки решений).
+Each message has an `event_id` (unique) and a `correlation_id` (link to the originating TokenEvent for the entire decision chain).
 
 ```python
-# events.py — факты (что произошло)
+# events.py — facts (what happened)
 
 from dataclasses import dataclass, field
 from abc import ABC
@@ -136,23 +136,23 @@ import uuid
 class Event(ABC):
     timestamp: float
     event_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
-    correlation_id: str = ""    # ID исходного TokenEvent — вся цепочка решений
+    correlation_id: str = ""    # ID of the originating TokenEvent — full decision chain
 
 
 @dataclass
 class TokenEvent(Event):
-    """Новый токен обнаружен на лончпаде."""
+    """New token detected on a launchpad."""
     token: Token
     launchpad: str              # 'pumpfun' | 'letsbonk' | ...
 
     def __post_init__(self):
         if not self.correlation_id:
-            self.correlation_id = self.event_id  # Корень цепочки
+            self.correlation_id = self.event_id  # Root of the chain
 
 
 @dataclass
 class FilterEvent(Event):
-    """Результат фильтрации (для лога, даже если отброшен)."""
+    """Filtering result (for the log, even if rejected)."""
     token: Token
     phase: str                  # 'precheck' | 'observation'
     passed: bool
@@ -163,31 +163,31 @@ class FilterEvent(Event):
 
 @dataclass
 class SignalEvent(Event):
-    """Сигнал на покупку — прошёл все фильтры, score > threshold."""
+    """Buy signal — passed all filters, score > threshold."""
     token: Token
     score: int
     reasons: list[str]
-    observation_data: dict      # Метрики наблюдения: unique_buyers, total_sol_in и т.д.
+    observation_data: dict      # Observation metrics: unique_buyers, total_sol_in, etc.
 
 
 @dataclass
 class FillEvent(Event):
-    """Исполненная сделка — реальная или симулированная."""
+    """Executed trade — real or simulated."""
     mint: str
     symbol: str
     side: str                   # 'buy' | 'sell'
     price: float
-    quote_amount_sol: float     # Сколько SOL потрачено (buy) или получено (sell)
-    base_amount_tokens: float   # Сколько токенов получено (buy) или продано (sell)
+    quote_amount_sol: float     # SOL spent (buy) or received (sell)
+    base_amount_tokens: float   # Tokens received (buy) or sold (sell)
     fee_sol: float
     slippage_pct: float
-    tx_sig: str | None          # None в бэктесте
-    command_id: str = ""        # ID команды, которую исполнили
+    tx_sig: str | None          # None in backtest
+    command_id: str = ""        # ID of the command that was executed
 
 
 @dataclass
 class PulseEvent(Event):
-    """Обновление пульса позиции."""
+    """Position pulse update."""
     mint: str
     snapshot: 'PulseSnapshot'
     action: str                 # 'hold' | 'sell_partial' | 'sell_all'
@@ -196,7 +196,7 @@ class PulseEvent(Event):
 ```
 
 ```python
-# commands.py — намерения (что нужно сделать)
+# commands.py — intentions (what needs to be done)
 
 from dataclasses import dataclass, field
 from abc import ABC
@@ -212,54 +212,54 @@ class Command(ABC):
 
 @dataclass
 class PlaceBuyCommand(Command):
-    """Намерение купить — Portfolio зарезервировал средства."""
+    """Intention to buy — Portfolio has reserved funds."""
     mint: str
     symbol: str
-    quote_amount_sol: float     # Сколько SOL потратить
+    quote_amount_sol: float     # How much SOL to spend
     reason: str                 # 'signal_score_35'
-    reservation_id: str = ""    # ID резервации в Portfolio
+    reservation_id: str = ""    # Reservation ID in Portfolio
 
 
 @dataclass
 class PlaceSellCommand(Command):
-    """Намерение продать — Portfolio рассчитал количество токенов."""
+    """Intention to sell — Portfolio computed the token amount."""
     mint: str
     symbol: str
-    base_amount_tokens: float   # Сколько токенов продать (явно!)
+    base_amount_tokens: float   # How many tokens to sell (explicit!)
     reason: str                 # 'pulse_dead' | 'partial_profit' | ...
 ```
 
-Каждый Event и Command логируются в SQLite (`event_log`) с `event_id` и `correlation_id`. Бэктест может переиграть любую цепочку решений, отследив correlation_id от TokenEvent до финального FillEvent.
+Every Event and Command is logged in SQLite (`event_log`) with `event_id` and `correlation_id`. The backtest can replay any decision chain by following correlation_id from TokenEvent to the final FillEvent.
 
 
 ---
 
-## Модуль 2: CLOCK — Абстракция времени
+## Module 2: CLOCK — Time abstraction
 
-Ключевой модуль для тезиса "один код — два режима". Все модули получают время и sleep через Clock, а не через `time.time()` / `asyncio.sleep()` напрямую.
+Key module for the "one codebase — two modes" thesis. All modules get time and sleep through Clock, not via `time.time()` / `asyncio.sleep()` directly.
 
 ```python
-# clock.py (корень пакета)
+# clock.py (package root)
 
 from abc import ABC, abstractmethod
 
 
 class Clock(ABC):
-    """Абстракция времени. RealClock для live, SimulatedClock для бэктеста."""
+    """Time abstraction. RealClock for live, SimulatedClock for backtest."""
 
     @abstractmethod
     def now(self) -> float:
-        """Текущее время (unix timestamp)."""
+        """Current time (unix timestamp)."""
         ...
 
     @abstractmethod
     async def sleep(self, seconds: float) -> None:
-        """Ожидание. В бэктесте — мгновенное, в live — реальное."""
+        """Wait. In backtest — instant, in live — real."""
         ...
 
 
 class RealClock(Clock):
-    """Живое время. Для paper и live режимов."""
+    """Live time. For paper and live modes."""
 
     def now(self) -> float:
         return time.time()
@@ -269,7 +269,7 @@ class RealClock(Clock):
 
 
 class SimulatedClock(Clock):
-    """Симулированное время. Для бэктеста — детерминированный replay."""
+    """Simulated time. For backtest — deterministic replay."""
 
     def __init__(self, start_ts: float):
         self._current_ts = start_ts
@@ -279,48 +279,48 @@ class SimulatedClock(Clock):
 
     async def sleep(self, seconds: float) -> None:
         self._current_ts += seconds
-        # Мгновенный return — бэктест не ждёт реальные 45 секунд
+        # Instant return — backtest does not wait the real 45 seconds
 
     def advance_to(self, ts: float) -> None:
-        """Перемотать время до конкретного момента (для replay по данным)."""
+        """Fast-forward time to a specific moment (for data-driven replay)."""
         self._current_ts = max(self._current_ts, ts)
 ```
 
-**Правило:** ни один модуль не вызывает `time.time()` или `asyncio.sleep()` напрямую. Только `self.clock.now()` и `await self.clock.sleep()`. Это делает бэктест детерминированным и мгновенным.
+**Rule:** no module calls `time.time()` or `asyncio.sleep()` directly. Only `self.clock.now()` and `await self.clock.sleep()`. This makes the backtest deterministic and instant.
 
 
 ---
 
-## Модуль 3: SOURCES — Источники данных
+## Module 3: SOURCES — Data sources
 
-Абстракция источника данных. Бэктест и прод — один интерфейс.
+Data source abstraction. Backtest and production share one interface.
 
 ```python
 # sources/base.py + sources/backtest.py + sources/live.py
 
 class DataSource(ABC):
-    """Абстрактный источник данных. Бэктест читает SQLite, прод — WebSocket."""
+    """Abstract data source. Backtest reads SQLite, production — WebSocket."""
 
-    clock: Clock               # Все источники используют Clock
+    clock: Clock               # All sources use Clock
 
     @abstractmethod
     async def stream_new_tokens(self) -> AsyncIterator[TokenEvent]:
-        """Поток новых токенов."""
+        """Stream of new tokens."""
         ...
 
     @abstractmethod
     async def stream_trades(self, mint: str) -> AsyncIterator[Trade]:
-        """Поток сделок токена (stream, не polling!)."""
+        """Stream of token trades (stream, not polling!)."""
         ...
 
     @abstractmethod
     async def get_trades(self, mint: str, from_ts: float, to_ts: float) -> list[Trade]:
-        """Сделки токена за период (для observation window)."""
+        """Token trades for a period (for observation window)."""
         ...
 
     @abstractmethod
     async def get_wallet_history(self, wallet: str, limit: int = 10) -> list[Transaction]:
-        """Последние транзакции кошелька (для bundled buy detection)."""
+        """Recent wallet transactions (for bundled buy detection)."""
         ...
 
     @abstractmethod
@@ -330,21 +330,21 @@ class DataSource(ABC):
 
 
 class BacktestSource(DataSource):
-    """Читает из SQLite. Эмулирует поток событий в хронологическом порядке."""
+    """Reads from SQLite. Emulates the event stream in chronological order."""
 
     def __init__(self, db_path: str, clock: SimulatedClock, start_ts: float, end_ts: float):
         self.db_path = db_path
-        self.clock = clock          # SimulatedClock — время из данных
+        self.clock = clock          # SimulatedClock — time from data
         self.start_ts = start_ts
         self.end_ts = end_ts
 
     async def stream_new_tokens(self) -> AsyncIterator[TokenEvent]:
         for token in iter_tokens_by_time(self.db_path, self.start_ts, self.end_ts):
-            self.clock.advance_to(token.created_at)  # Перематываем время
+            self.clock.advance_to(token.created_at)  # Fast-forward time
             yield TokenEvent(timestamp=self.clock.now(), token=token, launchpad='pumpfun')
 
     async def stream_trades(self, mint: str) -> AsyncIterator[Trade]:
-        """Replay трейдов из SQLite в хронологическом порядке."""
+        """Replay trades from SQLite in chronological order."""
         for trade in iter_trades_by_mint(self.db_path, mint):
             self.clock.advance_to(trade.timestamp)
             yield trade
@@ -352,48 +352,48 @@ class BacktestSource(DataSource):
     async def get_trades(self, mint, from_ts, to_ts) -> list[Trade]:
         return get_trades_window(self.db_path, mint, from_ts, to_ts)
 
-    # ... остальные методы из SQLite
+    # ... other methods from SQLite
 
 
 class LiveSource(DataSource):
-    """WebSocket + RPC. Пишет каждый ивент в SQLite для будущих бэктестов."""
+    """WebSocket + RPC. Writes every event into SQLite for future backtests."""
 
     def __init__(self, launchpad: 'Launchpad', clock: RealClock, rpc_url: str, db_path: str):
         self.launchpad = launchpad
-        self.clock = clock          # RealClock — реальное время
+        self.clock = clock          # RealClock — real time
         self.rpc_url = rpc_url
-        self.db_path = db_path      # Записываем всё для реплея
+        self.db_path = db_path      # Record everything for replay
 
     async def stream_new_tokens(self) -> AsyncIterator[TokenEvent]:
         async for raw in self.launchpad.ws_subscribe():
             token = self.launchpad.parse_create_event(raw)
-            insert_token(self.db_path, token)       # Сохраняем для бэктеста
+            insert_token(self.db_path, token)       # Save for backtest
             yield TokenEvent(timestamp=self.clock.now(), token=token, launchpad=self.launchpad.name)
 
     async def stream_trades(self, mint: str) -> AsyncIterator[Trade]:
-        """Подписка на WebSocket трейды — реальный stream."""
+        """Subscribe to WebSocket trades — real stream."""
         async for raw in self.launchpad.ws_subscribe_trades(mint):
             trade = self.launchpad.parse_trade_event(raw)
-            insert_trade(self.db_path, trade)       # Сохраняем для бэктеста
+            insert_trade(self.db_path, trade)       # Save for backtest
             yield trade
 
     async def get_trades(self, mint, from_ts, to_ts) -> list[Trade]:
-        # Сначала проверяем кеш в SQLite, потом RPC
+        # First check the SQLite cache, then RPC
         ...
 ```
 
-Ключевое: `LiveSource` пишет ВСЕ данные в SQLite. Завтра прогоняешь вчерашний день через `BacktestSource` с новыми порогами. Бесплатный бэктест из реальных данных.
+Key point: `LiveSource` writes ALL data into SQLite. Tomorrow you run yesterday's day through `BacktestSource` with new thresholds. Free backtest on real data.
 
 
 ---
 
-## Модуль 4: LAUNCHPAD — Адаптеры лончпадов
+## Module 4: LAUNCHPAD — Launchpad adapters
 
 ```python
 # launchpads/base.py + launchpads/pumpfun.py
 
 class Launchpad(ABC):
-    """Абстракция лончпада. Сейчас PumpFun, потом LetsBonk, Believe, LaunchLab."""
+    """Launchpad abstraction. Currently PumpFun, later LetsBonk, Believe, LaunchLab."""
 
     name: str
     program_id: str
@@ -401,47 +401,47 @@ class Launchpad(ABC):
 
     @abstractmethod
     async def ws_subscribe(self) -> AsyncIterator[dict]:
-        """WebSocket подписка на новые токены."""
+        """WebSocket subscription to new tokens."""
         ...
 
     @abstractmethod
     async def ws_subscribe_trades(self, mint: str) -> AsyncIterator[dict]:
-        """WebSocket подписка на трейды конкретного токена (stream!)."""
+        """WebSocket subscription to trades of a specific token (stream!)."""
         ...
 
     @abstractmethod
     def parse_create_event(self, raw: dict) -> Token:
-        """Парсинг сырого события в Token."""
+        """Parse raw event into a Token."""
         ...
 
     @abstractmethod
     def parse_trade_event(self, raw: dict) -> Trade:
-        """Парсинг сырого события в Trade."""
+        """Parse raw event into a Trade."""
         ...
 
     @abstractmethod
     async def build_buy_tx(self, mint: str, amount_sol: float, keypair) -> Transaction:
-        """Сформировать транзакцию покупки на bonding curve."""
+        """Build a buy transaction on the bonding curve."""
         ...
 
     @abstractmethod
     async def build_sell_tx(self, mint: str, amount_tokens: float, keypair) -> Transaction:
-        """Сформировать транзакцию продажи на bonding curve."""
+        """Build a sell transaction on the bonding curve."""
         ...
 
     @abstractmethod
     def calculate_slippage(self, amount_sol: float, curve_state: dict) -> float:
-        """Рассчитать slippage по формуле bonding curve."""
+        """Compute slippage using the bonding curve formula."""
         ...
 
     @abstractmethod
     def get_graduation_threshold(self) -> float:
-        """Порог graduation в SOL (специфичен для лончпада)."""
+        """Graduation threshold in SOL (launchpad-specific)."""
         ...
 
     @abstractmethod
     def get_antiscam_checks(self, token: Token, trades: list[Trade]) -> list[str]:
-        """Специфичные для лончпада анти-скам проверки. Возвращает список warning reasons."""
+        """Launchpad-specific anti-scam checks. Returns a list of warning reasons."""
         ...
 
 
@@ -452,8 +452,8 @@ class PumpFun(Launchpad):
     ws_url = "wss://pumpportal.fun/api/data"
 
     # Bonding curve: y = 1073000191 - 32190005730/(30+x)
-    # x = SOL вложено, y = токенов получено
-    # Экспоненциальная кривая — ранний вход дёшев
+    # x = SOL invested, y = tokens received
+    # Exponential curve — early entry is cheap
 
     async def ws_subscribe(self):
         async with websockets.connect(self.ws_url) as ws:
@@ -477,7 +477,7 @@ class PumpFun(Launchpad):
     # ... build_buy_tx, build_sell_tx, calculate_slippage
 
 
-# Потом:
+# Later:
 # class LetsBonk(Launchpad): ...
 # class Believe(Launchpad): ...
 ```
@@ -485,27 +485,27 @@ class PumpFun(Launchpad):
 
 ---
 
-## Модуль 5: FILTERS + SCORER — Двухфазная фильтрация и скоринг
+## Module 5: FILTERS + SCORER — Two-phase filtering and scoring
 
-Фильтры разделены на две фазы:
-- **Precheck** (до наблюдения): authority, creator, blacklist — мгновенные, отсекают 90% мусора
-- **Observation** (после 30-90 сек наблюдения): buyers, volume, diversity, bundled buy — требуют данных
+Filters are split into two phases:
+- **Precheck** (before observation): authority, creator, blacklist — instant, filter out 90% of junk
+- **Observation** (after 30-90 sec of observation): buyers, volume, diversity, bundled buy — require data
 
 ```python
 # filters/base.py + filters/scorer.py + filters/*.py
 
 @dataclass
 class FilterResult:
-    score: int                  # Вклад в общий скор
-    hard_reject: bool           # True = мгновенный отказ, score неважен
-    reason: str                 # Человекочитаемая причина
+    score: int                  # Contribution to the overall score
+    hard_reject: bool           # True = instant rejection, score irrelevant
+    reason: str                 # Human-readable reason
 
 
 class Filter(ABC):
-    """Абстрактный фильтр. Каждый фильтр = отдельный класс, отдельный вес."""
+    """Abstract filter. Each filter = separate class, separate weight."""
 
     name: str
-    weight: int                 # Макс. вклад в score (0 для hard-reject фильтров)
+    weight: int                 # Max contribution to score (0 for hard-reject filters)
     enabled: bool = True
 
     @abstractmethod
@@ -514,7 +514,7 @@ class Filter(ABC):
 
 
 class AuthorityFilter(Filter):
-    """HARD REJECT: mint/freeze authority не отозван или Token-2022."""
+    """HARD REJECT: mint/freeze authority not revoked or Token-2022."""
     name = "authority"
     weight = 0
 
@@ -532,22 +532,22 @@ class AuthorityFilter(Filter):
 
 
 class CreatorFilter(Filter):
-    """Мягкий скоринг по истории создателя + hard reject для блеклиста."""
+    """Soft scoring on creator history + hard reject for blacklist."""
     name = "creator"
     weight = 15
 
     async def check(self, token, context) -> FilterResult:
         stats = context.get('creator_stats')
 
-        # Hard: блеклист
+        # Hard: blacklist
         if stats and stats.blacklisted:
             return FilterResult(0, True, "creator_blacklisted")
 
-        # Hard: кошелёк моложе 24ч
+        # Hard: wallet younger than 24h
         if stats and stats.wallet_age_hours < self.cfg.min_creator_wallet_age_hours:
             return FilterResult(0, True, f"wallet_age_{stats.wallet_age_hours:.0f}h")
 
-        # Soft: серийный скамер (>50 токенов, <1% graduation)
+        # Soft: serial scammer (>50 tokens, <1% graduation)
         if stats and stats.total_tokens > 50:
             if stats.graduation_rate < self.cfg.min_creator_graduation_rate:
                 return FilterResult(-20, False, f"serial_scammer_{stats.graduation_rate:.3f}")
@@ -558,7 +558,7 @@ class CreatorFilter(Filter):
 
 
 class BundledBuyFilter(Filter):
-    """HARD REJECT: первые покупатели получили SOL из одного источника."""
+    """HARD REJECT: early buyers received SOL from a common source."""
     name = "bundled_buy"
     weight = 0
 
@@ -567,7 +567,7 @@ class BundledBuyFilter(Filter):
         if len(early_buyers) < 3:
             return FilterResult(0, False, "too_few_buyers")
 
-        # Проверяем источник SOL для первых 5 покупателей
+        # Check the SOL source for the first 5 buyers
         funding_sources = {}
         for buyer_wallet in early_buyers[:5]:
             history = await self.source.get_wallet_history(buyer_wallet, limit=10)
@@ -576,7 +576,7 @@ class BundledBuyFilter(Filter):
                     src = tx.from_wallet
                     funding_sources.setdefault(src, []).append(buyer_wallet)
 
-        # 3+ покупателя из одного источника = bundled
+        # 3+ buyers from one source = bundled
         for src, buyers in funding_sources.items():
             if len(buyers) >= 3:
                 return FilterResult(0, True, f"bundled_from_{src[:8]}")
@@ -585,9 +585,9 @@ class BundledBuyFilter(Filter):
 
 
 class ObservationFilter(Filter):
-    """Мягкий скоринг по метрикам наблюдения (45 сек окно)."""
+    """Soft scoring on observation metrics (45 sec window)."""
     name = "observation"
-    weight = 50  # Суммарный макс из подметрик ниже
+    weight = 50  # Total max from sub-metrics below
 
     async def check(self, token, context) -> FilterResult:
         trades = context.get('observation_trades', [])
@@ -597,7 +597,7 @@ class ObservationFilter(Filter):
         buys = [t for t in trades if t.side == 'buy']
         sells = [t for t in trades if t.side == 'sell']
 
-        # --- Уникальные покупатели ---
+        # --- Unique buyers ---
         unique_buyers = set(t.wallet for t in buys)
         if len(unique_buyers) >= 10:
             score += 10; reasons.append(f"buyers_10+")
@@ -606,7 +606,7 @@ class ObservationFilter(Filter):
         else:
             score -= 10; reasons.append(f"buyers_low_{len(unique_buyers)}")
 
-        # --- Volume в SOL (не количество сделок!) ---
+        # --- Volume in SOL (not number of trades!) ---
         total_sol = sum(t.amount_sol for t in buys)
         if total_sol > 2.0:
             score += 15; reasons.append(f"volume_{total_sol:.1f}sol")
@@ -615,7 +615,7 @@ class ObservationFilter(Filter):
         else:
             score -= 5; reasons.append(f"volume_low_{total_sol:.2f}sol")
 
-        # --- Разнообразие сумм (антибот) ---
+        # --- Amount diversity (anti-bot) ---
         amounts = [round(t.amount_sol, 4) for t in buys]
         unique_amounts = len(set(amounts))
         if unique_amounts >= 4:
@@ -623,7 +623,7 @@ class ObservationFilter(Filter):
         elif unique_amounts < 2 and len(amounts) > 3:
             score -= 15; reasons.append(f"uniform_amounts_bot")
 
-        # --- Скорость кривой ---
+        # --- Curve speed ---
         if trades:
             elapsed = trades[-1].timestamp - trades[0].timestamp
             curve = context.get('curve_progress', 0)
@@ -632,12 +632,12 @@ class ObservationFilter(Filter):
                 if speed > 0.5:
                     score += 10; reasons.append(f"fast_curve")
 
-        # --- Нет ранних продаж создателя ---
+        # --- No early creator sells ---
         creator_sells = [t for t in sells if t.is_creator]
         if creator_sells:
             return FilterResult(0, True, "creator_selling_early")
 
-        # --- Один кит > 50% объёма ---
+        # --- One whale > 50% of volume ---
         if buys:
             max_buy = max(t.amount_sol for t in buys)
             if total_sol > 0 and max_buy / total_sol > 0.5:
@@ -656,7 +656,7 @@ class ObservationFilter(Filter):
 
 
 class Scorer:
-    """Двухфазная фильтрация. Precheck → Observation (если прошёл precheck)."""
+    """Two-phase filtering. Precheck → Observation (if precheck passed)."""
 
     def __init__(
         self,
@@ -671,11 +671,11 @@ class Scorer:
         self.threshold = threshold
 
     async def precheck(self, token: Token, context: dict) -> FilterEvent:
-        """Фаза 1: мгновенная фильтрация (<50мс). До наблюдения."""
+        """Phase 1: instant filtering (<50ms). Before observation."""
         return await self._run_filters(self.precheck, token, context, phase='precheck')
 
     async def evaluate(self, token: Token, context: dict) -> FilterEvent:
-        """Фаза 2: полная оценка после наблюдения. Включает precheck + observation."""
+        """Phase 2: full evaluation after observation. Includes precheck + observation."""
         return await self._run_filters(
             self.precheck + self.observation, token, context, phase='observation',
         )
@@ -710,34 +710,34 @@ class Scorer:
 
 ---
 
-## Модуль 6: PULSE — Пульсовый мониторинг + ExitManager
+## Module 6: PULSE — Pulse monitoring + ExitManager
 
-**Важно:** PulseMonitor получает трейды через stream (`source.stream_trades(mint)`), а не через polling каждые 3 секунды. Это исключает дублирование трейдов и ложные сигналы. Каждый трейд обрабатывается ровно один раз.
+**Important:** PulseMonitor receives trades via stream (`source.stream_trades(mint)`), not through polling every 3 seconds. This eliminates trade duplication and false signals. Every trade is processed exactly once.
 
 ```python
 # pulse/monitor.py + pulse/exit_manager.py
 
 @dataclass
 class PulseSnapshot:
-    buy_rate: float             # Доля покупок в окне (0.0 - 1.0)
+    buy_rate: float             # Share of buys in the window (0.0 - 1.0)
     sell_rate: float
-    new_wallet_rate: float      # Доля новых кошельков среди покупателей
-    avg_buy_size_sol: float     # Средний размер покупки в SOL
-    total_sol_in: float         # Объём покупок в SOL за окно
+    new_wallet_rate: float      # Share of new wallets among buyers
+    avg_buy_size_sol: float     # Average buy size in SOL
+    total_sol_in: float         # Buy volume in SOL for the window
     creator_selling: bool
-    whale_exit: bool            # Продажа > 1 SOL
+    whale_exit: bool            # Sell > 1 SOL
 
-    # ТРЕНД (сравнение с предыдущим окном)
+    # TREND (comparison with previous window)
     buy_rate_trend: str         # 'rising' | 'stable' | 'declining'
     buy_size_trend: str         # 'rising' | 'stable' | 'declining'
-    trend_declining_count: int  # Сколько окон подряд declining
-    trend_dying: bool           # declining >= 2 окна подряд
+    trend_declining_count: int  # How many consecutive declining windows
+    trend_dying: bool           # declining >= 2 consecutive windows
 
-    curve_progress: float       # % заполнения bonding curve
+    curve_progress: float       # % of bonding curve filled
 
 
 class PulseMonitor:
-    """Скользящее окно событий с трендовым анализом."""
+    """Sliding event window with trend analysis."""
 
     def __init__(self, window_size: int = 20, min_events: int = 5):
         self.window: deque[Trade] = deque(maxlen=window_size)
@@ -757,7 +757,7 @@ class PulseMonitor:
         buy_rate = len(buys) / len(self.window)
         sell_rate = len(sells) / len(self.window)
 
-        # Новые кошельки
+        # New wallets
         new_wallets = set()
         for t in buys:
             if t.wallet not in self.seen_wallets:
@@ -765,11 +765,11 @@ class PulseMonitor:
         self.seen_wallets.update(t.wallet for t in self.window)
         new_wallet_rate = len(new_wallets) / max(len(buys), 1)
 
-        # Средний размер в SOL
+        # Average size in SOL
         avg_buy = sum(t.amount_sol for t in buys) / max(len(buys), 1)
         total_sol = sum(t.amount_sol for t in buys)
 
-        # Тренд
+        # Trend
         buy_rate_trend = self._trend(buy_rate, self.prev_buy_rate)
         buy_size_trend = self._trend(avg_buy, self.prev_avg_buy_size)
 
@@ -808,7 +808,7 @@ class PulseMonitor:
 
 
 class ExitManager:
-    """Решает когда и сколько продавать на основе пульса."""
+    """Decides when and how much to sell based on the pulse."""
 
     def __init__(self, cfg: 'Config'):
         self.cfg = cfg
@@ -818,7 +818,7 @@ class ExitManager:
 
     def decide(self, pulse: PulseSnapshot, pnl_pct: float, elapsed_sec: float) -> PulseEvent:
 
-        # === ЖЁСТКИЕ ВЫХОДЫ — 100% ===
+        # === HARD EXITS — 100% ===
 
         if pulse.creator_selling:
             return self._sell_all("creator_dump")
@@ -847,19 +847,19 @@ class ExitManager:
         if elapsed_sec > self.cfg.max_hold_seconds:
             return self._sell_all("timeout")
 
-        # === ЧАСТИЧНЫЕ ВЫХОДЫ ===
+        # === PARTIAL EXITS ===
 
         available = self.remaining_pct - self.cfg.moonbag_pct
         if available <= 0.01:
             return self._hold()
 
-        # Сильный профит → зафиксировать 30%
+        # Strong profit → lock in 30%
         if pnl_pct > self.cfg.partial_sell_profit_threshold * 100 and not self.has_taken_profit:
             sell_pct = min(self.cfg.partial_sell_on_profit_pct, available)
             self.has_taken_profit = True
             return self._sell_partial(sell_pct, "strong_profit")
 
-        # Пульс слабеет + профит → продать 50%
+        # Weakening pulse + profit → sell 50%
         if pulse.buy_rate < self.cfg.pulse_weak_buy_rate and pnl_pct > 50:
             sell_pct = min(self.cfg.partial_sell_on_weak_pulse_pct, available)
             return self._sell_partial(sell_pct, "weak_pulse_profit")
@@ -892,17 +892,17 @@ class ExitManager:
 
 ---
 
-## Модуль 7: PORTFOLIO — Управление позициями и балансом
+## Module 7: PORTFOLIO — Position and balance management
 
-Отдельный модуль для учёта баланса, позиций, ордеров. Не размазано по engine.
+A separate module for accounting balance, positions, orders. Not spread across the engine.
 
-**Ключевые отличия от v2:**
-- **Reserve/commit/release** — при создании buy-команды средства резервируются, при fill — коммитятся, при fail — возвращаются. Защита от race conditions при параллельных SignalEvent.
-- **Персистентность** — каждое изменение состояния пишется в SQLite. При рестарте Portfolio восстанавливается из БД.
-- **Явные количества** — buy команда содержит `quote_amount_sol`, sell команда содержит `base_amount_tokens`. Никаких неявных пересчётов.
+**Key differences from v2:**
+- **Reserve/commit/release** — when a buy command is created, funds are reserved; on fill they are committed; on fail they are returned. Protection against race conditions on parallel SignalEvent.
+- **Persistence** — every state change is written to SQLite. On restart, Portfolio is restored from the DB.
+- **Explicit amounts** — the buy command contains `quote_amount_sol`, the sell command contains `base_amount_tokens`. No implicit recalculations.
 
 ```python
-# portfolio.py (корень пакета)
+# portfolio.py (package root)
 
 class Portfolio:
     def __init__(self, db: 'Database', clock: Clock, initial_balance: float,
@@ -910,7 +910,7 @@ class Portfolio:
         self.db = db
         self.clock = clock
         self.balance: float = initial_balance
-        self.reserved: float = 0.0              # Зарезервировано под pending buy orders
+        self.reserved: float = 0.0              # Reserved for pending buy orders
         self.positions: dict[str, Position] = {}
         self.history: list[TradeResult] = []
         self.max_positions = max_positions
@@ -918,7 +918,7 @@ class Portfolio:
 
     @classmethod
     def restore(cls, db: 'Database', clock: Clock, cfg: 'Config') -> 'Portfolio':
-        """Восстановление из SQLite после рестарта. Читает open positions, pending orders, balance."""
+        """Restore from SQLite after restart. Reads open positions, pending orders, balance."""
         portfolio = cls(db, clock, cfg.initial_balance_sol, cfg.max_open_positions, cfg.buy_amount_sol)
         portfolio.positions = db.load_open_positions()
         portfolio.balance = db.load_balance()
@@ -928,24 +928,24 @@ class Portfolio:
 
     @property
     def available_balance(self) -> float:
-        """Доступный баланс = общий - зарезервированный."""
+        """Available balance = total - reserved."""
         return self.balance - self.reserved
 
     def can_open(self) -> bool:
-        """Есть бюджет и слот под новую позицию?"""
+        """Is there budget and a slot for a new position?"""
         return (
             len(self.positions) < self.max_positions
             and self.available_balance >= self.buy_amount
         )
 
     def create_buy_command(self, signal: SignalEvent) -> PlaceBuyCommand | None:
-        """SignalEvent → PlaceBuyCommand. Резервирует средства атомарно."""
+        """SignalEvent → PlaceBuyCommand. Reserves funds atomically."""
         if not self.can_open():
             return None
         if signal.token.mint in self.positions:
             return None
 
-        # Reserve — деньги заблокированы до fill или fail
+        # Reserve — money is locked until fill or fail
         reservation_id = uuid.uuid4().hex[:12]
         self.reserved += self.buy_amount
         self.db.save_reservation(reservation_id, self.buy_amount)
@@ -961,7 +961,7 @@ class Portfolio:
         )
 
     def on_buy_fill(self, fill: FillEvent, reservation_id: str):
-        """Commit: обновить баланс и открыть позицию после покупки."""
+        """Commit: update balance and open position after purchase."""
         # Release reservation, deduct actual cost
         self.reserved -= self.buy_amount
         self.balance -= (fill.quote_amount_sol + fill.fee_sol)
@@ -985,13 +985,13 @@ class Portfolio:
         self.db.save_balance(self.balance, self.reserved)
 
     def on_buy_fail(self, reservation_id: str):
-        """Release: вернуть зарезервированные средства при ошибке исполнения."""
+        """Release: return reserved funds on execution error."""
         self.reserved -= self.buy_amount
         self.db.delete_reservation(reservation_id)
         self.db.save_balance(self.balance, self.reserved)
 
     def create_sell_command(self, pulse_event: PulseEvent) -> PlaceSellCommand | None:
-        """PulseEvent → PlaceSellCommand с явным количеством токенов."""
+        """PulseEvent → PlaceSellCommand with explicit token amount."""
         pos = self.positions.get(pulse_event.mint)
         if not pos:
             return None
@@ -1001,12 +1001,12 @@ class Portfolio:
             correlation_id=pulse_event.correlation_id,
             mint=pulse_event.mint,
             symbol=pos.symbol,
-            base_amount_tokens=sell_tokens,     # Явно! Не amount_sol
+            base_amount_tokens=sell_tokens,     # Explicit! Not amount_sol
             reason=pulse_event.reason,
         )
 
     def on_sell_fill(self, fill: FillEvent):
-        """Обновить баланс и позицию после продажи."""
+        """Update balance and position after sale."""
         pos = self.positions.get(fill.mint)
         if not pos:
             return
@@ -1042,16 +1042,16 @@ class Portfolio:
 
 ---
 
-## Модуль 8: EXECUTION — Исполнение ордеров
+## Module 8: EXECUTION — Order execution
 
-**Ключевые отличия от v2:**
-- Принимает `Command` (PlaceBuyCommand / PlaceSellCommand), а не OrderEvent
-- Buy использует `quote_amount_sol`, sell использует `base_amount_tokens` — явные поля, без путаницы
-- Execution Worker — отдельная `asyncio.Task` с `Semaphore`, не блокирует event processor
-- Каждая попытка исполнения записывается в SQLite (`execution_attempts`)
+**Key differences from v2:**
+- Accepts `Command` (PlaceBuyCommand / PlaceSellCommand), not OrderEvent
+- Buy uses `quote_amount_sol`, sell uses `base_amount_tokens` — explicit fields, no confusion
+- Execution Worker — a separate `asyncio.Task` with `Semaphore`, does not block the event processor
+- Every execution attempt is written to SQLite (`execution_attempts`)
 
 ```python
-# execution.py (корень пакета)
+# execution.py (package root)
 
 class ExecutionHandler(ABC):
     @abstractmethod
@@ -1060,7 +1060,7 @@ class ExecutionHandler(ABC):
 
 
 class SimulatedExecution(ExecutionHandler):
-    """Бэктест: исполняет мгновенно + модель slippage по bonding curve."""
+    """Backtest: executes instantly + bonding-curve slippage model."""
 
     def __init__(self, source: DataSource, launchpad: Launchpad, clock: Clock):
         self.source = source
@@ -1113,7 +1113,7 @@ class SimulatedExecution(ExecutionHandler):
 
 
 class LiveExecution(ExecutionHandler):
-    """Прод: реальная Solana транзакция."""
+    """Production: real Solana transaction."""
 
     def __init__(self, launchpad: Launchpad, clock: Clock, rpc_client, keypair, db: 'Database'):
         self.launchpad = launchpad
@@ -1132,8 +1132,8 @@ class LiveExecution(ExecutionHandler):
                 command.mint, command.base_amount_tokens, self.keypair,
             )
 
-        # Отправка с retry, каждая попытка логируется
-        for attempt in range(2):  # Max 2 попытки (не 3 — бережём время)
+        # Send with retry, every attempt is logged
+        for attempt in range(2):  # Max 2 attempts (not 3 — save time)
             self.db.log_execution_attempt(command.command_id, attempt)
             try:
                 sig = await self.rpc.send_transaction(tx)
@@ -1148,7 +1148,7 @@ class LiveExecution(ExecutionHandler):
             correlation_id=command.correlation_id,
             mint=command.mint, symbol=command.symbol,
             side='buy' if isinstance(command, PlaceBuyCommand) else 'sell',
-            price=...,      # Из результата tx
+            price=...,      # From tx result
             quote_amount_sol=...,
             base_amount_tokens=...,
             fee_sol=..., slippage_pct=...,
@@ -1157,7 +1157,7 @@ class LiveExecution(ExecutionHandler):
 
 
 class ExecutionWorker:
-    """Отдельный worker для исполнения команд. Не блокирует event processor."""
+    """Separate worker for executing commands. Does not block the event processor."""
 
     def __init__(self, handler: ExecutionHandler, max_concurrent: int = 2):
         self.handler = handler
@@ -1165,11 +1165,11 @@ class ExecutionWorker:
         self._queue: asyncio.Queue[Command] = asyncio.Queue()
 
     async def submit(self, command: Command) -> None:
-        """Положить команду в очередь исполнения."""
+        """Put a command into the execution queue."""
         await self._queue.put(command)
 
     async def run(self, on_fill: Callable, on_fail: Callable) -> None:
-        """Основной цикл worker'а. Запускается как отдельная asyncio.Task."""
+        """Main worker loop. Runs as a separate asyncio.Task."""
         while True:
             command = await self._queue.get()
             async with self._semaphore:
@@ -1183,18 +1183,18 @@ class ExecutionWorker:
 
 ---
 
-## Модуль 9: ENGINE — Главный цикл
+## Module 9: ENGINE — Main loop
 
-Event-driven цикл. Все модули общаются через `asyncio.Queue`.
+Event-driven loop. All modules communicate through `asyncio.Queue`.
 
-**Ключевые отличия от v2:**
-- Execution вынесен в отдельный `ExecutionWorker` — не блокирует event processor
-- Token handler ограничен `Semaphore` — bounded concurrency, не взрывает память
-- Pulse monitor использует `stream_trades()` — stream вместо polling, каждый трейд ровно раз
-- Все time-зависимые операции через `self.clock` — бэктест детерминированный
+**Key differences from v2:**
+- Execution moved out into a separate `ExecutionWorker` — does not block the event processor
+- Token handler is bounded by `Semaphore` — bounded concurrency, does not blow up memory
+- Pulse monitor uses `stream_trades()` — stream instead of polling, every trade exactly once
+- All time-dependent operations go through `self.clock` — backtest is deterministic
 
 ```python
-# engine.py (корень пакета)
+# engine.py (package root)
 
 class PulseBot:
     def __init__(
@@ -1217,10 +1217,10 @@ class PulseBot:
         self.cfg = config
         self.db = db
         self.event_queue: asyncio.Queue = asyncio.Queue()
-        self._token_semaphore = asyncio.Semaphore(10)  # Max 10 токенов одновременно
+        self._token_semaphore = asyncio.Semaphore(10)  # Max 10 tokens concurrently
 
     async def run(self):
-        """Запуск: слушатель + обработчик + execution worker параллельно."""
+        """Startup: listener + processor + execution worker in parallel."""
         await asyncio.gather(
             self._token_listener(),
             self._event_processor(),
@@ -1231,25 +1231,25 @@ class PulseBot:
         )
 
     async def _token_listener(self):
-        """Слушает новые токены → кидает в очередь."""
+        """Listens for new tokens → puts them on the queue."""
         async for token_event in self.source.stream_new_tokens():
             self.db.log_event(token_event)
             await self.event_queue.put(token_event)
 
     async def _event_processor(self):
-        """Обрабатывает события. НЕ исполняет ордера — это делает ExecutionWorker."""
+        """Processes events. Does NOT execute orders — ExecutionWorker does."""
         while True:
             event = await self.event_queue.get()
             self.db.log_event(event)
 
             if isinstance(event, TokenEvent):
-                # Bounded concurrency через semaphore
+                # Bounded concurrency via semaphore
                 asyncio.create_task(self._handle_token_bounded(event))
 
             elif isinstance(event, SignalEvent):
                 command = self.portfolio.create_buy_command(event)
                 if command:
-                    await self.exec_worker.submit(command)  # Не блокирует!
+                    await self.exec_worker.submit(command)  # Non-blocking!
 
             elif isinstance(event, PulseEvent):
                 if event.action in ('sell_all', 'sell_partial'):
@@ -1258,7 +1258,7 @@ class PulseBot:
                         await self.exec_worker.submit(command)
 
     async def _on_fill(self, fill: FillEvent, command: Command):
-        """Callback от ExecutionWorker при успешном исполнении."""
+        """Callback from ExecutionWorker on successful execution."""
         self.db.log_event(fill)
         if fill.side == 'buy':
             self.portfolio.on_buy_fill(fill, command.reservation_id)
@@ -1267,34 +1267,34 @@ class PulseBot:
             self.portfolio.on_sell_fill(fill)
 
     async def _on_execution_fail(self, command: Command, error: Exception):
-        """Callback от ExecutionWorker при ошибке — возвращаем резервацию."""
+        """Callback from ExecutionWorker on error — return the reservation."""
         if isinstance(command, PlaceBuyCommand):
             self.portfolio.on_buy_fail(command.reservation_id)
         structlog.get_logger().error("execution_failed", command=command, error=str(error))
 
     async def _handle_token_bounded(self, token_event: TokenEvent):
-        """Обработка токена с bounded concurrency."""
+        """Token handling with bounded concurrency."""
         async with self._token_semaphore:
             await self._handle_token(token_event)
 
     async def _handle_token(self, token_event: TokenEvent):
-        """Обработка нового токена: precheck → наблюдение → полная оценка → signal."""
+        """Handle a new token: precheck → observation → full evaluation → signal."""
         token = token_event.token
         corr_id = token_event.correlation_id
 
-        # Собираем контекст для precheck фильтров
+        # Collect context for precheck filters
         context = {}
         context['token_info'] = await self.source.get_token_info(token.mint)
         context['creator_stats'] = self.db.get_creator_stats(token.creator)
 
-        # Фаза 1: Precheck (мгновенная, <50мс)
+        # Phase 1: Precheck (instant, <50ms)
         precheck_result = await self.scorer.precheck(token, context)
         precheck_result.correlation_id = corr_id
         await self.event_queue.put(precheck_result)
         if precheck_result.hard_rejected:
             return
 
-        # Наблюдение (30-90 сек) — через Clock, не asyncio.sleep!
+        # Observation (30-90 sec) — via Clock, not asyncio.sleep!
         await self.clock.sleep(self.cfg.observe_seconds)
 
         observation_trades = await self.source.get_trades(
@@ -1309,7 +1309,7 @@ class PulseBot:
         if observation_trades:
             context['curve_progress'] = observation_trades[-1].curve_progress_pct
 
-        # Фаза 2: Полная фильтрация (precheck + observation)
+        # Phase 2: Full filtering (precheck + observation)
         full_result = await self.scorer.evaluate(token, context)
         full_result.correlation_id = corr_id
         await self.event_queue.put(full_result)
@@ -1328,7 +1328,7 @@ class PulseBot:
             ))
 
     async def _monitor_pulse(self, mint: str, correlation_id: str):
-        """Мониторинг пульса: stream-based, каждый трейд ровно один раз."""
+        """Pulse monitoring: stream-based, every trade exactly once."""
         pos = self.portfolio.positions.get(mint)
         if not pos:
             return
@@ -1339,7 +1339,7 @@ class PulseBot:
         )
         exit_mgr = ExitManager(self.cfg)
 
-        # Stream — не polling! Каждый трейд обрабатывается ровно один раз.
+        # Stream — not polling! Every trade is processed exactly once.
         async for trade in self.source.stream_trades(mint):
             if mint not in self.portfolio.positions:
                 break
@@ -1365,10 +1365,10 @@ class PulseBot:
 
 ---
 
-## Модуль 10: CONFIG
+## Module 10: CONFIG
 
 ```python
-# config.py (корень пакета)
+# config.py (package root)
 
 @dataclass
 class LaunchpadConfig:
@@ -1388,22 +1388,22 @@ PUMPFUN_CONFIG = LaunchpadConfig(
 
 @dataclass
 class Config:
-    # === БЮДЖЕТ ===
+    # === BUDGET ===
     initial_balance_sol: float = 0.15
     buy_amount_sol: float = 0.03
     max_open_positions: int = 3
 
-    # === НАБЛЮДЕНИЕ ===
+    # === OBSERVATION ===
     observe_seconds: int = 45
     score_threshold: int = 20
 
-    # === ФИЛЬТРЫ СОЗДАТЕЛЯ ===
+    # === CREATOR FILTERS ===
     min_creator_wallet_age_hours: int = 24
     min_creator_graduation_rate: float = 0.01
     max_creator_dead_tokens: int = 10
     require_socials: bool = False
 
-    # === ПУЛЬС ===
+    # === PULSE ===
     pulse_window_size: int = 20
     pulse_min_events: int = 5
     pulse_dead_buy_rate: float = 0.10
@@ -1412,7 +1412,7 @@ class Config:
     pulse_no_new_wallets_events: int = 5
     pulse_near_graduation_pct: float = 70.0
 
-    # === ВЫХОДЫ ===
+    # === EXITS ===
     partial_sell_on_weak_pulse_pct: float = 0.50
     partial_sell_on_profit_pct: float = 0.30
     partial_sell_profit_threshold: float = 2.0
@@ -1420,15 +1420,15 @@ class Config:
     hard_stop_loss_pct: float = 0.50
     max_hold_seconds: int = 7200
 
-    # === ЛОНЧПАД ===
+    # === LAUNCHPAD ===
     launchpad: LaunchpadConfig = field(default_factory=lambda: PUMPFUN_CONFIG)
 
-    # === ИНФРА ===
+    # === INFRA ===
     rpc_url: str = ""
     db_path: str = "pulse_bot.db"
     log_level: str = "INFO"
 
-# Пресеты
+# Presets
 CONSERVATIVE = Config(observe_seconds=60, score_threshold=30, pulse_dead_buy_rate=0.15, hard_stop_loss_pct=0.30)
 MODERATE = Config()
 AGGRESSIVE = Config(observe_seconds=30, score_threshold=10, pulse_dead_buy_rate=0.05, hard_stop_loss_pct=0.70)
@@ -1437,12 +1437,12 @@ AGGRESSIVE = Config(observe_seconds=30, score_threshold=10, pulse_dead_buy_rate=
 
 ---
 
-## SQLite схема
+## SQLite schema
 
-**Отличия от v2:** добавлены `positions`, `fills`, `reservations`, `execution_attempts` для персистентного состояния. Бот восстанавливается после рестарта. Event log расширен `event_id` и `correlation_id`.
+**Differences from v2:** added `positions`, `fills`, `reservations`, `execution_attempts` for persistent state. The bot recovers after a restart. The event log is extended with `event_id` and `correlation_id`.
 
 ```sql
--- Токены (данные для бэктеста)
+-- Tokens (data for backtest)
 CREATE TABLE tokens (
     mint TEXT PRIMARY KEY,
     name TEXT, symbol TEXT, creator TEXT,
@@ -1452,7 +1452,7 @@ CREATE TABLE tokens (
     graduated INTEGER DEFAULT 0
 );
 
--- Сделки (данные для бэктеста и observation)
+-- Trades (data for backtest and observation)
 CREATE TABLE trades (
     tx_sig TEXT PRIMARY KEY,
     mint TEXT, wallet TEXT, side TEXT,
@@ -1461,7 +1461,7 @@ CREATE TABLE trades (
     timestamp REAL, is_creator INTEGER
 );
 
--- Кеш создателей
+-- Creator cache
 CREATE TABLE creators (
     wallet TEXT PRIMARY KEY,
     total_tokens INTEGER, graduated_tokens INTEGER,
@@ -1469,9 +1469,9 @@ CREATE TABLE creators (
     blacklisted INTEGER DEFAULT 0
 );
 
--- === ПЕРСИСТЕНТНОЕ СОСТОЯНИЕ (новое в v3) ===
+-- === PERSISTENT STATE (new in v3) ===
 
--- Открытые позиции (восстанавливаются при рестарте)
+-- Open positions (restored on restart)
 CREATE TABLE positions (
     mint TEXT PRIMARY KEY,
     symbol TEXT,
@@ -1485,28 +1485,28 @@ CREATE TABLE positions (
     status TEXT DEFAULT 'open'        -- 'open' | 'closed'
 );
 
--- Все исполненные сделки
+-- All executed trades
 CREATE TABLE fills (
-    fill_id TEXT PRIMARY KEY,         -- event_id из FillEvent
+    fill_id TEXT PRIMARY KEY,         -- event_id from FillEvent
     mint TEXT, symbol TEXT, side TEXT,
     price REAL,
     quote_amount_sol REAL,
     base_amount_tokens REAL,
     fee_sol REAL, slippage_pct REAL,
     tx_sig TEXT,
-    command_id TEXT,                   -- ID команды
-    correlation_id TEXT,              -- Цепочка от TokenEvent
+    command_id TEXT,                   -- Command ID
+    correlation_id TEXT,              -- Chain from TokenEvent
     timestamp REAL
 );
 
--- Резервации баланса (pending buy orders)
+-- Balance reservations (pending buy orders)
 CREATE TABLE reservations (
     reservation_id TEXT PRIMARY KEY,
     amount_sol REAL,
     created_at REAL
 );
 
--- Попытки исполнения (для отладки live)
+-- Execution attempts (for live debugging)
 CREATE TABLE execution_attempts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     command_id TEXT,
@@ -1516,25 +1516,25 @@ CREATE TABLE execution_attempts (
     timestamp REAL
 );
 
--- Баланс (восстанавливается при рестарте)
+-- Balance (restored on restart)
 CREATE TABLE balance (
-    id INTEGER PRIMARY KEY CHECK (id = 1),  -- Только одна строка
+    id INTEGER PRIMARY KEY CHECK (id = 1),  -- Only one row
     balance_sol REAL,
     reserved_sol REAL,
     updated_at REAL
 );
 
--- Лог ВСЕХ событий (для реплея и отладки)
+-- Log of ALL events (for replay and debugging)
 CREATE TABLE event_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_id TEXT,                     -- Уникальный ID события
-    correlation_id TEXT,               -- Цепочка от TokenEvent
+    event_id TEXT,                     -- Unique event ID
+    correlation_id TEXT,               -- Chain from TokenEvent
     event_type TEXT,                   -- 'token' | 'filter' | 'signal' | 'command' | 'fill' | 'pulse'
-    data TEXT,                         -- JSON сериализованный Event/Command
+    data TEXT,                         -- JSON-serialized Event/Command
     timestamp REAL
 );
 
--- Индексы
+-- Indexes
 CREATE INDEX idx_trades_mint_ts ON trades(mint, timestamp);
 CREATE INDEX idx_tokens_created ON tokens(created_at);
 CREATE INDEX idx_events_ts ON event_log(timestamp);
@@ -1546,29 +1546,29 @@ CREATE INDEX idx_positions_status ON positions(status);
 
 ---
 
-## CLI и режимы
+## CLI and modes
 
 ```bash
-# 1. Собрать исторические данные
+# 1. Collect historical data
 python main.py collect --days 7
 
-# 2. Бэктест с дефолтными настройками
+# 2. Backtest with default settings
 python main.py backtest
 
-# 3. Бэктест с агрессивным пресетом
+# 3. Backtest with the aggressive preset
 python main.py backtest --preset aggressive
 
-# 4. Grid search оптимизация
+# 4. Grid-search optimization
 python main.py optimize
 
-# 5. Paper trading (всё реально кроме транзакций)
+# 5. Paper trading (everything real except transactions)
 python main.py paper
 
-# 6. Боевой режим
+# 6. Live mode
 python main.py live
 ```
 
-Разница между режимами — Clock, Source, Execution:
+The difference between modes is Clock, Source, Execution:
 
 ```python
 if mode == 'backtest':
@@ -1584,7 +1584,7 @@ elif mode in ('live', 'paper'):
         else SimulatedExecution(source, launchpad, clock)
     )
 
-# Portfolio восстанавливается из SQLite при рестарте
+# Portfolio is restored from SQLite on restart
 portfolio = Portfolio.restore(db, clock, cfg) if mode != 'backtest' else Portfolio(db, clock, ...)
 
 exec_worker = ExecutionWorker(execution, max_concurrent=2)
@@ -1595,98 +1595,98 @@ asyncio.run(bot.run())
 
 ---
 
-## План разработки
+## Development plan
 
 ```
-НЕДЕЛЯ 1 — ФУНДАМЕНТ:
-  Вечер 1: models.py + events.py + commands.py + config.py
-           Все dataclass: Token, Trade, Position, PulseSnapshot, TradeResult
-           Events: TokenEvent, FilterEvent, SignalEvent, FillEvent, PulseEvent
-           Commands: PlaceBuyCommand, PlaceSellCommand
-           Config + LaunchpadConfig + пресеты
+WEEK 1 — FOUNDATION:
+  Evening 1: models.py + events.py + commands.py + config.py
+             All dataclasses: Token, Trade, Position, PulseSnapshot, TradeResult
+             Events: TokenEvent, FilterEvent, SignalEvent, FillEvent, PulseEvent
+             Commands: PlaceBuyCommand, PlaceSellCommand
+             Config + LaunchpadConfig + presets
 
-  Вечер 2: clock.py + db.py + sources/base.py + sources/backtest.py
-           Clock ABC + RealClock + SimulatedClock
-           SQLite схема (tokens, trades, creators, positions, fills, event_log, balance)
-           DataSource ABC + BacktestSource (чтение из SQLite + SimulatedClock)
+  Evening 2: clock.py + db.py + sources/base.py + sources/backtest.py
+             Clock ABC + RealClock + SimulatedClock
+             SQLite schema (tokens, trades, creators, positions, fills, event_log, balance)
+             DataSource ABC + BacktestSource (read from SQLite + SimulatedClock)
 
-  Вечер 3: launchpads/base.py + launchpads/pumpfun.py
-           Launchpad ABC (ws, parse, build_tx, curve, graduation, antiscam)
-           PumpFun (парсинг create/trade, bonding curve формула, ws_subscribe_trades)
+  Evening 3: launchpads/base.py + launchpads/pumpfun.py
+             Launchpad ABC (ws, parse, build_tx, curve, graduation, antiscam)
+             PumpFun (create/trade parsing, bonding curve formula, ws_subscribe_trades)
 
-  Вечер 4: collector.py
-           Bitquery GraphQL → SQLite (токены + сделки за 7 дней)
-           Запуск сбора данных
+  Evening 4: collector.py
+             Bitquery GraphQL → SQLite (tokens + trades for 7 days)
+             Run data collection
 
-НЕДЕЛЯ 2 — МОЗГИ:
-  Вечер 1: filters/base.py + filters/authority.py + filters/creator.py
-           Filter ABC + FilterResult + AuthorityFilter + CreatorFilter
+WEEK 2 — BRAINS:
+  Evening 1: filters/base.py + filters/authority.py + filters/creator.py
+             Filter ABC + FilterResult + AuthorityFilter + CreatorFilter
 
-  Вечер 2: filters/bundled_buy.py + filters/observation.py + filters/scorer.py
-           BundledBuyFilter + ObservationFilter (volume SOL, unique buyers, diversity)
-           Scorer (двухфазный: precheck_filters + observation_filters)
+  Evening 2: filters/bundled_buy.py + filters/observation.py + filters/scorer.py
+             BundledBuyFilter + ObservationFilter (volume SOL, unique buyers, diversity)
+             Scorer (two-phase: precheck_filters + observation_filters)
 
-  Вечер 3: pulse/monitor.py + pulse/exit_manager.py
-           PulseMonitor (stream-based, last_seen курсор, тренд declining/rising/stable)
-           ExitManager (частичные выходы + moonbag)
+  Evening 3: pulse/monitor.py + pulse/exit_manager.py
+             PulseMonitor (stream-based, last_seen cursor, trend declining/rising/stable)
+             ExitManager (partial exits + moonbag)
 
-  Вечер 4: portfolio.py + execution.py
-           Portfolio (reserve/commit/release, персистентность, restore)
-           ExecutionHandler ABC + SimulatedExecution + ExecutionWorker
+  Evening 4: portfolio.py + execution.py
+             Portfolio (reserve/commit/release, persistence, restore)
+             ExecutionHandler ABC + SimulatedExecution + ExecutionWorker
 
-НЕДЕЛЯ 3 — СБОРКА:
-  Вечер 1: engine.py
-           PulseBot (event loop, execution worker, bounded concurrency)
-           Склейка всех модулей через Clock
+WEEK 3 — INTEGRATION:
+  Evening 1: engine.py
+             PulseBot (event loop, execution worker, bounded concurrency)
+             Wiring all modules via Clock
 
-  Вечер 2: report.py + main.py
-           P&L отчёт (win rate, profit factor, drawdown, exit reasons)
-           CLI: collect / backtest / paper / live
+  Evening 2: report.py + main.py
+             P&L report (win rate, profit factor, drawdown, exit reasons)
+             CLI: collect / backtest / paper / live
 
-  Вечер 3: Первый бэктест
-           Прогон на данных за 7 дней. Анализ результатов.
-           Подкрутка порогов скоринга.
+  Evening 3: First backtest
+             Run on 7 days of data. Analyze results.
+             Tune scoring thresholds.
 
-  Вечер 4: Grid search
-           Перебор: observe_seconds × score_threshold × pulse_dead × hard_sl
-           Найти лучшую комбинацию параметров.
+  Evening 4: Grid search
+             Sweep: observe_seconds × score_threshold × pulse_dead × hard_sl
+             Find the best parameter combination.
 
-НЕДЕЛЯ 4 — ПРОД:
-  Вечер 1: sources/live.py
-           WebSocket подключение к Pump.fun + stream_trades
-           Запись всех данных в SQLite (для будущих бэктестов)
+WEEK 4 — PRODUCTION:
+  Evening 1: sources/live.py
+             WebSocket connection to Pump.fun + stream_trades
+             Record all data into SQLite (for future backtests)
 
-  Вечер 2: execution.py (LiveExecution)
-           Реальные buy/sell транзакции на devnet
-           Тест на devnet (фейковые SOL)
+  Evening 2: execution.py (LiveExecution)
+             Real buy/sell transactions on devnet
+             Test on devnet (fake SOL)
 
-  Вечер 3: Paper trading mainnet
-           LiveSource + SimulatedExecution + Portfolio.restore()
-           Реальные данные, виртуальные сделки, восстановление при рестарте
+  Evening 3: Paper trading mainnet
+             LiveSource + SimulatedExecution + Portfolio.restore()
+             Real data, virtual trades, recovery on restart
 
-  Вечер 4: Боевой режим
-           Live с 0.15 SOL (~$20)
-           Мониторинг, алерты
+  Evening 4: Live mode
+             Live with 0.15 SOL (~$20)
+             Monitoring, alerts
 
-ПОТОМ:
-  Неделя 5: LetsBonk (launchpads/letsbonk.py — свои эвристики, graduation)
-  Неделя 6: Believe (launchpads/believe.py — динамическая кривая, анти-снайпер)
-  Неделя 7: Smart Wallets модуль (отдельный Source или доп. listener)
-  Неделя 8: Telegram алерты (уведомления о сделках)
+LATER:
+  Week 5: LetsBonk (launchpads/letsbonk.py — own heuristics, graduation)
+  Week 6: Believe (launchpads/believe.py — dynamic curve, anti-sniper)
+  Week 7: Smart Wallets module (separate Source or additional listener)
+  Week 8: Telegram alerts (trade notifications)
 ```
 
 
 ---
 
-## Метрики успеха
+## Success metrics
 
-Бот прибыльный если за неделю:
+The bot is profitable if over a week:
 
-- **Win rate > 35%** (при ассиметричной ставке этого достаточно)
-- **Average win > 2× average loss** (ассиметрия)
+- **Win rate > 35%** (sufficient given the asymmetric bet)
+- **Average win > 2× average loss** (asymmetry)
 - **Profit factor > 1.5** (gross profit / gross loss)
-- **Max drawdown < 50% депозита**
-- **Токенов отфильтровано > 95%** (покупаем < 5% увиденного)
-- **Slippage реальный vs модельный < 2%** (валидация SimulatedExecution)
+- **Max drawdown < 50% of deposit**
+- **Tokens filtered out > 95%** (we buy < 5% of what we see)
+- **Real vs model slippage < 2%** (SimulatedExecution validation)
 
-Если метрики не выполняются после 2 недель paper trading — менять пороги или стратегию. Не лить живые деньги в убыточную систему.
+If the metrics do not hold after 2 weeks of paper trading — change thresholds or strategy. Do not pour live money into a losing system.

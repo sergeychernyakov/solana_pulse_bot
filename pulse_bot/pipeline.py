@@ -318,15 +318,33 @@ class Pipeline:
                             "meta unreadable",
                         )
                     if not _skilled:
-                        logger.warning(
-                            "Entry reg model %s DISABLED — insufficient "
-                            "skill (%s). Configs using it fall back to "
-                            "classifier-only entry (no reg-floor/ceiling "
-                            "gate).",
-                            _rp,
-                            _reason,
-                        )
-                        continue
+                        # 2026-05-18 — operator opt-in bypass via env. Same
+                        # escape hatch as EntryMLPolicy._main.py:305 for the
+                        # classifier branch. PULSE_ALLOW_DEGENERATE_MODEL=1
+                        # forces the reg head to load even when the universal
+                        # skill-gate would refuse it; the gate's verdict is
+                        # logged so operator visibility is preserved.
+                        if os.environ.get("PULSE_ALLOW_DEGENERATE_MODEL", "0") == "1":
+                            logger.warning(
+                                "Entry reg model %s skill-gate FAILED (%s) "
+                                "— LOADING ANYWAY because "
+                                "PULSE_ALLOW_DEGENERATE_MODEL=1 "
+                                "(operator opt-in; reg-floor/ceiling gates "
+                                "will fire on degenerate predictions).",
+                                _rp,
+                                _reason,
+                            )
+                        else:
+                            logger.warning(
+                                "Entry reg model %s DISABLED — insufficient "
+                                "skill (%s). Configs using it fall back to "
+                                "classifier-only entry (no reg-floor/ceiling "
+                                "gate). Set PULSE_ALLOW_DEGENERATE_MODEL=1 to "
+                                "force-load.",
+                                _rp,
+                                _reason,
+                            )
+                            continue
                     _pol = _EntryMLPolicy.from_path(_full)
                     self._reg_policies_by_path[_rp] = _pol
                     logger.info(
@@ -835,6 +853,24 @@ class Pipeline:
     ) -> None:
         """Two-phase pipeline for one token."""
         mint_short = token.mint[:12]
+
+        # 2026-05-18 — refuse to process tokens when the PumpPortal WS
+        # feed is denying subscribeTokenTrade (wallet < 0.02 SOL).
+        # Without this guard the bot keeps "entering" tokens it cannot
+        # observe; entries close at -7% via dead_token in 60s and the
+        # full A/B portfolio drifts deep red on a feed problem rather
+        # than any trading-signal problem. Replay launchpad doesn't
+        # have this gate.
+        if self._launchpad.name != "replay" and not getattr(
+            self._launchpad, "is_feed_funded", True
+        ):
+            logger.warning(
+                "SKIP token %s (%s): PumpPortal feed UNFUNDED — top up "
+                "wallet above 0.02 SOL to resume entries.",
+                token.symbol,
+                mint_short,
+            )
+            return
 
         try:
             logger.info(

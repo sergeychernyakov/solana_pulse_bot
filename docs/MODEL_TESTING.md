@@ -1,67 +1,67 @@
-# Как честно тестировать модель
+# How to honestly test the model
 
-Гайд по проверке: новая модель действительно лучше старой, или мы себя обманываем.
-
----
-
-## Главный принцип
-
-**Сравнивать модели можно только при одинаковых условиях.** Любое из этого делает сравнение нечестным:
-- Разные test sets (накопились новые данные между retrain'ами)
-- Разное число entries (`proba≥0.5` у двух моделей с разной калибровкой = разные перцентили)
-- Разный base rate в holdout (P@10% автоматически падает при меньшей base rate)
-- Разные TP/SL gates в backtest
+A guide for verifying: is the new model actually better than the old one, or are we fooling ourselves.
 
 ---
 
-## Типичные ошибки
+## Main principle
 
-### Ошибка 1: сравнение WR при разном N entries
+**Models can only be compared under identical conditions.** Any of the following makes the comparison dishonest:
+- Different test sets (new data accumulated between retrains)
+- Different number of entries (`proba≥0.5` for two models with different calibration = different percentiles)
+- Different base rate in holdout (P@10% automatically drops at a lower base rate)
+- Different TP/SL gates in backtest
 
-**Плохо:**
-> Старая модель: 1251 entries, WR 7.91%
-> Новая модель: 741 entries, WR 15.4%
-> "Новая в 2 раза лучше!"
+---
 
-Новая просто строже отбирает. **0 entries дали бы WR=undefined и 0 потерь** — это не значит что модель идеальная.
+## Typical mistakes
 
-**Хорошо:** взять top-N с одинаковым N и сравнить количество wins на одном holdout.
+### Mistake 1: comparing WR at different N entries
 
-### Ошибка 2: сравнение P@10% при разном base rate
+**Bad:**
+> Old model: 1251 entries, WR 7.91%
+> New model: 741 entries, WR 15.4%
+> "New one is 2x better!"
 
-**Плохо:**
-> P@10%: 9.36% → 6.03%, регрессия!
+The new one simply filters more strictly. **0 entries would give WR=undefined and 0 losses** — that doesn't mean the model is perfect.
 
-Если base rate упал 1.43% → 0.82% (более грязный датасет) — P@10% **обязан** упасть пропорционально.
+**Good:** take top-N with the same N and compare the number of wins on the same holdout.
 
-**Хорошо:** считать **lift** = P@10% / base_rate.
+### Mistake 2: comparing P@10% at different base rate
+
+**Bad:**
+> P@10%: 9.36% → 6.03%, regression!
+
+If base rate dropped 1.43% → 0.82% (dirtier dataset) — P@10% **must** drop proportionally.
+
+**Good:** compute **lift** = P@10% / base_rate.
 - prev: 9.36% / 1.43% = **6.55×**
-- new:  6.03% / 0.82% = **7.35×** (на самом деле ranking лучше)
+- new:  6.03% / 0.82% = **7.35×** (ranking is actually better)
 
-### Ошибка 3: economic_backtest с захардкоженными TP/SL
+### Mistake 3: economic_backtest with hardcoded TP/SL
 
-`pulse_bot.ml.daily_validation` использует **TP=50% / SL=30%** — это не live конфигурация (live SL=15, max_hold=120s). Минусовый PnL в backtest **не означает** что бот теряет деньги в paper-режиме.
+`pulse_bot.ml.daily_validation` uses **TP=50% / SL=30%** — this is not the live configuration (live SL=15, max_hold=120s). Negative PnL in backtest **does not mean** the bot is losing money in paper mode.
 
-**Хорошо:** живой `paper_trades` audit на rich за 24-48h после деплоя.
+**Good:** live `paper_trades` audit on rich for 24-48h after deploy.
 
-### Ошибка 4: разные test sets
+### Mistake 4: different test sets
 
-Между двумя retrain'ами накопились новые токены. `daily_report_entry_2026-04-25.json` гонялся на 14,899 строк, `daily_report_entry_2026-04-30.json` — на 19,755. Distribution shift делает прямое сравнение метрик бессмысленным.
+Between two retrains new tokens accumulated. `daily_report_entry_2026-04-25.json` was run on 14,899 rows, `daily_report_entry_2026-04-30.json` — on 19,755. Distribution shift makes direct metric comparison meaningless.
 
-**Хорошо:** прогнать обе модели (`entry_model.ubj` и `entry_model.ubj.prev`) на **одном** holdout.
+**Good:** run both models (`entry_model.ubj` and `entry_model.ubj.prev`) on the **same** holdout.
 
 ---
 
-## Честный протокол сравнения
+## Honest comparison protocol
 
-### 1. Top-N на shared holdout
+### 1. Top-N on shared holdout
 
 ```python
-# Загрузить обе модели
+# Load both models
 new_model = xgb.Booster(); new_model.load_model("data/ml/entry_model.ubj")
 prev_model = xgb.Booster(); prev_model.load_model("data/ml/entry_model.ubj.prev")
 
-# Один и тот же holdout (последние 20% по scored_at)
+# Same holdout (last 20% by scored_at)
 df = pd.read_parquet("data/ml/entry.parquet").sort_values("scored_at")
 test = df.iloc[int(len(df) * 0.8):]
 X = test[features].values
@@ -70,58 +70,58 @@ y = test["label"].values
 new_proba = new_model.predict(xgb.DMatrix(X, feature_names=features))
 prev_proba = prev_model.predict(xgb.DMatrix(X, feature_names=features))
 
-# Сравнить top-N wins
+# Compare top-N wins
 for N in [50, 100, 200, 500, 1000]:
     new_wins = y[np.argsort(new_proba)[::-1][:N]].sum()
     prev_wins = y[np.argsort(prev_proba)[::-1][:N]].sum()
     print(f"N={N}: prev={prev_wins} new={new_wins}")
 ```
 
-Готовый скрипт: `scripts/honest_topn_compare.py` (TODO — пока в `/tmp/honest_topn.py` на Mac).
+Ready-made script: `scripts/honest_topn_compare.py` (TODO — currently in `/tmp/honest_topn.py` on Mac).
 
-### 2. AUC на shared holdout
+### 2. AUC on shared holdout
 
-`auc` из `meta.json` посчитан на **разных** test sets. Считать AUC заново на одном holdout — даёт честное сравнение ranking quality.
+`auc` from `meta.json` is computed on **different** test sets. Recomputing AUC on a single holdout gives an honest comparison of ranking quality.
 
 ### 3. Top-N overlap
 
-Если top-100 overlap < 50% — модели **существенно разные**, рассматривать как отдельные стратегии. Если > 90% — почти эквивалент, разница между ними может быть шумом.
+If top-100 overlap < 50% — the models are **substantially different**, treat them as separate strategies. If > 90% — almost equivalent, the difference between them may be noise.
 
-### 4. Lift, не P@10%
+### 4. Lift, not P@10%
 
 ```
 lift = precision_top10 / base_rate
 ```
-Lift инвариантен к разному уровню "грязи" в holdout.
+Lift is invariant to different levels of "dirt" in holdout.
 
-### 5. Live paper audit (источник истины)
+### 5. Live paper audit (source of truth)
 
-Backtest с фиксированными TP=50/SL=30 — это **синтетика**. Реальная проверка — `scripts/live_audit.py` на rich:
+Backtest with fixed TP=50/SL=30 is **synthetic**. The real check is `scripts/live_audit.py` on rich:
 ```bash
 ssh rich
 cd /home/sergey/www/gg
 PYTHONPATH=. .venv/bin/python -m scripts.live_audit --hours 24
 ```
 
-Метрики: реализованный PnL, WR на закрытых позициях, ρ для regression модели.
+Metrics: realized PnL, WR on closed positions, ρ for regression model.
 
 ---
 
-## Что не делать
+## What not to do
 
-- **Не делать выводов на N<100 закрытых позициях** — CI95 для WR при N=100 это ±10пп, легко спутать с шумом.
-- **Не доверять одному backtest run** — economic_backtest стохастичен на симуляции exit'ов.
-- **Не сравнивать модели до feature_stability** — если фичи нестабильны (не выживают 5 random seeds), AUC случаен.
-- **Не публиковать "WR улучшился" без указания N** — это первый вопрос ревьюера.
+- **Don't draw conclusions on N<100 closed positions** — CI95 for WR at N=100 is ±10pp, easy to confuse with noise.
+- **Don't trust a single backtest run** — economic_backtest is stochastic on exit simulation.
+- **Don't compare models before feature_stability** — if features are unstable (don't survive 5 random seeds), AUC is random.
+- **Don't publish "WR improved" without stating N** — that's the reviewer's first question.
 
 ---
 
-## Минимальный чек-лист перед "новая модель лучше"
+## Minimum checklist before "the new model is better"
 
-- [ ] Top-N comparison на одном holdout (минимум N=100, 500)
-- [ ] AUC и P@10% на одном holdout (не из разных meta.json)
-- [ ] Lift × base_rate, не голый P@10%
-- [ ] Top-100 overlap указан (для контекста)
-- [ ] CI95 для каждой метрики (если N мал)
-- [ ] Live audit запланирован на 24-48h после деплоя
-- [ ] CHANGELOG entry с before/after на тех же условиях
+- [ ] Top-N comparison on one holdout (minimum N=100, 500)
+- [ ] AUC and P@10% on one holdout (not from different meta.json)
+- [ ] Lift × base_rate, not bare P@10%
+- [ ] Top-100 overlap stated (for context)
+- [ ] CI95 for each metric (if N is small)
+- [ ] Live audit scheduled for 24-48h after deploy
+- [ ] CHANGELOG entry with before/after under the same conditions

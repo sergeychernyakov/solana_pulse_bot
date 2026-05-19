@@ -188,10 +188,46 @@ configs:
     wash_cluster_size_max: 50
 
   # ── Round 2: entry-side filters ─────────────────────────────────
+  - config_id: REGFLOOR_MINUS10
+    name: "Reg-model floor -10%"
+    description: "Entry A/B (2026-05-18): permissive — block ml_override BUY only when reg-model predicts pnl_pct < -10%. Tests if reg model's most-pessimistic predictions correlate with actual losers. Requires PULSE_ALLOW_DEGENERATE_MODEL=1."
+    reg_floor_pct: -10.0
+    bot_cluster_hard_skip_n: 3
+    wash_cluster_skip_n: 2
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50
+
+  - config_id: REGFLOOR_MINUS5
+    name: "Reg-model floor -5%"
+    description: "Entry A/B (2026-05-18): mildly permissive — block ml_override BUY when reg-model predicts pnl_pct < -5%. Bridge between MINUS10 and FLOOR0 to map sensitivity curve. Requires PULSE_ALLOW_DEGENERATE_MODEL=1."
+    reg_floor_pct: -5.0
+    bot_cluster_hard_skip_n: 3
+    wash_cluster_skip_n: 2
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50
+
+  - config_id: REGFLOOR0
+    name: "Reg-model floor 0%"
+    description: "Entry A/B (2026-05-18): block ml_override BUY when reg-model predicts pnl_pct < 0. Empirical (parquet 126K rows, classifier-BUY subset 12647): keeps ~9% of trades, mean PnL +1.48%, WR 13.7%. Requires PULSE_ALLOW_DEGENERATE_MODEL=1 so reg head loads despite skill-gate."
+    reg_floor_pct: 0.0
+    bot_cluster_hard_skip_n: 3
+    wash_cluster_skip_n: 2
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50
+
   - config_id: REGFLOOR5
     name: "Reg-model floor +5%"
-    description: "Entry A/B: block ml_override BUY when reg-model predicts pnl_pct < +5%. Tests whether reg-model adds selection signal."
+    description: "Entry A/B: block ml_override BUY when reg-model predicts pnl_pct < +5%. Empirical (parquet 126K, classifier-BUY subset 12647): keeps ~1% of trades, mean PnL +9.75%, WR 31%. Very low volume — sensitivity to single trades high. Requires PULSE_ALLOW_DEGENERATE_MODEL=1."
     reg_floor_pct: 5.0
+    bot_cluster_hard_skip_n: 3
+    wash_cluster_skip_n: 2
+    wash_cluster_size_min: 5
+    wash_cluster_size_max: 50
+
+  - config_id: REGFLOOR10
+    name: "Reg-model floor +10%"
+    description: "Entry A/B (2026-05-18): strict reg-model floor. Empirical (parquet 126K): keeps ~0.008% of trades — almost no volume. Treat as upper-bound sanity check, not deployable. Requires PULSE_ALLOW_DEGENERATE_MODEL=1."
+    reg_floor_pct: 10.0
     bot_cluster_hard_skip_n: 3
     wash_cluster_skip_n: 2
     wash_cluster_size_min: 5
