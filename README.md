@@ -441,3 +441,18 @@ Sorted by **gain importance** (latest v18 retrain, 2026-04-25).
 ## Author
 
 **Sergey Chernyakov** — Telegram: [@imhotepus](https://t.me/imhotepus)
+
+---
+
+**Keywords:** Solana, pump.fun, pumpfun, memecoin, memecoin trading bot,
+Solana bot, Solana trading bot, crypto trading bot, algorithmic trading,
+sniping bot, sniper bot, pump.fun bot, pump.fun sniper, bonding curve,
+PumpPortal, Helius, Yellowstone Geyser, gRPC, WebSocket, machine learning,
+ML trading, XGBoost, survival analysis, quantile regression, entry timing,
+exit policy, A/B testing, paper trading, backtest, walk-forward,
+feature engineering, train/serve skew, model skill gate, EV-based
+threshold, schema versioning, scam wallet detection, wallet classification,
+sniper detection, smart money, holder concentration, top-N concentration,
+PostgreSQL, psycopg2, asyncpg, Streamlit dashboard, systemd, Python 3.12,
+solders, anchorpy, on-chain execution, Solana RPC, getSignaturesForAddress,
+logsSubscribe, Solana validator, mainnet-beta.
