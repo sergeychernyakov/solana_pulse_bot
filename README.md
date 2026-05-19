@@ -212,64 +212,51 @@ All are written to SQLite for analysis and backtesting:
 
 All parameters are configurable for the grid-search optimizer.
 
-## Production deployment — Rich server (192.168.3.118)
+## Production deployment (generic template)
 
 > **IMPORTANT — where things run:**
-> - **`pulse_bot monitor` (live bot)** — **rich only**, via systemd. Never run on Mac.
-> - **Mac** — dev only: backtest, optimizer sweep, ML train, analytics.
-> - **Dashboards (live + backtest)** — on rich, reachable at http://192.168.3.118:8501/8502.
-> - **Backfill** and **Solana validator** — also on rich, via systemd.
+> - **`pulse_bot monitor` (live bot)** — production host only, via systemd. Never run on a dev laptop.
+> - **Dev machine** — backtest, optimizer sweep, ML train, analytics only.
+> - **Backfill** and **Solana validator** (optional) — also on the production host, via systemd.
 
 ```bash
-# SSH alias configured in ~/.ssh/config: Host rich → 192.168.3.118 user=sergey
-ssh rich
-
-# Bot status (systemd user units)
+# Bot lifecycle (systemd user units)
 systemctl --user status pulse-bot.service
-systemctl --user status backfill.service
-systemctl --user status solana-validator.service
-systemctl --user status pulse-dashboard.service
-systemctl --user status pulse-backtest-dashboard.service
-tail -f ~/www/gg/logs/bot.log
-
-# Dashboards (live data, network-accessible):
-# http://192.168.3.118:8501  — main live monitoring
-# http://192.168.3.118:8502  — backtest / optimizer results
-
-# Bot lifecycle
 systemctl --user start pulse-bot.service
 systemctl --user restart pulse-bot.service       # after .env / code changes
 systemctl --user stop pulse-bot.service
 
+tail -f ~/solana_pulse_bot/logs/bot.log
+
 # Unit file: ~/.config/systemd/user/pulse-bot.service
-# Logs: ~/www/gg/logs/bot.log
+# Logs:      ~/solana_pulse_bot/logs/bot.log
 
-# DB on rich: PG 16, user=sergeychernyakov password=pulsebot
-PGPASSWORD=pulsebot psql -U sergeychernyakov -d pulse_bot -h localhost
+# Local PostgreSQL (replace user/password/db with your own):
+PGPASSWORD=<your_pwd> psql -U <your_user> -d pulse_bot -h localhost
 ```
 
-**Sync DB between Rich (production) and Mac (dev) — on-demand:**
+**Sync DB between production and dev — on-demand:**
 
-Rich = source of truth (bot writes 24/7 there). Mac pulls a fresh snapshot when one is needed for retrain/sweep/analysis. No cron — sync on demand.
+The production host is the source of truth (bot writes 24/7 there). The dev box pulls a fresh snapshot when one is needed for retrain / sweep / analysis. No cron — sync on demand.
 
 ```bash
-# Rich → Mac (fresh data before retrain/sweep, ~5 min for a 3 GB DB):
-ssh rich 'pg_dump -U sergeychernyakov -d pulse_bot -F c -Z 9' > /tmp/rich.dump \
-  && pg_restore --clean --no-owner -d pulse_bot /tmp/rich.dump
+# Production → dev (fresh data before retrain/sweep, ~5 min for a 3 GB DB):
+ssh <prod_host> 'pg_dump -U <user> -d pulse_bot -F c -Z 9' > /tmp/prod.dump \
+  && pg_restore --clean --no-owner -d pulse_bot /tmp/prod.dump
 
-# Mac → Rich (only for initial deploy or recovery):
+# Dev → production (only for initial deploy or recovery):
 pg_dump -d pulse_bot -F c -Z 9 -f /tmp/dump.dump
-scp /tmp/dump.dump rich:/tmp/
-ssh rich 'pg_restore -U sergeychernyakov -d pulse_bot /tmp/dump.dump'
+scp /tmp/dump.dump <prod_host>:/tmp/
+ssh <prod_host> 'pg_restore -U <user> -d pulse_bot /tmp/dump.dump'
 ```
 
-## Quick start (Mac dev)
+## Quick start (dev)
 
-> Mac is **dev only**: backtest / optimizer / ML retrain / dashboards. The live `monitor` runs only on rich (see above).
+> Dev machine is **dev only**: backtest / optimizer / ML retrain / dashboards. The live `monitor` runs only on the production host (see above).
 
 ```bash
-git clone <repo-url>
-cd gg
+git clone git@github.com:sergeychernyakov/solana_pulse_bot.git
+cd solana_pulse_bot
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -278,7 +265,7 @@ pip install xgboost psycopg2-binary asyncpg  # ML + Postgres deps (not in requir
 # IMPORTANT: always activate venv before running
 source .venv/bin/activate
 
-# Backtest against a fresh dump from rich
+# Backtest against a fresh DB snapshot
 python main.py backtest
 
 # Dashboard for viewing data
