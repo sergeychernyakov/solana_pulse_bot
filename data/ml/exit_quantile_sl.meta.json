@@ -1,0 +1,20 @@
+{
+  "objective": "reg:quantileerror",
+  "quantile": 0.25,
+  "features": [
+    "hold_seconds",
+    "current_pnl_pct",
+    "peak_pnl_pct",
+    "drawdown_from_peak",
+    "buy_rate_recent",
+    "sell_rate_recent",
+    "unique_buyers_recent",
+    "curve_progress_pct",
+    "curve_velocity_recent"
+  ],
+  "coverage": 0.24068767908309455,
+  "spearman_rho": 0.11619656833115473,
+  "train_rows": 1648,
+  "test_rows": 349,
+  "note": "Shadow-only until paired-bootstrap gate passes. Do not wire into live exit decisions via PULSE_EXIT_REGRESSION_ACTIVE=1 without 2-week shadow validation."
+}

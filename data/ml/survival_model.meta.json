@@ -1,0 +1,19 @@
+{
+  "schema_version": "survival_v1_20260425",
+  "features": [
+    "entry_score",
+    "entry_mcap_sol",
+    "entry_buyer_number",
+    "bucket_index",
+    "elapsed_seconds"
+  ],
+  "bucket_seconds": 5.0,
+  "max_horizon_seconds": 180.0,
+  "rows": 162786,
+  "positives": 451,
+  "positive_rate": 0.0027705085203887313,
+  "scale_pos_weight": 359.94456762749445,
+  "n_estimators": 200,
+  "max_depth": 4,
+  "learning_rate": 0.05
+}

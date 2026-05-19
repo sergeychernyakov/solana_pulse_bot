@@ -1,0 +1,46 @@
+{
+  "class_counts": {
+    "0": 966,
+    "1": 401,
+    "2": 28633
+  },
+  "class_names": [
+    "WAIT_MORE",
+    "BUY_NOW",
+    "SKIP"
+  ],
+  "features": [
+    "snapshot_t",
+    "unique_buyers",
+    "buy_count",
+    "sell_count",
+    "buy_volume_sol",
+    "sell_volume_sol",
+    "buy_rate",
+    "sell_pressure",
+    "buy_to_sell_count_ratio",
+    "mc_at_t",
+    "mc_growth_pct",
+    "time_since_first_buy",
+    "first_buy_sol",
+    "max_buy_sol",
+    "avg_buy_sol",
+    "creator_sold"
+  ],
+  "hparams": {
+    "learning_rate": 0.05,
+    "max_depth": 4,
+    "n_estimators": 200,
+    "random_state": 42
+  },
+  "n_rows": 30000,
+  "schema_version": "entry_timing_v1_20260425",
+  "snapshot_times_sec": [
+    15.0,
+    30.0,
+    45.0,
+    60.0,
+    75.0,
+    90.0
+  ]
+}
