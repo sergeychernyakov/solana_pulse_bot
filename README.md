@@ -6,6 +6,27 @@ Observer bot for Solana memecoin launchpads (pump.fun, letsbonk). Watches new to
 
 Backtest uses the same code as the live bot — **100% decision match** (verified on 300+ tokens).
 
+## Achieved paper-trading performance
+
+All numbers below are **paper trading** (simulated entries/exits replayed against
+on-chain trade streams) — real money was never enabled. Source: PostgreSQL
+`paper_trades` rows on the rich production server; snapshots referenced below
+were captured before each reset.
+
+| Period | Trades | Net PnL | Avg/trade | WR | Notes |
+|---|---|---|---|---|---|
+| **v21 ml_override era** (2026-04-30 → 2026-05-13, 13 days) | 2158 closed | **+3.98 SOL** | +0.0018 SOL | — | Cumulative, snapshot `paper_trades_archive_20260513`. ≈+0.28 SOL/day ≈ +2 SOL/week — 6-7× above the pre-committed kill-criterion (+0.3 SOL/week). |
+| **Peak 19h burst** (2026-05-06 14:30 → 2026-05-07 09:30) | 161 closed | **+2.78 SOL** | +0.017 SOL | **18.6%** (30 wins / 131 losses) | After enabling the survival confidence-gate (`PULSE_SURVIVAL_MIN_CONFIDENCE=0.50`). Top-5 winners (TYLEE +780%, RWAFY +383%, BFS +364%, MAUA +347%, INCOME +333%) ≈ 80% of total profit — classic "lottery-ticket farming" + tail capture. Snapshot tag: `known-good-2026-05-07-paper-profitable`. |
+| **Pre-v21 legacy** (pre 2026-04-30) | 11,666 closed | −85 SOL | −0.0073 SOL | — | Different entry policy (rules-only), kept for archival reference. The v21 jump came from switching to ml_override + skill-gated heads. |
+
+**Why "achieved" and not "earned":** live execution was never wired up. Multiple
+attempts to migrate to real on-chain trading hit a structural wall — PumpPortal
+Lightning's pricing model (0.01 SOL per 10 000 streamed trades, ≈1.2 SOL/day at
+our fan-out) made continued paper-mode operation economically unattractive once
+the project's research scope was complete. The PumpPortal wallet was drained
+back to the funding source on 2026-05-19 and the bot was stopped; the
+on-chain `execution_pumpfun.py` path is implemented but unactivated.
+
 ## Architecture (v18, 2026-04-25)
 
 ```
